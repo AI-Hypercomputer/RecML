@@ -27,10 +27,12 @@ from mlrx.metrics.base_metrics import Metric
 from mlrx.training.core import Experiment
 from mlrx.training.core import run_experiment
 from mlrx.training.core import Trainer
-from mlrx.training.jax import JaxState
-from mlrx.training.jax import JaxTask
-from mlrx.training.jax import JaxTrainer
-from mlrx.training.jax import KerasState
+from mlrx.training.jax_trainer import JaxState
+from mlrx.training.jax_trainer import JaxTask
+from mlrx.training.jax_trainer import JaxTrainer
+from mlrx.training.jax_trainer import KerasState
+from mlrx.training.keras_trainer import KerasTask
+from mlrx.training.keras_trainer import KerasTrainer
 from mlrx.training.optax_factory import AdagradFactory
 from mlrx.training.optax_factory import AdamFactory
 from mlrx.training.optax_factory import OptimizerFactory
