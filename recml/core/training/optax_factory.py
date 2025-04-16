@@ -29,10 +29,10 @@ def _default_weight_decay_mask(params: optax.Params) -> optax.Params:
 
 
 def _regex_mask(regex: str) -> Callable[[optax.Params], optax.Params]:
-  """Returns a weight decay mask that applies to parameters matching a regex."""
+  """Returns a mask that applies to parameters matching a regex."""
 
   def _matches_regex(path: tuple[str, ...], _: Any) -> bool:
-    key = "/".join([jax.tree_util.keystr((k,), simple=True) for k in path])
+    key = '/'.join([jax.tree_util.keystr((k,), simple=True) for k in path])
     return re.fullmatch(regex, key) is not None
 
   def _mask(params: optax.Params) -> optax.Params:
@@ -54,6 +54,8 @@ class OptimizerFactory(types.Factory[optax.GradientTransformation]):
       magnitude of the gradients during optimization. Defaults to None.
     weight_decay_mask: The weight decay mask to use when applying weight decay.
       Defaults applying weight decay to all non-1D parameters.
+    freeze_mask: Optional mask to freeze parameters during optimization.
+      Defaults to None.
 
   Example usage:
 
@@ -78,6 +80,7 @@ class OptimizerFactory(types.Factory[optax.GradientTransformation]):
   weight_decay_mask: str | Callable[[optax.Params], optax.Params] = (
       _default_weight_decay_mask
   )
+  freeze_mask: str | Callable[[optax.Params], optax.Params] | None = None
 
   def make(self) -> optax.GradientTransformation:
     if self.grad_clip_norm is not None:
@@ -99,12 +102,29 @@ class OptimizerFactory(types.Factory[optax.GradientTransformation]):
     else:
       weight_decay = optax.identity()
 
-    return optax.chain(*[
+    tx = optax.chain(*[
         apply_clipping,
         self.scaling,
         weight_decay,
         lr_scaling,
     ])
+
+    if self.freeze_mask is not None:
+      if isinstance(self.freeze_mask, str):
+        mask = _regex_mask(self.freeze_mask)
+      else:
+        mask = self.freeze_mask
+
+      def _param_labels(params: optax.Params) -> optax.Params:
+        return jax.tree.map(
+            lambda p: 'frozen' if mask(p) else 'trainable', params
+        )
+
+      tx = optax.multi_transform(
+          transforms={'trainable': tx, 'frozen': optax.set_to_zero()},
+          param_labels=_param_labels,
+      )
+    return tx
 
 
 class AdamFactory(types.Factory[optax.GradientTransformation]):
@@ -121,6 +141,8 @@ class AdamFactory(types.Factory[optax.GradientTransformation]):
       magnitude of the gradients during optimization. Defaults to None.
     weight_decay_mask: The weight decay mask to use when applying weight decay.
       Defaults applying weight decay to all non-1D parameters.
+    freeze_mask: Optional mask to freeze parameters during optimization.
+      Defaults to None.
 
   Example usage:
   ```
@@ -143,6 +165,7 @@ class AdamFactory(types.Factory[optax.GradientTransformation]):
   weight_decay_mask: str | Callable[[optax.Params], optax.Params] = (
       _default_weight_decay_mask
   )
+  freeze_mask: str | Callable[[optax.Params], optax.Params] | None = None
 
   def make(self) -> optax.GradientTransformation:
     return OptimizerFactory(
@@ -164,6 +187,8 @@ class AdagradFactory(types.Factory[optax.GradientTransformation]):
     eps: The epsilon coefficient for the Adagrad optimizer. Defaults to 1e-7.
     grad_clip_norm: Optional gradient clipping norm to limit the maximum
       magnitude of the gradients during optimization. Defaults to None.
+    freeze_mask: Optional mask to freeze parameters during optimization.
+      Defaults to None.
 
   Example usage:
   ```
@@ -175,6 +200,7 @@ class AdagradFactory(types.Factory[optax.GradientTransformation]):
   initial_accumulator_value: float = 0.1
   eps: float = 1e-7
   grad_clip_norm: float | None = None
+  freeze_mask: str | Callable[[optax.Params], optax.Params] | None = None
 
   def make(self) -> optax.GradientTransformation:
     return OptimizerFactory(

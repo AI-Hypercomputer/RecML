@@ -11,12 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Public utilities API."""
+"""Miscellaneous utilities."""
 
-# pylint: disable=g-importing-member
+from collections.abc import Callable
+import inspect
+from typing import Any
 
-from recml.core.utils.config import DEFINE_fiddle_config
-from recml.core.utils.config import FiddleFlag
-from recml.core.utils.misc import has_argument
-from recml.core.utils.types import Dataclass
-from recml.core.utils.types import FrozenDataclass
+
+def has_argument(fn: Callable[..., Any], arg_name: str) -> bool:
+  """Checks if a function has an argument with a given name."""
+  params = inspect.signature(fn).parameters.values()
+  param_names = [v.name for v in params]
+  has_arg = arg_name in param_names
+  has_kw_args = any([v.kind == inspect.Parameter.VAR_KEYWORD for v in params])
+  return has_arg or has_kw_args

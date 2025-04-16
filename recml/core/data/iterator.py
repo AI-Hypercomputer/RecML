@@ -57,16 +57,15 @@ class TFDatasetIterator(clu_data.DatasetIterator):
     if self._prefetched_batch is not None:
       batch = self._prefetched_batch
       self._prefetched_batch = None
-      return batch
-
-    batch = next(self._iterator)
-    if self._postprocessor is not None:
-      batch = self._postprocessor(batch)
+    else:
+      batch = next(self._iterator)
+      if self._postprocessor is not None:
+        batch = self._postprocessor(batch)
 
     def _maybe_to_numpy(
-        x: tf.Tensor | tf.SparseTensor | tf.RaggedTensor,
+        x: tf.Tensor | tf.SparseTensor | tf.RaggedTensor | np.ndarray,
     ) -> np.ndarray | tf.SparseTensor | tf.RaggedTensor:
-      if isinstance(x, (tf.SparseTensor, tf.RaggedTensor)):
+      if isinstance(x, (tf.SparseTensor, tf.RaggedTensor, np.ndarray)):
         return x
       if hasattr(x, "_numpy"):
         numpy = x._numpy()  # pylint: disable=protected-access
@@ -83,13 +82,16 @@ class TFDatasetIterator(clu_data.DatasetIterator):
   @property
   def element_spec(self) -> clu_data.ElementSpec:
     if self._element_spec is not None:
-      batch = self._element_spec
-    else:
-      batch = self.__next__()
-      self._prefetched_batch = batch
+      return self._element_spec
+
+    batch = next(self._iterator)
+    if self._postprocessor is not None:
+      batch = self._postprocessor(batch)
+
+    self._prefetched_batch = batch
 
     def _to_element_spec(
-        x: np.ndarray | tf.SparseTensor | tf.RaggedTensor,
+        x: tf.Tensor | tf.SparseTensor | tf.RaggedTensor | np.ndarray,
     ) -> clu_data.ArraySpec:
       if isinstance(x, tf.SparseTensor):
         return clu_data.ArraySpec(
@@ -100,6 +102,10 @@ class TFDatasetIterator(clu_data.DatasetIterator):
         return clu_data.ArraySpec(
             dtype=x.dtype.as_numpy_dtype,  # pylint: disable=attribute-error
             shape=tuple(x.shape.as_list()),  # pylint: disable=attribute-error
+        )
+      if isinstance(x, tf.Tensor):
+        return clu_data.ArraySpec(
+            dtype=x.dtype.as_numpy_dtype, shape=tuple(x.shape.as_list())
         )
       return clu_data.ArraySpec(dtype=x.dtype, shape=tuple(x.shape))
 
