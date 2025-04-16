@@ -1,0 +1,17 @@
+jax>=0.4.30
+jaxlib>=0.4.30
+numpy
+pylint
+pytest
+pyink
+pre-commit
+clu
+jaxtyping
+tensorflow
+keras
+fiddle
+tensorflow_datasets
+absl-py
+keras_hub
+torch
+einops
