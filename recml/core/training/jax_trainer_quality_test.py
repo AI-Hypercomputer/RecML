@@ -25,13 +25,13 @@ import jax
 import jax.numpy as jnp
 import jaxtyping as jt
 import optax
-from recml.core.training import jax as jax_lib
+from recml.core.training import jax_trainer
 from recml.core.training import partitioning
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
 
-class _MNISTTask(jax_lib.JaxTask):
+class _MNISTTask(jax_trainer.JaxTask):
   """Task for fitting a CNN on MNIST."""
 
   def create_datasets(self) -> tuple[tf.data.Dataset, tf.data.Dataset]:
@@ -126,7 +126,7 @@ class JaxQualityTest(absltest.TestCase):
   def test_mnist_e2e(self):
     model_dir = self.create_tempdir().full_path
     task = _MNISTTask()
-    trainer = jax_lib.JaxTrainer(
+    trainer = jax_trainer.JaxTrainer(
         partitioner=partitioning.DataParallelPartitioner(),
         train_steps=1000,
         steps_per_eval=50,
