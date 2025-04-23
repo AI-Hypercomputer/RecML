@@ -113,7 +113,9 @@ class DataParallelPartitioner(Partitioner):
 
     def _wrapped_init(batch: PyTree) -> State:
       with jax.sharding.use_mesh(self.mesh):
-        return init_fn(batch)
+        state = init_fn(batch)
+        state = _maybe_unbox_state(state)
+        return state
 
     return _wrapped_init
 
@@ -235,20 +237,11 @@ class ModelParallelPartitioner(Partitioner):
       )
       compiled_init_fn = jax.jit(init_fn, out_shardings=state_sharding)
 
-    def _maybe_unbox(x: Any) -> Any:
-      if isinstance(x, nn.spmd.LogicallyPartitioned):
-        return x.unbox()
-      return x
-
     def _init(batch: PyTree) -> State:
       with self.mesh_context_manager(self.mesh):
         state = compiled_init_fn(batch)
-        unboxed_state = jax.tree.map(
-            _maybe_unbox,
-            state,
-            is_leaf=lambda k: isinstance(k, nn.spmd.LogicallyPartitioned),
-        )
-      return unboxed_state
+        state = _maybe_unbox_state(state)
+      return state
 
     self.abstract_batch = abstract_batch
     self.abstract_state = abstract_state
@@ -288,3 +281,16 @@ class ModelParallelPartitioner(Partitioner):
         return step_fn(batch, state)
 
     return _step
+
+
+def _maybe_unbox_state(x: Any) -> Any:
+  def _maybe_unbox(x: Any) -> Any:
+    if isinstance(x, nn.Partitioned):
+      return x.unbox()
+    return x
+
+  return jax.tree.map(
+      _maybe_unbox,
+      x,
+      is_leaf=lambda k: isinstance(k, nn.Partitioned),
+  )
