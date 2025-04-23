@@ -27,10 +27,12 @@ from recml.core.metrics.base_metrics import Metric
 from recml.core.training.core import Experiment
 from recml.core.training.core import run_experiment
 from recml.core.training.core import Trainer
-from recml.core.training.jax import JaxState
-from recml.core.training.jax import JaxTask
-from recml.core.training.jax import JaxTrainer
-from recml.core.training.jax import KerasState
+from recml.core.training.jax_trainer import JaxState
+from recml.core.training.jax_trainer import JaxTask
+from recml.core.training.jax_trainer import JaxTrainer
+from recml.core.training.jax_trainer import KerasState
+from recml.core.training.keras_trainer import KerasTask
+from recml.core.training.keras_trainer import KerasTrainer
 from recml.core.training.optax_factory import AdagradFactory
 from recml.core.training.optax_factory import AdamFactory
 from recml.core.training.optax_factory import OptimizerFactory

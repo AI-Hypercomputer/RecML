@@ -14,7 +14,7 @@
 """Core training library for Jax."""
 
 import abc
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import dataclasses
 import enum
 from typing import Any, Generic, TypeVar
@@ -33,6 +33,8 @@ CHECKPOINT_DIR = "checkpoints"
 TRAINING_COMPLETE_MARKER_FILE = "marker.txt"
 TRAIN_LOG_DIRNAME = "train"
 EVAL_LOG_DIRNAME = "val"
+KERAS_MODEL_SAVEFILE = "model.keras"
+ORBAX_CHECKPOINT_DEFAULT_KEY = "default"
 
 DEFAULT_RNG_SEED = 0
 IN_TRAINER_CONTEXT = False  # Set to true when run from the main trainer.
@@ -169,6 +171,15 @@ def get_iterators(
     )
 
   return train_dataset, eval_datasets  # pytype: disable=bad-return-type
+
+
+def get_shape(
+    x: tf.Tensor | tf.SparseTensor | tf.RaggedTensor,
+) -> Sequence[int | None]:
+  """Gets the shape of a dense / sparse / ragged tensor."""
+  if isinstance(x, tf.SparseTensor):
+    return [x.shape[0]] + [None for _ in x.shape[1:]]
+  return x.shape.as_list()
 
 
 def in_tracing_context() -> bool:

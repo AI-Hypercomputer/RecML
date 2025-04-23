@@ -30,7 +30,7 @@ import keras
 import optax
 import orbax.checkpoint as ocp
 from recml.core.training import core
-from recml.core.training import jax as jax_lib
+from recml.core.training import jax_trainer
 from recml.core.training import partitioning
 import tensorflow as tf
 
@@ -42,7 +42,7 @@ class _DummyFlaxModel(nn.Module):
     return nn.Dense(1, kernel_init=nn.initializers.constant(-1.0))(inputs)
 
 
-class _JaxTask(jax_lib.JaxTask):
+class _JaxTask(jax_trainer.JaxTask):
 
   def create_datasets(
       self,
@@ -90,7 +90,7 @@ class _JaxTask(jax_lib.JaxTask):
     return {"loss": clu_metrics.Average.from_model_output(loss)}
 
 
-class _KerasJaxTask(jax_lib.JaxTask):
+class _KerasJaxTask(jax_trainer.JaxTask):
 
   def create_datasets(self) -> tf.data.Dataset:
     def _map_fn(x: int):
@@ -106,7 +106,7 @@ class _KerasJaxTask(jax_lib.JaxTask):
 
   def create_state(
       self, batch: jt.PyTree, rng: jax.Array
-  ) -> jax_lib.KerasState:
+  ) -> jax_trainer.KerasState:
     x, _ = batch
 
     model = keras.Sequential(
@@ -122,11 +122,11 @@ class _KerasJaxTask(jax_lib.JaxTask):
     model.build(x.shape)
 
     optimizer = optax.adagrad(0.1)
-    return jax_lib.KerasState.create(model=model, tx=optimizer)
+    return jax_trainer.KerasState.create(model=model, tx=optimizer)
 
   def train_step(
-      self, batch: jt.PyTree, state: jax_lib.KerasState, rng: jax.Array
-  ) -> tuple[jax_lib.KerasState, Mapping[str, clu_metrics.Metric]]:
+      self, batch: jt.PyTree, state: jax_trainer.KerasState, rng: jax.Array
+  ) -> tuple[jax_trainer.KerasState, Mapping[str, clu_metrics.Metric]]:
     x, y = batch
 
     def _loss_fn(tvars):
@@ -140,7 +140,7 @@ class _KerasJaxTask(jax_lib.JaxTask):
     return state, {"loss": clu_metrics.Average.from_model_output(loss)}
 
   def eval_step(
-      self, batch: jt.PyTree, state: jax_lib.KerasState
+      self, batch: jt.PyTree, state: jax_trainer.KerasState
   ) -> Mapping[str, clu_metrics.Metric]:
     x, y = batch
     y_pred, _ = state.model.stateless_call(state.tvars, state.ntvars, x)
@@ -208,13 +208,13 @@ class JaxTest(parameterized.TestCase):
   )
   def test_jax_trainer(
       self,
-      task_cls: type[jax_lib.JaxTask],
+      task_cls: type[jax_trainer.JaxTask],
       mode: str,
       expected_keys: Sequence[str],
   ):
     model_dir = self.create_tempdir().full_path
     task = task_cls()
-    trainer = jax_lib.JaxTrainer(
+    trainer = jax_trainer.JaxTrainer(
         partitioner=partitioning.DataParallelPartitioner(data_axis="batch"),
         train_steps=12,
         steps_per_eval=3,
@@ -258,7 +258,7 @@ class JaxTest(parameterized.TestCase):
         ),
     )
     state = State(step=10, opt_state=tx.init({"a": jnp.ones((10, 10))}))
-    metrics = jax_lib._state_metrics(state)
+    metrics = jax_trainer._state_metrics(state)
     self.assertIn("optimizer/learning_rate", metrics)
     self.assertEqual(metrics["optimizer/learning_rate"].compute(), 0.1)
 
