@@ -26,6 +26,7 @@ from clu import data as clu_data
 from clu import periodic_actions
 import clu.metrics as clu_metrics
 from flax import struct
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import keras
@@ -67,43 +68,85 @@ class JaxState(struct.PyTreeNode, Generic[MetaT]):
     step: A counter of the current step of the job. It starts at zero and it is
       incremented by 1 on a call to `state.update(...)`. This should be a Jax
       array and not a Python integer.
-    apply: A function that can be used to apply the forward pass of the model.
-      For Flax models this is usually set to `model.apply`.
     params: A pytree of trainable variables that will be updated by `tx` and
       used in `apply`.
     tx: An optax gradient transformation that will be used to update the
       parameters contained in `params` on a call to `state.update(...)`.
     opt_state: The optimizer state for `tx`. This is usually created by calling
       `tx.init(params)`.
+    _apply: An optional function that can be used to apply the forward pass of
+      the model. For Flax models this is usually set to `model.apply` while for
+      Haiku models this is usually set to `transform.apply`.
+    _model: An optional reference to a stateless Flax model for convenience.
     mutable: A pytree of mutable variables that are used by `apply`.
     meta: Arbitrary metadata that is recorded on the state. This can be useful
       for tracking additional references in the state.
   """
 
   step: jax.Array
-  apply: Callable[..., Any] = struct.field(pytree_node=False)
   params: PyTree = struct.field(pytree_node=True)
   tx: optax.GradientTransformation = struct.field(pytree_node=False)
   opt_state: optax.OptState = struct.field(pytree_node=True)
   mutable: PyTree = struct.field(pytree_node=True, default_factory=dict)
   meta: MetaT = struct.field(pytree_node=False, default_factory=dict)
+  _apply: Callable[..., Any] | None = struct.field(
+      pytree_node=False, default_factory=None
+  )
+  _model: nn.Module | None = struct.field(pytree_node=False, default=None)
+
+  @property
+  def model(self) -> nn.Module:
+    """Returns a reference to the model used to create the state."""
+    if self._model is None:
+      raise ValueError("No Flax `model` is set on the state.")
+    return self._model
+
+  def apply(self, *args, **kwargs) -> Any:
+    """Applies the forward pass of the model."""
+    if self._apply is None:
+      raise ValueError("No `apply` function is set on the state.")
+    return self._apply(*args, **kwargs)
 
   @classmethod
   def create(
       cls,
       *,
-      apply: Callable[..., Any],
+      apply: Callable[..., Any] | None = None,
+      model: nn.Module | None = None,
       params: PyTree,
       tx: optax.GradientTransformation,
       **kwargs,
   ) -> Self:
-    """Creates a new instance from a Jax apply function and Optax optimizer."""
+    """Creates a new instance from a Jax model / apply fn and Optax optimizer.
+
+    Args:
+      apply: A function that can be used to apply the forward pass of the model.
+        For Flax models this is usually set to `model.apply`. This cannot be set
+        along with `model`.
+      model: A reference to a stateless Flax model. This cannot be set along
+        with `apply`. When set the `apply` attribute of the state will be set to
+        `model.apply`.
+      params: A pytree of trainable variables that will be updated by `tx` and
+        used in `apply`.
+      tx: An optax gradient transformation that will be used to update the
+        parameters contained in `params` on a call to `state.update(...)`.
+      **kwargs: Other updates to set on the new state.
+
+    Returns:
+      An new instance of the state.
+    """
+    if apply is not None and model is not None:
+      raise ValueError("Only one of `apply` or `model` can be provided.")
+    elif model is not None:
+      apply = model.apply
+
     return cls(
         step=jnp.zeros([], dtype=jnp.int32),
-        apply=apply,
         params=params,
         tx=tx,
         opt_state=tx.init(params),
+        _apply=apply,
+        _model=model,
         **kwargs,
     )
 

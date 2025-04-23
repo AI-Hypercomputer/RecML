@@ -136,12 +136,10 @@ class PartitioningTest(parameterized.TestCase):
     state = partitioner.partition_init(_init, abstract_batch=sharded_inputs)(
         sharded_inputs
     )
-    self.assertIsInstance(state, nn.Partitioned)
 
-    unboxed_state = state.unbox()
-    self.assertIsInstance(unboxed_state, jax.Array)
-    self.assertSequenceEqual(unboxed_state.shape, (128, 16))
-    self.assertEqual(unboxed_state.sharding, partitioner.state_sharding)
+    self.assertIsInstance(state, jax.Array)
+    self.assertSequenceEqual(state.shape, (128, 16))
+    self.assertEqual(state.sharding, partitioner.state_sharding)
     self.assertEqual(
         partitioner.state_sharding,
         jax.sharding.NamedSharding(
