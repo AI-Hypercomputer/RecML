@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tools for MLRX metrics."""
+"""Tools for RecML metrics."""
 
 from collections.abc import Mapping
 import concurrent.futures
