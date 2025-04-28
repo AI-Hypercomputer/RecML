@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import abc
 from collections.abc import Mapping
+import dataclasses
 import gc
 import os
 import time
@@ -232,6 +233,27 @@ class KerasTrainer(core.Trainer[KerasTask]):
     model = task.create_model_for_eval(
         **self._maybe_get_model_kws(task, dataset)
     )
+
+    if keras.backend.backend() == "jax":
+      [tb_cbk] = [
+          cbk
+          for cbk in self._eval_callbacks
+          if isinstance(cbk, keras_utils.EpochSummaryCallback)
+      ]
+      epoch_start_time = time.time()
+      history = model.evaluate(
+          dataset,
+          steps=self._steps_per_eval,
+          callbacks=self._eval_callbacks,
+          return_dict=True,
+      )
+      epoch_dt = time.time() - epoch_start_time
+      steps_per_second = self._steps_per_eval / epoch_dt
+      val_logs = {"val_" + k: v for k, v in history.items()}
+      val_logs["val_steps_per_second"] = steps_per_second
+      tb_cbk.on_epoch_end(0, val_logs)
+      return history
+
     return model.evaluate(
         dataset,
         steps=self._steps_per_eval,
