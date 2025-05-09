@@ -1,0 +1,16 @@
+gcloud alpha compute tpus tpu-vm ssh chandrasekhard-vl-1 --project tpu-prod-env-automated --zone us-east5-a --worker=all  --command="pip install -U --pre jax jaxlib libtpu requests -f https://storage.googleapis.com/jax-releases/jax_nightly_releases.html -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+" -- -o ProxyCommand='corp-ssh-helper -relay=mtv5.r.ext.google.com %h %p'
+
+gcloud alpha compute tpus tpu-vm ssh chandrasekhard-vl-1 --project tpu-prod-env-automated --zone us-east5-a --worker=all  --command="pip install -U https://storage.googleapis.com/jax-tpu-embedding-whls/20250418/jax_tpu_embedding-0.1.0.dev20250418-cp310-cp310-manylinux_2_35_x86_64.whl
+" -- -o ProxyCommand='corp-ssh-helper -relay=mtv5.r.ext.google.com %h %p'
+
+gcloud alpha compute tpus tpu-vm ssh chandrasekhard-vl-1 --project tpu-prod-env-automated --zone us-east5-a --worker=all  --command="pip install -U tensorflow  dm-tree flax                                                                                                   
+" -- -o ProxyCommand='corp-ssh-helper -relay=mtv5.r.ext.google.com %h %p'
+
+
+
+gcloud alpha compute tpus tpu-vm ssh chandrasekhard-vl-1 --project tpu-prod-env-automated --zone us-east5-a --worker=all  --command="gsutil -m cp -r gs://chandrasekhard/mlperf50/dlrm .                                                                           
+" -- -o ProxyCommand='corp-ssh-helper -relay=mtv5.r.ext.google.com %h %p'
+
+gcloud alpha compute tpus tpu-vm ssh chandrasekhard-vl-1 --project tpu-prod-env-automated --zone us-east5-a --worker=all  --command="TPU_NAME=chandrasekhard-vl-1  python -u dlrm/dlrm_main.py --batch_size=135168 --embedding_size=128 --file_pattern=gs://qinyiyan-vm/mlperf-dataset/criteo_merge_balanced_4224/train-*" -- -o ProxyCommand='corp-ssh-helper -relay=mtv5.r.ext.google.com %h %p'
+
