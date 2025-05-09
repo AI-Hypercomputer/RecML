@@ -128,7 +128,7 @@ _EMBEDDING_SIZE = flags.DEFINE_integer("embedding_size", 16, "Embedding size.")
 
 _ALLOW_ID_DROPPING = flags.DEFINE_bool(
     "allow_id_dropping",
-    True,
+    False,
     "If set, allow dropping ids during embedding lookup.",
 )
 

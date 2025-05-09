@@ -103,14 +103,21 @@ class DLRMDCNV2(nn.Module):
   ):
     dense_outputs = self.bottom_mlp(dense_features)
     dense_embeddings = []
+    processed_dense_lookups = []
     for key, value in dense_lookups.items():
-      embeddings = nn.Embed(self.vocab_sizes[int(key)], self.embedding_size)(value)
-      #jax.debug.print("[chandra-debug] embeddings shape before sum: {}", embeddings.shape)
-      embeddings = jnp.sum(embeddings, axis=-2)
-      #jax.debug.print("[chandra-debug] embeddings shape after sum: {}", embeddings.shape)
-      dense_embeddings.append(embeddings)
+        embeddings = nn.Embed(self.vocab_sizes[int(key)], self.embedding_size)(value)
+        embeddings = jnp.sum(embeddings, axis=-2)
+        processed_dense_lookups.append(embeddings)
 
-    dense_embeddings = jnp.concatenate(dense_embeddings, axis=-2)
+    if processed_dense_lookups:
+        # Stack along axis 1 to get (global_batch_size, num_dense_lookups, embedding_size)
+        stacked_dense_embeddings = jnp.stack(processed_dense_lookups, axis=1)
+    else:
+        # Handle empty list if no dense_lookups are provided
+        stacked_dense_embeddings = jnp.empty((self.global_batch_size, 0, self.embedding_size))
+
+    #dense_embeddings = jnp.concatenate(dense_embeddings, axis=-2)
+    dense_embeddings = stacked_dense_embeddings
     #jax.debug.print("[chandra-debug] dense_embeddings shape: {}", dense_embeddings.shape)
 
     sparse_embeddings = embed.SparseCoreEmbed(
