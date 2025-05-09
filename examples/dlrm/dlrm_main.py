@@ -471,7 +471,7 @@ def test_dlrm_dcnv2_model():
       f"Embed_{i}": Layout(
           DLL(major_to_minor=(0, 1)), NamedSharding(mesh, P())
       )
-      for i in range(17)
+      for i in range(26-len(feature_specs.items()))
   }
 
   dcn_out_shardings = {
