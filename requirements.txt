@@ -75,7 +75,7 @@ regex==2024.11.6
 requests==2.32.3
 rich==14.0.0
 scipy==1.15.2
-setuptools==78.1.0
+setuptools==78.1.1
 simple-parsing==0.1.7
 simplejson==3.20.1
 six==1.17.0
