@@ -23,11 +23,11 @@ from jax_tpu_embedding.sparsecore.lib.flax import embed
 from jax_tpu_embedding.sparsecore.lib.flax import embed_optimizer
 from jax_tpu_embedding.sparsecore.lib.nn import embedding
 from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
-#from jax_tpu_embedding.sparsecore.utils.google.xprof_helper import XprofHelper
+
 import numpy as np
 import optax
 
-#from google3.perftools.accelerators.xprof.api.python import webserver_start
+
 
 jax.distributed.initialize()
 import jax.profiler
