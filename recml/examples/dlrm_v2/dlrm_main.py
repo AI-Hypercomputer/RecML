@@ -104,6 +104,7 @@ def create_feature_specs(
   """Creates the feature specs for the DLRM model."""
   table_specs = {}
   feature_specs = {}
+  # Features with vocab size below threshold are handled by dense embeddings
   for i, vocab_size in enumerate(vocab_sizes):
     if vocab_size <= _EMBEDDING_THRESHOLD.value:
       continue
@@ -194,6 +195,7 @@ class DLRMDataLoader:
     dense_features = feature_batch["dense_features"]
     sparse_features = feature_batch["sparse_features"]
     dense_lookups = {}
+    # Separate features for dense lookup based on embedding threshold
     for i in range(len(VOCAB_SIZES)):
       if VOCAB_SIZES[i] <= _EMBEDDING_THRESHOLD.value:
         dense_lookups[str(i)] = sparse_features[str(i)]
@@ -229,6 +231,7 @@ class DLRMDataLoader:
           self.buffer.append(processed_batch)
           self._sync.notify_all()
       except StopIteration:
+        # None in buffer signals to the consumer that the dataset has been exhausted.
         # Signal the end of the dataset.
         with self._sync:
           self.buffer.append(None)
@@ -249,16 +252,16 @@ class DLRMDataLoader:
       return item
 
   def stop(self):
-    """Stop all worker threads and clear the buffer."""
+    """Clears the iterator to stop data loading and signals worker threads to exit."""
     del self._iterator
 
 
 def eval_loop(
     eval_steps: int,
     eval_producer: DLRMDataLoader,
-    eval_step_fn: Callable, # The jitted eval_step function
+    eval_step_fn: Callable, # JIT-compiled evaluation step function
     params: Any,
-    apply_fn: Callable, # Pass the model's apply function
+    apply_fn: Callable, # Model's apply function for predictions
 ):
   """Runs the evaluation loop."""
   logging.info("Starting evaluation...")
@@ -281,7 +284,6 @@ def eval_loop(
       logging.warning("Evaluation dataset exhausted before eval_steps was reached.")
       break
 
-  # Get metrics from all devices
   metrics_on_host = jax.device_get(eval_metrics_collection)
   loss_val = metrics_on_host.loss.compute()
   accuracy_val = metrics_on_host.accuracy.compute()
@@ -297,7 +299,6 @@ def eval_loop(
   )
 
 
-# CORRECTED: eval_step now takes apply_fn as its static argument.
 @partial(jax.jit, static_argnums=0)
 def eval_step(
     apply_fn: Callable,
@@ -458,6 +459,10 @@ def main(argv):
   pd = P("x")
   global_devices = jax.devices()
   mesh = jax.sharding.Mesh(global_devices, "x")
+  logging.info(
+      "Starting DLRM v2 training with parameters: Batch Size %d, Learning Rate %.4f, Num Steps %d, Embedding Size %d",
+      _BATCH_SIZE.value, _LEARNING_RATE.value, _NUM_STEPS.value, _EMBEDDING_SIZE.value
+  )
 
   _, feature_specs = create_feature_specs(VOCAB_SIZES)
 
@@ -466,6 +471,7 @@ def main(argv):
   def _get_max_unique_ids_per_partition(name: str, batch_size: int) -> int:
     return 2048
 
+  # Automatically stack embedding tables for SparseCore efficiency.
   embedding.auto_stack_tables(
       feature_specs,
       global_device_count=jax.device_count(),
@@ -473,6 +479,7 @@ def main(argv):
       stack_to_max_unique_ids_per_partition=_get_max_unique_ids_per_partition,
       num_sc_per_device=4,
   )
+  # Prepare feature specifications for the training process.
   embedding.prepare_feature_specs_for_training(
       feature_specs,
       global_device_count=jax.device_count(),
