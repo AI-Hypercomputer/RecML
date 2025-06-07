@@ -91,7 +91,7 @@ termcolor==3.0.1
 toml==0.10.2
 tomlkit==0.13.2
 toolz==1.0.0
-torch==2.6.0
+torch==2.7.1
 tqdm==4.67.1
 treescope==0.1.9
 typing-extensions==4.13.2
