@@ -118,6 +118,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       max_checkpoints_to_keep: int = 5,
       checkpoint_save_interval_epochs: int = 1,
       rng_seed: int = core.DEFAULT_RNG_SEED,
+      legacy_format: bool = True,
   ):
     """Initializes the instance."""
 
@@ -148,12 +149,14 @@ class KerasTrainer(core.Trainer[KerasTask]):
         model_dir, core.TRAINING_COMPLETE_MARKER_FILE
     )
     self._checkpoint_dir = os.path.join(model_dir, core.CHECKPOINT_DIR)
+    self._legacy_format = legacy_format
 
     if keras.backend.backend() == "jax":
       self._checkpoint_manager = keras_utils.KerasOrbaxCheckpointManager(
           checkpoint_dir=self._checkpoint_dir,
           max_to_keep=max_checkpoints_to_keep,
           save_interval_epochs=checkpoint_save_interval_epochs,
+          legacy_format=self._legacy_format,
       )
       self._train_callbacks = [
           keras_utils.EpochSummaryCallback(
@@ -314,13 +317,18 @@ class KerasTrainer(core.Trainer[KerasTask]):
           self,
           checkpoint_dir: str,
           epoch: int,
+          legacy_format: bool,
       ):
         self._checkpoint_dir = checkpoint_dir
         self._epoch = epoch
+        self._legacy_format = legacy_format
 
       def on_test_begin(self, logs: Mapping[str, Any] | None = None):
         keras_utils.restore_keras_model(
-            model, self._checkpoint_dir, step=self._epoch
+            model,
+            self._checkpoint_dir,
+            step=self._epoch,
+            legacy_format=self._legacy_format,
         )
 
     history = None
@@ -329,7 +337,9 @@ class KerasTrainer(core.Trainer[KerasTask]):
         timeout=self._continuous_eval_timeout,
         timeout_fn=timeout_fn,
     ):
-      restore_callback = _RestoreCallback(self._checkpoint_dir, epoch)
+      restore_callback = _RestoreCallback(
+          self._checkpoint_dir, epoch, self._legacy_format
+      )
       [tb_cbk] = [
           cbk
           for cbk in self._eval_callbacks
