@@ -95,7 +95,7 @@ torch==2.6.0
 tqdm==4.67.1
 treescope==0.1.9
 typing-extensions==4.13.2
-urllib3==2.4.0
+urllib3==2.5.0
 virtualenv==20.30.0
 wadler-lindig==0.1.5
 werkzeug==3.1.3
