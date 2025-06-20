@@ -21,7 +21,7 @@ export LOGGING_INTERVAL=1500
 export RESTORE_CHECKPOINT=true
 
 
-python RecML/recml/inference/models/jax/DLRM_DCNv2/dlrm_main.py \
+python ./recml/inference/models/jax/DLRM_DCNv2/dlrm_main.py \
 --learning_rate=${LEARNING_RATE} \
 --batch_size=${BATCH_SIZE} \
 --embedding_size=${EMBEDDING_SIZE} \
