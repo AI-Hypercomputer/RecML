@@ -54,10 +54,10 @@ gcloud alpha compute tpus tpu-vm ssh ${TPU_NAME} --project ${PROJECT} --zone ${Z
 gcloud alpha compute tpus tpu-vm ssh ${TPU_NAME} --project ${PROJECT} --zone ${ZONE} --worker=all  --command="pip install -U tensorflow  dm-tree flax google-metrax"
 ```
 
-#### Run workload
+#### Make script executable and Run workload
 
 Note: Please update the MODEL_NAME & TASK_NAME before running the below command
 
 ```
-gcloud alpha compute tpus tpu-vm ssh ${TPU_NAME} --project ${PROJECT} --zone ${ZONE} --worker=all  --command="TPU_NAME=${TPU_NAME} ./inference/benchmarks/<MODEL_NAME>/<TASK_NAME>"
+gcloud alpha compute tpus tpu-vm ssh ${TPU_NAME} --project ${PROJECT} --zone ${ZONE} --worker=all  --command="cd RecML && chmod +x ./recml/inference/benchmarks/<MODEL_NAME>/<TASK_NAME> && TPU_NAME=${TPU_NAME} ./recml/inference/benchmarks/<MODEL_NAME>/<TASK_NAME>"
 ```
