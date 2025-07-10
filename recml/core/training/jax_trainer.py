@@ -699,6 +699,9 @@ class JaxTrainer(core.Trainer[JaxTask]):
       )
       metrics[core.TRAIN_LOG_DIRNAME] = train_metrics
 
+      if jax.process_index() == 0:
+        task.export_model(state, self._model_dir)
+
       self._maybe_save_checkpoint(curr_step, state, metrics=metrics)
       step = curr_step + 1
 
@@ -706,7 +709,6 @@ class JaxTrainer(core.Trainer[JaxTask]):
 
     if jax.process_index() == 0:
       self._write_marker_file()
-      task.export_model(state, self._model_dir)
 
     self.checkpoint_manager.close()
     del self.checkpoint_manager
