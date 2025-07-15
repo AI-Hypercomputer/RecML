@@ -593,11 +593,12 @@ def test_dlrm_dcnv2_model():
     if step == 200:
         jax.profiler.stop_trace()
 
-    if step == 50:
+    if step % 10 == 0:
         fdo_client.publish()
         jax.experimental.multihost_utils.sync_global_devices("FDO CLIENT BARRIER")
         
 
+    '''
     if step == 51:
       (
           max_ids_per_partition,
@@ -613,6 +614,7 @@ def test_dlrm_dcnv2_model():
           ),
           num_sc_per_device=2,
       )
+    '''
     
     if step % 1500 == 0:
       end_time = time.time()
