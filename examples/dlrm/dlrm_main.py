@@ -163,7 +163,7 @@ _MODEL_DIR = flags.DEFINE_string(
     "Model working directory.",
 )
 
-out_path = os.path.join('/tmp', 'fdo_dump')
+out_path = os.path.join('gs://chandrasekhard/dlrm/fdo/', 'fdo_dump')
 os.makedirs(out_path, exist_ok=True)
 logging.info('FDO storage path: %s', out_path)
 fdo_client = file_fdo_client.NPZFileFDOClient(out_path)
