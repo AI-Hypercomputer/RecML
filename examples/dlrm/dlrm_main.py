@@ -584,7 +584,7 @@ def test_dlrm_dcnv2_model():
     if step % 10 == 0:
         fdo_client.publish()
 
-
+    '''
     if step == 50:
       (
           max_ids_per_partition,
@@ -600,6 +600,7 @@ def test_dlrm_dcnv2_model():
           ),
           num_sc_per_device=2,
       )
+    '''
     
     if step % 1500 == 0:
       end_time = time.time()
