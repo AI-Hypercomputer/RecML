@@ -1,5 +1,3 @@
-"""Data loader for Criteo dataset optimized for JAX training."""
-
 import dataclasses
 from typing import Dict, List
 
@@ -9,65 +7,61 @@ import numpy as np
 import tensorflow as tf
 
 
+# Define dataclass and constants at the top level
 dataclass = dataclasses.dataclass
 PARALELLISM = 32
+
+
+VOCAB_SIZES = [
+    40000000, 39060, 17295, 7424, 20265, 3, 7122, 1543, 63, 40000000,
+    3067956, 405282, 10, 2209, 11938, 155, 4, 976, 14, 40000000, 40000000,
+    40000000, 590152, 12973, 108, 36,
+]
+MULTI_HOT_SIZES = [
+    3, 2, 1, 2, 6, 1, 1, 1, 1, 7, 3, 8, 1, 6, 9, 5, 1, 1, 1, 12, 100, 27, 10,
+    3, 1, 1,
+]
 
 
 @dataclass
 class DataConfig:
   """Configuration for data loading parameters."""
-
-  global_batch_size: int
+  global_batch_size: int  
+  pre_batch_size: int     
   is_training: bool
   use_cached_data: bool = False
 
 
-def get_dummy_batch(batch_size, multi_hot_sizes=None, vocab_sizes=None):
-  """Returns a dummy batch of data.
-
-  Args:
-    batch_size: The size of the batch to generate.
-    multi_hot_sizes: A list of sizes for the multi-hot features.
-    vocab_sizes: A list of sizes for the vocabularies of the sparse features.
-
-  Our features dict is an inputs of dictionary - {
-      'label': (0,1)
-      'dense_features': {
-          '1': 0.123,
-          '2': 0.456,
-          ...
-          '13': 0.987,
-      },
-      'sparse_features': {
-          '1': sparse_tensor,
-          '2': sparse_tensor,
-          ...
-          '26': sparse_tensor,
-      },
+def get_dummy_batch(batch_size, multi_hot_sizes, vocab_sizes):
+  """Returns a dummy batch of data in the final desired structure."""
+  data = {
+      'clicked': np.random.randint(0, 2, size=(batch_size,), dtype=np.int64)
   }
-  """
-  data = {}
-
-  data['clicked'] = np.random.randint(0, 2, size=(batch_size,), dtype=np.int64)
-  data['dense_features'] = np.random.uniform(
-      0.0, 0.9, size=(batch_size, 13)
-  ).astype(np.float32)
-
+  dense_features_list = [
+      np.random.uniform(0.0, 0.9, size=(batch_size, 1)).astype(np.float32)
+      for _ in range(13)
+  ]
+  data['dense_features'] = np.concatenate(dense_features_list, axis=-1)
   sparse_features = {}
-
   for i in range(len(multi_hot_sizes)):
-    sparse_features[str(i)] = np.random.randint(
-        low=0,
-        high=vocab_sizes[i],
-        size=(batch_size, multi_hot_sizes[i]),
-    )
-
+    vocab_size = vocab_sizes[i] if i < len(vocab_sizes) else 1000
+    multi_hot_size = multi_hot_sizes[i]
+    output_key = str(i)
+    sparse_features[output_key] = np.random.randint(
+        low=0, high=vocab_size, size=(batch_size, multi_hot_size), dtype=np.int64)
   data['sparse_features'] = sparse_features
   return data
 
 
 class CriteoDataLoader:
-  """Data loader for Criteo dataset optimized for JAX training."""
+  """
+  Data loader for Criteo dataset optimized for JAX training.
+
+  This loader is designed for a distributed environment and handles sharding
+  of input files across multiple JAX processes. It efficiently reads
+  pre-batched TFRecords, unbatches them into individual examples, and then
+  re-batches them into a single, large global batch of a precise target size.
+  """
 
   def __init__(
       self,
@@ -76,200 +70,97 @@ class CriteoDataLoader:
       num_dense_features: int,
       vocab_sizes: List[int],
       multi_hot_sizes: List[int],
-      embedding_threshold: int = 21000,
       shuffle_buffer: int = 256,
-      prefetch_size: int = 256,
   ):
+    if params.global_batch_size % jax.process_count() != 0:
+        raise ValueError(
+            f"global_batch_size ({params.global_batch_size}) must be divisible "
+            f"by the number of JAX processes ({jax.process_count()}).")
+
     self._file_pattern = file_pattern
-    print(f' file_pattern: {file_pattern}')
+    print(f'file_pattern: {file_pattern}')
     self._params = params
     self._num_dense_features = num_dense_features
     self._vocab_sizes = vocab_sizes
     self._multi_hot_sizes = multi_hot_sizes
-    # Embedding threshold is used to determine whether a feature should be
-    # placed on TensorCore or SparseCore.
-    self._embedding_threshold = embedding_threshold
     self._shuffle_buffer = shuffle_buffer
-    self._prefetch_size = prefetch_size
-    self._cached_dummy_data = False
 
     self.label_features = 'clicked'
-    self.dense_features = [f'int-feature-{x}' for x in range(1, 14)]
-    self.sparse_features = [f'categorical-feature-{x}' for x in range(14, 40)]
+    self.dense_features = [f'int-feature-{i}' for i in range(1, 14)]
+    self.sparse_features = [f'categorical-feature-{i}' for i in range(14, 14 + len(vocab_sizes))]
 
-  def _get_cached_dummy_dataset(
-      self, batch_size: int, vocab_sizes: List[int]
-  ) -> tf.data.Dataset:
-    """Creates a TensorFlow dataset from cached dummy data."""
-    print(f'returning dummy dataset')
-    if self._cached_dummy_data is None:
-      # Generate dummy data once
-      self._cached_dummy_data = get_dummy_batch(
-          batch_size,
-          self._multi_hot_sizes,
-          vocab_sizes=vocab_sizes,
-      )
-
-    # Convert numpy arrays to tf.data.Dataset
-    dataset = tf.data.Dataset.from_tensors({
-        'clicked': tf.convert_to_tensor(self._cached_dummy_data['clicked']),
-        'dense_features': tf.convert_to_tensor(
-            self._cached_dummy_data['dense_features']
-        ),
-        'sparse_features': {
-            k: tf.convert_to_tensor(v)
-            for k, v in self._cached_dummy_data['sparse_features'].items()
-        },
-    })
-    dataset = dataset.take(1).repeat()
-    dataset = dataset.prefetch(buffer_size=2048)
-    options = tf.data.Options()
-    options.deterministic = False
-    options.threading.private_threadpool_size = 96
-    dataset = dataset.with_options(options)
-    return dataset
-
-  def _get_feature_spec(
-      self, batch_size: int
-  ) -> Dict[str, tf.io.FixedLenFeature]:
+  def _get_feature_spec(self, batch_size: int) -> Dict[str, tf.io.FixedLenFeature]:
     """Creates the feature specification for parsing TFRecords."""
     feature_spec = {
-        self.label_features: tf.io.FixedLenFeature(
-            [
-                batch_size,
-            ],
-            dtype=tf.int64,
-        )
+        self.label_features: tf.io.FixedLenFeature([batch_size], dtype=tf.int64)
     }
-
     for dense_feat in self.dense_features:
-      feature_spec[dense_feat] = tf.io.FixedLenFeature(
-          [
-              batch_size,
-          ],
-          dtype=tf.float32,
-      )
-
+      feature_spec[dense_feat] = tf.io.FixedLenFeature([batch_size], dtype=tf.float32)
     for sparse_feat in self.sparse_features:
-      feature_spec[sparse_feat] = tf.io.FixedLenFeature(
-          [
-              batch_size,
-          ],
-          dtype=tf.string,
-      )
-
+      feature_spec[sparse_feat] = tf.io.FixedLenFeature([batch_size], dtype=tf.string)
     return feature_spec
 
-  def _parse_example(
-      self, serialized_example: tf.Tensor, batch_size: int
-  ) -> Dict[str, tf.Tensor]:
+  def _parse_example(self, serialized_example: tf.Tensor) -> Dict[str, tf.Tensor]:
     """Parses a serialized TFRecord example into features."""
-    feature_spec = self._get_feature_spec(batch_size)
-    parsed_features = tf.io.parse_single_example(
-        serialized_example, feature_spec
-    )
-
-    # Process labels
-    labels = tf.reshape(
-        parsed_features[self.label_features],
-        [
-            batch_size,
-        ],
-    )
-
-    # Process dense features
-    dense_features = []
-    for dense_ft in self.dense_features:
-      cur_feature = tf.reshape(
-          parsed_features[dense_ft],
-          [
-              batch_size,
-              1,
-          ],
-      )
-      dense_features.append(cur_feature)
-    dense_features = tf.concat(dense_features, axis=-1)
-
-    # Process sparse features
+    feature_spec = self._get_feature_spec(self._params.pre_batch_size)
+    parsed_features = tf.io.parse_single_example(serialized_example, feature_spec)
+    labels = parsed_features[self.label_features]
+    dense_features = tf.stack(
+        [parsed_features[feat] for feat in self.dense_features], axis=-1)
     sparse_features = {}
     for i, sparse_ft in enumerate(self.sparse_features):
+      output_key = str(i)
       cat_ft_int64 = tf.io.decode_raw(parsed_features[sparse_ft], tf.int64)
-      cat_ft_int64 = tf.reshape(
-          cat_ft_int64,
-          [
-              batch_size,
-              self._multi_hot_sizes[i],
-          ],
-      )
+      cat_ft_int64 = tf.reshape(cat_ft_int64, [self._params.pre_batch_size, self._multi_hot_sizes[i]])
+      sparse_features[output_key] = cat_ft_int64
+    return {'clicked': labels, 'dense_features': dense_features, 'sparse_features': sparse_features}
 
-      # TODO(b/396189671): Logic needed for PartialTPUEmbedding.
-      # if self._vocab_sizes[i] > self._embedding_threshold:
-      #   sparse_features[str(i)] = tf.sparse.from_dense(cat_ft_int64)
-      # else:
-      #   sparse_features[str(i)] = cat_ft_int64
-
-      sparse_features[str(i)] = cat_ft_int64
-
-    return {
-        'clicked': labels,
-        'dense_features': dense_features,
-        'sparse_features': sparse_features,
-    }
+  def _get_direct_dummy_dataset(self, batch_size: int) -> tf.data.Dataset:
+    """Creates a TF dataset from cached dummy data of the final batch size."""
+    print(f'Returning a dummy dataset of final batch size {batch_size}')
+    dummy_data = get_dummy_batch(batch_size, self._multi_hot_sizes, self._vocab_sizes)
+    dataset = tf.data.Dataset.from_tensors(dummy_data)
+    return dataset.repeat()
 
   def _create_dataset(self) -> tf.data.Dataset:
     """Creates and configures the TensorFlow dataset."""
-    batch_size = self._params.global_batch_size // jax.process_count()
+    final_per_host_batch_size = self._params.global_batch_size // jax.process_count()
+
     if self._params.use_cached_data:
-      return self._get_cached_dummy_dataset(
-          batch_size, vocab_sizes=self._vocab_sizes
-      )
+      return self._get_direct_dummy_dataset(final_per_host_batch_size)
 
-    dataset = tf.data.Dataset.list_files(self._file_pattern, shuffle=False)
+    print(
+        f"[Process {jax.process_index()}] This host will produce batches of size {final_per_host_batch_size}. "
+        f"It will read TFRecords with pre_batch_size={self._params.pre_batch_size}, "
+        f"unbatch them, and then re-batch to the target size."
+    )
 
+    dataset = tf.data.Dataset.list_files(self._file_pattern, shuffle=self._params.is_training)
     dataset = dataset.shard(jax.process_count(), jax.process_index())
-
     if self._params.is_training:
-      # dataset = dataset.shuffle(4)
       dataset = dataset.repeat()
 
-    # We make 4 * num_processes TFRecord shards.
-    parallelism = PARALELLISM
-
     dataset = tf.data.TFRecordDataset(
-        dataset, buffer_size=32 * 1024 * 1024, num_parallel_reads=parallelism
-    )
+        dataset, buffer_size=32 * 1024 * 1024, num_parallel_reads=PARALELLISM)
 
-    # Parse examples
     dataset = dataset.map(
-        lambda x: self._parse_example(x, batch_size),
-        num_parallel_calls=parallelism,
-    )
+        self._parse_example, num_parallel_calls=tf.data.AUTOTUNE)
+
+    dataset = dataset.unbatch()
 
     if self._params.is_training and self._shuffle_buffer > 0:
       dataset = dataset.shuffle(self._shuffle_buffer)
 
-    if not self._params.is_training:
-      def _mark_as_padding(features):
-        return {
-            'clicked': -1 * tf.ones(
-                [
-                    batch_size,
-                ],
-                dtype=tf.int64,
-            ),
-            'dense_features': features['dense_features'],
-            'sparse_features': features['sparse_features'],
-        }
+    dataset = dataset.batch(
+        final_per_host_batch_size,
+        drop_remainder=True,
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
 
-      padding_ds = dataset.take(1)
-      padding_ds = padding_ds.map(_mark_as_padding).repeat(200)
-      dataset = dataset.concatenate(padding_ds).take(660).cache().repeat()
-
-    # dataset = dataset.prefetch(self._prefetch_size)
-
-    dataset = dataset.prefetch(buffer_size=2048)
+    dataset = dataset.take(1).cache().repeat()
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
     options = tf.data.Options()
-    options.deterministic = False
+    options.experimental_deterministic = False
     options.threading.private_threadpool_size = 96
     dataset = dataset.with_options(options)
     return dataset
@@ -277,28 +168,8 @@ class CriteoDataLoader:
   def get_iterator(self):
     """Returns an iterator over the dataset that provides NumPy arrays."""
     dataset = self._create_dataset()
+    return dataset.as_numpy_iterator()
 
-    def _convert_to_numpy(batch):
-      return {
-          'clicked': batch['clicked'].numpy(),
-          'dense_features': batch['dense_features'].numpy(),
-          'sparse_features': {
-              k: v.numpy() for k, v in batch['sparse_features'].items()
-          },
-      }
-
-    return map(_convert_to_numpy, iter(dataset))
-
-  def get_jax_arrays(
-      self, batch: Dict[str, np.ndarray]
-  ) -> Dict[str, jnp.ndarray]:
+  def get_jax_arrays(self, batch: Dict[str, np.ndarray]) -> Dict[str, jnp.ndarray]:
     """Converts a batch of NumPy arrays to JAX arrays."""
-    features = {
-        'clicked': jnp.array(batch['clicked']),
-        'dense_features': jnp.array(batch['dense_features']),
-        'sparse_features': {
-            k: jnp.array(v) for k, v in batch['sparse_features'].items()
-        },
-    }
-    return features
-
+    return jax.tree_util.tree_map(jnp.array, batch)
