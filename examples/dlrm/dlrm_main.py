@@ -5,6 +5,7 @@ import functools
 import threading
 import time
 from typing import Any, List, Mapping
+import os
 
 from absl import app
 from absl import flags
@@ -23,6 +24,7 @@ from jax_tpu_embedding.sparsecore.lib.flax import embed
 from jax_tpu_embedding.sparsecore.lib.flax import embed_optimizer
 from jax_tpu_embedding.sparsecore.lib.nn import embedding
 from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
+from jax_tpu_embedding.sparsecore.lib.fdo import file_fdo_client
 
 import numpy as np
 import optax
@@ -108,6 +110,17 @@ _FILE_PATTERN = flags.DEFINE_string(
     "File pattern for the training data.",
 )
 
+_FDO_DIR = flags.DEFINE_string(
+    'fdo_dir',
+    '/tmp',
+    'If set, FDO dumps will be written to the directory.',
+)
+
+
+_LOG_FREQUENCY = flags.DEFINE_integer(
+    'log_frequency', 10, 'Frequency to log metrics.'
+)
+
 _LEARNING_RATE = flags.DEFINE_float("learning_rate", 0.01, "Learning rate.")
 
 _NUM_DENSE_FEATURES = flags.DEFINE_integer(
@@ -128,7 +141,7 @@ _EMBEDDING_SIZE = flags.DEFINE_integer("embedding_size", 16, "Embedding size.")
 
 _ALLOW_ID_DROPPING = flags.DEFINE_bool(
     "allow_id_dropping",
-    False,
+    True,
     "If set, allow dropping ids during embedding lookup.",
 )
 
@@ -150,6 +163,10 @@ _MODEL_DIR = flags.DEFINE_string(
     "Model working directory.",
 )
 
+out_path = os.path.join('/tmp', 'fdo_dump')
+os.makedirs(out_path, exist_ok=True)
+logging.info('FDO storage path: %s', out_path)
+fdo_client = file_fdo_client.NPZFileFDOClient(out_path)
 
 def create_feature_specs(
     vocab_sizes: List[int],
@@ -220,6 +237,7 @@ class DLRMDataLoader:
     # Here we pass global batch size. TF.data will shard it.
     self.data_config = DataConfig(
         global_batch_size=batch_size,
+        pre_batch_size=4224,
         is_training=True,
         use_cached_data=False,
     )
@@ -229,7 +247,7 @@ class DLRMDataLoader:
         num_dense_features=_NUM_DENSE_FEATURES.value,
         vocab_sizes=VOCAB_SIZES,
         multi_hot_sizes=MULTI_HOT_SIZES,
-        embedding_threshold=_EMBEDDING_THRESHOLD.value,
+        #embedding_threshold=_EMBEDDING_THRESHOLD.value,
     )
     self._iterator = self._dataloader.get_iterator()
     self.batch_size = batch_size
@@ -266,18 +284,18 @@ class DLRMDataLoader:
     )
 
     # Process sparse features
-    processed_sparse = embedding.preprocess_sparse_dense_matmul_input(
+    processed_sparse, stats = embedding.preprocess_sparse_dense_matmul_input(
         sparse_features,
         feature_weights,
         self.feature_specs,
         self.mesh.local_mesh.size,
         self.mesh.size,
-        num_sc_per_device=4,
+        num_sc_per_device=2,
         sharding_strategy="MOD",
         allow_id_dropping=_ALLOW_ID_DROPPING.value,
-        static_buffer_size_multiplier=256,
-    )[:-1]
-
+        #static_buffer_size_multiplier=256,
+    )
+    fdo_client.record(stats)
     # Preprocess the inputs and build Jax global views of the data.
     # Global view is required for embedding lookup.
     make_global_view = lambda x: jax.tree.map(
@@ -289,12 +307,12 @@ class DLRMDataLoader:
     labels = make_global_view(labels)
     dense_features = make_global_view(dense_features)
     dense_lookups = make_global_view(dense_lookups)
-    processed_sparse = map(make_global_view, processed_sparse)
+    processed_sparse = make_global_view(processed_sparse)
     return [
         labels,
         dense_features,
         dense_lookups,
-        embed.EmbeddingLookups(*processed_sparse)
+        processed_sparse
     ]
 
   def _worker_loop(self):
@@ -331,7 +349,7 @@ class DLRMDataLoader:
       self.buffer.clear()
       self._sync.notify_all()
 
-    del self._iterator
+    #del self._iterator
 
 
 def test_dlrm_dcnv2_model():
@@ -342,6 +360,8 @@ def test_dlrm_dcnv2_model():
   global_devices = jax.devices()
   mesh = jax.sharding.Mesh(global_devices, "x")
   global_sharding = jax.sharding.NamedSharding(mesh, pd)
+  
+
 
   _, feature_specs = create_feature_specs(VOCAB_SIZES)
   def _get_max_ids_per_partition(name: str, batch_size: int) -> int:
@@ -356,7 +376,7 @@ def test_dlrm_dcnv2_model():
 
     """
     logging.info("max_ids_per_partition: %s : # of ids: %s", name, batch_size)
-    return 4096
+    return 2048
 
   def _get_max_unique_ids_per_partition(name: str, batch_size: int) -> int:
     """Reference implementation for calculating max unique ids per partition on the fly.
@@ -371,7 +391,7 @@ def test_dlrm_dcnv2_model():
     logging.info(
         "max_unique_ids_per_partition: %s : # of ids: %s", name, batch_size
     )
-    return 2048
+    return 512
 
   # Table stacking
   embedding.auto_stack_tables(
@@ -379,13 +399,13 @@ def test_dlrm_dcnv2_model():
       global_device_count=jax.device_count(),
       stack_to_max_ids_per_partition=_get_max_ids_per_partition,
       stack_to_max_unique_ids_per_partition=_get_max_unique_ids_per_partition,
-      num_sc_per_device=4,
+      num_sc_per_device=2,
   )
 
   embedding.prepare_feature_specs_for_training(
       feature_specs,
       global_device_count=jax.device_count(),
-      num_sc_per_device=4,
+      num_sc_per_device=2,
   )
 
   # Construct the model.
@@ -402,8 +422,8 @@ def test_dlrm_dcnv2_model():
   producer = DLRMDataLoader(
       file_pattern=_FILE_PATTERN.value,
       batch_size=_BATCH_SIZE.value,
-      num_workers=32,
-      buffer_size=256,
+      num_workers=16,
+      buffer_size=64,
       feature_specs=feature_specs,
       mesh=mesh,
       global_sharding=global_sharding,
@@ -512,7 +532,7 @@ def test_dlrm_dcnv2_model():
       labels: jax.Array,
       dense_features: jax.Array,
       dense_lookups: Any,
-      embedding_lookups: embed.EmbeddingLookups,
+      embedding_lookups: embed.EmbeddingLookupInput,
       opt_state,
   ):
     def forward_pass(
@@ -533,8 +553,8 @@ def test_dlrm_dcnv2_model():
         params, labels, dense_features, dense_lookups, embedding_lookups
     )
 
-    updates, opt_state = tx.update(grads, opt_state)
-    params = embed_optimizer.apply_updates_for_sc_model(params, updates)
+    #updates, opt_state = tx.update(grads, opt_state)
+    #params = embed_optimizer.apply_updates_for_sc_model(params, updates)
 
     return params, opt_state, loss_val
 
@@ -557,8 +577,29 @@ def test_dlrm_dcnv2_model():
           params, labels, dense_features, dense_lookups, embedding_lookups, opt_state
       )
 
+    
     if step == 200:
         jax.profiler.stop_trace()
+
+    if step % 10 == 0:
+        fdo_client.publish()
+
+
+    if step == 50:
+      (
+          max_ids_per_partition,
+          max_unique_ids_per_partition,
+          required_buffer_size_per_sc,
+      ) = fdo_client.load()
+      embedding.update_preprocessing_parameters(
+          feature_specs,
+          embedding.SparseDenseMatmulInputStats(
+              max_ids_per_partition=max_ids_per_partition,
+              max_unique_ids_per_partition=max_unique_ids_per_partition,
+              required_buffer_size_per_sc=required_buffer_size_per_sc,
+          ),
+          num_sc_per_device=2,
+      )
     
     if step % 1500 == 0:
       end_time = time.time()
@@ -581,4 +622,3 @@ def main(argv):
 
 if __name__ == "__main__":
   app.run(main)
-
