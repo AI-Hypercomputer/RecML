@@ -593,7 +593,7 @@ def test_dlrm_dcnv2_model():
     if step == 200:
         jax.profiler.stop_trace()
 
-    if step % 10 == 0:
+    if step == 50:
         fdo_client.publish()
         jax.experimental.multihost_utils.sync_global_devices("FDO CLIENT BARRIER")
         
