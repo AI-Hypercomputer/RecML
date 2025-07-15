@@ -163,6 +163,18 @@ _MODEL_DIR = flags.DEFINE_string(
     "Model working directory.",
 )
 
+_MAX_IDS = flags.DEFINE_integer(
+    "max_ids",
+    2048,
+    "max_ids",
+)
+
+_MAX_UNIQUE_IDS = flags.DEFINE_integer(
+    "max_unique_ids",
+    512,
+    "max_unique_ids",
+)
+
 out_path = os.path.join('gs://chandrasekhard/dlrm/fdo/', 'fdo_dump')
 os.makedirs(out_path, exist_ok=True)
 logging.info('FDO storage path: %s', out_path)
@@ -191,8 +203,8 @@ def create_feature_specs(
         optimizer=embedding_spec.AdagradOptimizerSpec(learning_rate=0.01),
         combiner="sum",
         name=table_name,
-        max_ids_per_partition=2048,
-        max_unique_ids_per_partition=512,
+        max_ids_per_partition=_MAX_IDS.value,
+        max_unique_ids_per_partition=_MAX_UNIQUE_IDS.value,
     )
     feature_spec = embedding_spec.FeatureSpec(
         table_spec=table_spec,
@@ -376,7 +388,7 @@ def test_dlrm_dcnv2_model():
 
     """
     logging.info("max_ids_per_partition: %s : # of ids: %s", name, batch_size)
-    return 2048
+    return _MAX_IDS.value
 
   def _get_max_unique_ids_per_partition(name: str, batch_size: int) -> int:
     """Reference implementation for calculating max unique ids per partition on the fly.
@@ -391,7 +403,7 @@ def test_dlrm_dcnv2_model():
     logging.info(
         "max_unique_ids_per_partition: %s : # of ids: %s", name, batch_size
     )
-    return 512
+    return _MAX_UNIQUE_IDS.value
 
   # Table stacking
   embedding.auto_stack_tables(
@@ -583,9 +595,10 @@ def test_dlrm_dcnv2_model():
 
     if step % 10 == 0:
         fdo_client.publish()
+        jax.experimental.multihost_utils.sync_global_devices("FDO CLIENT BARRIER")
+        
 
-    '''
-    if step == 50:
+    if step == 51:
       (
           max_ids_per_partition,
           max_unique_ids_per_partition,
@@ -600,7 +613,6 @@ def test_dlrm_dcnv2_model():
           ),
           num_sc_per_device=2,
       )
-    '''
     
     if step % 1500 == 0:
       end_time = time.time()
