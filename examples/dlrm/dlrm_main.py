@@ -434,8 +434,8 @@ def test_dlrm_dcnv2_model():
   producer = DLRMDataLoader(
       file_pattern=_FILE_PATTERN.value,
       batch_size=_BATCH_SIZE.value,
-      num_workers=16,
-      buffer_size=64,
+      num_workers=2,
+      buffer_size=2,
       feature_specs=feature_specs,
       mesh=mesh,
       global_sharding=global_sharding,
