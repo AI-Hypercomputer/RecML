@@ -2,37 +2,41 @@
 
 import collections
 import functools
+import os
 import threading
 import time
 from typing import Any, List, Mapping
-import os
 
 from absl import app
 from absl import flags
 from absl import logging
+import flax
 import jax
-from jax.experimental.layout import DeviceLocalLayout as DLL
-from jax.experimental.layout import Layout
+from jax.experimental.layout import Layout as DLL
+from jax.experimental.layout import Format
 import jax.numpy as jnp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+
+# Checkpointing and embedding spec proto imports
+import orbax.checkpoint as ocp
+from jax_tpu_embedding.sparsecore.lib.proto import embedding_spec_pb2
+
 from dataloader import CriteoDataLoader
 from dataloader import DataConfig
 from dlrm_model import DLRMDCNV2
 from dlrm_model import uniform_init
 from jax_tpu_embedding.sparsecore.lib.flax import embed
 from jax_tpu_embedding.sparsecore.lib.flax import embed_optimizer
+from jax_tpu_embedding.sparsecore.lib.fdo import file_fdo_client
 from jax_tpu_embedding.sparsecore.lib.nn import embedding
 from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
-from jax_tpu_embedding.sparsecore.lib.fdo import file_fdo_client
-
 import numpy as np
 import optax
 
-
-
 jax.distributed.initialize()
 import jax.profiler
+
 jax.profiler.start_server(9999)
 partial = functools.partial
 info = logging.info
@@ -111,14 +115,14 @@ _FILE_PATTERN = flags.DEFINE_string(
 )
 
 _FDO_DIR = flags.DEFINE_string(
-    'fdo_dir',
-    '/tmp',
-    'If set, FDO dumps will be written to the directory.',
+    "fdo_dir",
+    "/tmp",
+    "If set, FDO dumps will be written to the directory.",
 )
 
 
 _LOG_FREQUENCY = flags.DEFINE_integer(
-    'log_frequency', 10, 'Frequency to log metrics.'
+    "log_frequency", 10, "Frequency to log metrics."
 )
 
 _LEARNING_RATE = flags.DEFINE_float("learning_rate", 0.01, "Learning rate.")
@@ -163,6 +167,31 @@ _MODEL_DIR = flags.DEFINE_string(
     "Model working directory.",
 )
 
+# --- Checkpointing Flags Start ---
+_CHECKPOINT_DIR = flags.DEFINE_string(
+    'checkpoint_dir',
+    None,
+    'If set, checkpoints will be written to the directory.',
+)
+
+_CHECKPOINT_INTERVAL = flags.DEFINE_integer(
+    'checkpoint_interval', 1000, 'Number of steps per checkpoint'
+)
+
+_CHECKPOINT_RESUME = flags.DEFINE_bool(
+    'checkpoint_resume',
+    True,
+    'If set True and checkpoint_dir is specified, try to resume the training'
+    ' from the latest checkpoint available in the checkpoint_dir.',
+)
+
+_CHECKPOINT_MAX_TO_KEEP = flags.DEFINE_integer(
+    'checkpoint_max_to_keep',
+    5,
+    'Number of checkpoints to keep.',
+)
+# --- Checkpointing Flags End ---
+
 _MAX_IDS = flags.DEFINE_integer(
     "max_ids",
     2048,
@@ -175,10 +204,15 @@ _MAX_UNIQUE_IDS = flags.DEFINE_integer(
     "max_unique_ids",
 )
 
-out_path = os.path.join('gs://chandrasekhard/dlrm/fdo/', 'fdo_dump')
-os.makedirs(out_path, exist_ok=True)
-logging.info('FDO storage path: %s', out_path)
-fdo_client = file_fdo_client.NPZFileFDOClient(out_path)
+
+
+
+@flax.struct.dataclass
+class TrainState:
+  """State of the model and the training."""
+  params: Any
+  opt_state: Any
+
 
 def create_feature_specs(
     vocab_sizes: List[int],
@@ -191,8 +225,8 @@ def create_feature_specs(
   feature_specs = {}
   for i, vocab_size in enumerate(vocab_sizes):
     if vocab_size <= _EMBEDDING_THRESHOLD.value:
-        continue
-        
+      continue
+
     table_name = f"{i}"
     feature_name = f"{i}"
     bound = jnp.sqrt(1.0 / vocab_size)
@@ -234,6 +268,7 @@ class DLRMDataLoader:
       feature_specs=None,
       mesh=None,
       global_sharding=None,
+      fdo_client = None,
   ):
     """Initialize the producer.
 
@@ -251,7 +286,7 @@ class DLRMDataLoader:
         global_batch_size=batch_size,
         pre_batch_size=4224,
         is_training=True,
-        use_cached_data=False,
+        use_cached_data=False if file_pattern else True,
     )
     self._dataloader = CriteoDataLoader(
         file_pattern=file_pattern,
@@ -259,7 +294,7 @@ class DLRMDataLoader:
         num_dense_features=_NUM_DENSE_FEATURES.value,
         vocab_sizes=VOCAB_SIZES,
         multi_hot_sizes=MULTI_HOT_SIZES,
-        #embedding_threshold=_EMBEDDING_THRESHOLD.value,
+        # embedding_threshold=_EMBEDDING_THRESHOLD.value,
     )
     self._iterator = self._dataloader.get_iterator()
     self.batch_size = batch_size
@@ -270,6 +305,7 @@ class DLRMDataLoader:
     self.buffer = collections.deque(maxlen=buffer_size)
     self._sync = threading.Condition()
     self._workers = []
+    self.fdo_client = fdo_client
 
     for _ in range(num_workers):
       worker = threading.Thread(target=self._worker_loop, daemon=True)
@@ -289,10 +325,8 @@ class DLRMDataLoader:
     labels = feature_batch["clicked"]
 
     feature_weights = jax.tree_util.tree_map(
-        lambda x: np.array(
-            np.ones_like(x, shape=x.shape, dtype=np.float32)
-        ),
-        sparse_features
+        lambda x: np.array(np.ones_like(x, shape=x.shape, dtype=np.float32)),
+        sparse_features,
     )
 
     # Process sparse features
@@ -305,9 +339,9 @@ class DLRMDataLoader:
         num_sc_per_device=2,
         sharding_strategy="MOD",
         allow_id_dropping=_ALLOW_ID_DROPPING.value,
-        #static_buffer_size_multiplier=256,
+        # static_buffer_size_multiplier=256,
     )
-    fdo_client.record(stats)
+    self.fdo_client.record(stats)
     # Preprocess the inputs and build Jax global views of the data.
     # Global view is required for embedding lookup.
     make_global_view = lambda x: jax.tree.map(
@@ -320,24 +354,16 @@ class DLRMDataLoader:
     dense_features = make_global_view(dense_features)
     dense_lookups = make_global_view(dense_lookups)
     processed_sparse = make_global_view(processed_sparse)
-    return [
-        labels,
-        dense_features,
-        dense_lookups,
-        processed_sparse
-    ]
+    return [labels, dense_features, dense_lookups, processed_sparse]
 
   def _worker_loop(self):
     """Worker thread that continuously generates and processes batches."""
     while True:
       batch = next(self._iterator)
       processed_batch = self.process_inputs(batch)
-      # processed_batch = jax.device_put(processed_batch, self.global_sharding)
 
       with self._sync:
-        self._sync.wait_for(
-            lambda: len(self.buffer) < self.buffer.maxlen
-        )
+        self._sync.wait_for(lambda: len(self.buffer) < self.buffer.maxlen)
         self.buffer.append(processed_batch)
         self._sync.notify_all()
 
@@ -361,45 +387,33 @@ class DLRMDataLoader:
       self.buffer.clear()
       self._sync.notify_all()
 
-    #del self._iterator
+    # del self._iterator
 
 
 def test_dlrm_dcnv2_model():
   """Test DLRM DCN v2 model."""
+
+  # define fdo client
+  out_path = os.path.join(_MODEL_DIR.value, "fdo_dump")
+  os.makedirs(out_path, exist_ok=True)
+  logging.info("FDO storage path: %s", out_path)
+  fdo_client = file_fdo_client.NPZFileFDOClient(out_path)
 
   # Define sharding.
   pd = P("x")
   global_devices = jax.devices()
   mesh = jax.sharding.Mesh(global_devices, "x")
   global_sharding = jax.sharding.NamedSharding(mesh, pd)
-  
-
 
   _, feature_specs = create_feature_specs(VOCAB_SIZES)
+
   def _get_max_ids_per_partition(name: str, batch_size: int) -> int:
-    """Reference implementation for calculating max ids per partition on the fly.
-
-    Args:
-        name: Name of the feature.
-        batch_size: The size of each batch.
-
-    Returns:
-        Estimated maximum number of ids per partition.
-
-    """
+    """Reference implementation for calculating max ids per partition on the fly."""
     logging.info("max_ids_per_partition: %s : # of ids: %s", name, batch_size)
     return _MAX_IDS.value
 
   def _get_max_unique_ids_per_partition(name: str, batch_size: int) -> int:
-    """Reference implementation for calculating max unique ids per partition on the fly.
-
-    Args:
-        name: Name of the feature.
-        batch_size: The size of each batch.
-
-    Returns:
-        Estimated maximum number of unique ids per partition.
-    """
+    """Reference implementation for calculating max unique ids per partition."""
     logging.info(
         "max_unique_ids_per_partition: %s : # of ids: %s", name, batch_size
     )
@@ -431,6 +445,7 @@ def test_dlrm_dcnv2_model():
       vocab_sizes=VOCAB_SIZES,
   )
 
+  # Initialize model, optimizer, and state
   producer = DLRMDataLoader(
       file_pattern=_FILE_PATTERN.value,
       batch_size=_BATCH_SIZE.value,
@@ -439,34 +454,69 @@ def test_dlrm_dcnv2_model():
       feature_specs=feature_specs,
       mesh=mesh,
       global_sharding=global_sharding,
+      fdo_client=fdo_client,
   )
 
   _, dense_features, dense_lookups, embedding_lookups = next(producer)
   params = model.init(
       jax.random.key(42), dense_features, dense_lookups, embedding_lookups
   )
-
-  def get_shape(x):
-    return x.shape
-
-  logging.info(
-      "[chandra-debug] params: %s", jax.tree_util.tree_map(get_shape, params)
-  )
-  # logging.info("[chandra-debug] params is %s", params)
-
   tx = embed_optimizer.create_optimizer_for_sc_model(
       params,
       optax.adagrad(learning_rate=_LEARNING_RATE.value),
   )
-  opt_state = tx.init(params)
+  # Create a single TrainState
+  train_state = TrainState(params=params, opt_state=tx.init(params))
+  del params  # No longer needed
+
+  # --- Checkpointing Setup Start ---
+  chkpt_mgr = None
+  if _CHECKPOINT_DIR.value:
+    chkpt_mgr = ocp.CheckpointManager(
+        directory=os.path.join(_CHECKPOINT_DIR.value, "checkpoints"),
+        options=ocp.CheckpointManagerOptions(
+            max_to_keep=_CHECKPOINT_MAX_TO_KEEP.value,
+            save_interval_steps=_CHECKPOINT_INTERVAL.value,
+            enable_background_delete=True,
+        ),
+    )
+
+  latest_step = -1
+  if chkpt_mgr and _CHECKPOINT_RESUME.value:
+    latest_step = chkpt_mgr.latest_step()
+    if latest_step is not None:
+      logging.info("Resuming from checkpoint at step %d", latest_step)
+      restore_target = {
+          'train_state': ocp.args.PyTreeRestore(train_state),
+          'stacking_proto': ocp.args.ProtoRestore(
+              embedding_spec_pb2.EmbeddingSpecProto
+          ),
+      }
+      restored = chkpt_mgr.restore(
+          latest_step, args=ocp.args.Composite(**restore_target)
+      )
+      train_state = restored['train_state']
+    else:
+      logging.info("No checkpoint found, starting from scratch.")
+      latest_step = -1
+  # --- Checkpointing Setup End ---
+
+  # Define output shardings for JIT compilation
+  def get_shape(x):
+    return x.shape
+
+  logging.info(
+      "[chandra-debug] params: %s",
+      jax.tree_util.tree_map(get_shape, train_state.params),
+  )
 
   dense_out_shardings = {
       f"Dense_{i}": {
-          "bias": Layout(
+          "bias": Format(
               DLL(major_to_minor=(0,)),
               NamedSharding(mesh, P()),
           ),
-          "kernel": Layout(
+          "kernel": Format(
               DLL(major_to_minor=(0, 1)),
               NamedSharding(mesh, P()),
           ),
@@ -474,20 +524,18 @@ def test_dlrm_dcnv2_model():
       for i in range(8)
   }
 
-  print(feature_specs.items())
-
-  stacked_table_names = set([
-      f.table_spec.setting_in_stack.stack_name for _, f in feature_specs.items()
-  ])
+  stacked_table_names = set(
+      [f.table_spec.setting_in_stack.stack_name for _, f in feature_specs.items()]
+  )
 
   embedding_out_shardings = {
       "SparseCoreEmbed_0": {
           "sc_embedding_variables": embed.WithSparseCoreLayout(
               value={
-                  f"{key}": Layout(
+                  f"{key}": Format(
                       DLL(
                           major_to_minor=(0, 1),
-                          _tiling=((8,),),
+                          tiling=((8,),),
                       ),
                       NamedSharding(mesh, P("x", None)),
                   )
@@ -500,60 +548,54 @@ def test_dlrm_dcnv2_model():
   }
 
   dense_embed_out_shardings = {
-      f"Embed_{i}": Layout(
-          DLL(major_to_minor=(0, 1)), NamedSharding(mesh, P())
-      )
-      for i in range(26-len(feature_specs.items()))
+      f"Embed_{i}": Format(DLL(major_to_minor=(0, 1)), NamedSharding(mesh, P()))
+      for i in range(26 - len(feature_specs.items()))
   }
 
   dcn_out_shardings = {
-      f"bias_{i}": Layout(
-          DLL(major_to_minor=(0,)), NamedSharding(mesh, P())
-      )
+      f"bias_{i}": Format(DLL(major_to_minor=(0,)), NamedSharding(mesh, P()))
       for i in range(3)
   }
-  dcn_out_shardings.update({
-      f"u_kernel_{i}": Layout(
-          DLL(major_to_minor=(0, 1)), NamedSharding(mesh, P())
-      )
-      for i in range(3)
-  })
-  dcn_out_shardings.update({
-      f"v_kernel_{i}": Layout(
-          DLL(major_to_minor=(0, 1)), NamedSharding(mesh, P())
-      )
-      for i in range(3)
-  })
+  dcn_out_shardings.update(
+      {f"u_kernel_{i}": Format(DLL(major_to_minor=(0, 1)), NamedSharding(mesh, P())) for i in range(3)}
+  )
+  dcn_out_shardings.update(
+      {f"v_kernel_{i}": Format(DLL(major_to_minor=(0, 1)), NamedSharding(mesh, P())) for i in range(3)}
+  )
 
-  out_shardings = {
-      "params": {
-          **dense_out_shardings,
-          **embedding_out_shardings,
-          **dcn_out_shardings,
-          **dense_embed_out_shardings,
-      }
-  }
+  # Sharding for the entire TrainState object
+  # opt_state sharding is inferred by JAX to match params, so we pass None
+  train_state_shardings = TrainState(
+      params={
+          "params": {
+              **dense_out_shardings,
+              **embedding_out_shardings,
+              **dcn_out_shardings,
+              **dense_embed_out_shardings,
+          }
+      },
+      opt_state=None,
+  )
 
   @partial(
       jax.jit,
-      out_shardings=(out_shardings, None, None),
+      out_shardings=(train_state_shardings, None),
       donate_argnums=(0,),
   )
   def train_step(
-      params: Any,
+      train_state: TrainState,
       labels: jax.Array,
       dense_features: jax.Array,
       dense_lookups: Any,
       embedding_lookups: embed.EmbeddingLookupInput,
-      opt_state,
   ):
     def forward_pass(
         params, labels, dense_features, dense_lookups, embedding_lookups
     ):
-      logits = model.apply(params, dense_features, dense_lookups, embedding_lookups)
-      xentropy = optax.sigmoid_binary_cross_entropy(
-          logits=logits, labels=labels
+      logits = model.apply(
+          params, dense_features, dense_lookups, embedding_lookups
       )
+      xentropy = optax.sigmoid_binary_cross_entropy(logits=logits, labels=labels)
       return jnp.mean(xentropy), logits
 
     # Run model forward/backward pass.
@@ -562,21 +604,30 @@ def test_dlrm_dcnv2_model():
     )
 
     (loss_val, unused_logits), grads = train_step_fn(
-        params, labels, dense_features, dense_lookups, embedding_lookups
+        train_state.params,
+        labels,
+        dense_features,
+        dense_lookups,
+        embedding_lookups,
     )
 
-    #updates, opt_state = tx.update(grads, opt_state)
-    #params = embed_optimizer.apply_updates_for_sc_model(params, updates)
+    updates, new_opt_state = tx.update(grads, train_state.opt_state)
+    new_params = embed_optimizer.apply_updates_for_sc_model(
+        train_state.params, updates
+    )
 
-    return params, opt_state, loss_val
+    return train_state.replace(
+        params=new_params, opt_state=new_opt_state
+    ), loss_val
 
   start_time = time.time()
+  start_step = latest_step + 1
 
-  #with XprofHelper(start_step=100 + 100, num_steps=50) as xprof_helper:
-  for step in range(_NUM_STEPS.value):
-    #xprof_helper.step()
+  # with XprofHelper(start_step=100 + 100, num_steps=50) as xprof_helper:
+  for step in range(start_step, _NUM_STEPS.value):
+    # xprof_helper.step()
     if step == 100:
-            jax.profiler.start_trace("/tmp/tensorboard")
+      jax.profiler.start_trace("/tmp/tensorboard")
     with jax.profiler.StepTraceAnnotation("step", step_num=step):
       # --------------------------------------------------------------------------
       # Step 1: SC input processing.
@@ -585,21 +636,41 @@ def test_dlrm_dcnv2_model():
       # ------------------------------------------------------------------------
       # Step 2: run model.
       # ------------------------------------------------------------------------
-      params, opt_state, loss_val = train_step(
-          params, labels, dense_features, dense_lookups, embedding_lookups, opt_state
+      train_state, loss_val = train_step(
+          train_state,
+          labels,
+          dense_features,
+          dense_lookups,
+          embedding_lookups,
       )
 
-    
     if step == 200:
-        jax.profiler.stop_trace()
+      jax.profiler.stop_trace()
 
-    if step % 10 == 0:
-        fdo_client.publish()
-        jax.experimental.multihost_utils.sync_global_devices("FDO CLIENT BARRIER")
-        
+    
+    if chkpt_mgr and (step + 1) % _CHECKPOINT_INTERVAL.value == 0:
+      logging.info("Saving checkpoint at step %d", step)
+      stacking_proto = embedding.create_proto_from_feature_specs(
+          feature_specs,
+          global_device_count=jax.device_count(),
+          num_sparsecore_per_device=2,
+      )
+      chkpt_mgr.save(
+          step,
+          args=ocp.args.Composite(
+              train_state=ocp.args.PyTreeSave(train_state),
+              stacking_proto=ocp.args.ProtoSave(stacking_proto),
+          ),
+      )
+    
 
-    '''
-    if step == 51:
+    if step % 1000 == 0:
+      fdo_client.publish()
+      jax.experimental.multihost_utils.sync_global_devices(
+          "FDO CLIENT BARRIER"
+      )
+
+    if step == 1500:
       (
           max_ids_per_partition,
           max_unique_ids_per_partition,
@@ -614,24 +685,46 @@ def test_dlrm_dcnv2_model():
           ),
           num_sc_per_device=2,
       )
-    '''
-    
-    if step % 1500 == 0:
-      end_time = time.time()
 
+    if (step % 1500 == 0) and (step > start_step):
+      end_time = time.time()
       logging.info(
-        "Step %s: %lf, mean_step_time = %lf",
-        step,
-        loss_val,
-        (end_time - start_time) / 100,
+          "Step %s: %lf, mean_step_time = %lf",
+          step,
+          loss_val,
+          (end_time - start_time) / 1500,
       )
       start_time = time.time()
+
+  # --- Checkpointing Finalize Start ---
+  if chkpt_mgr:
+    # Save final step
+    stacking_proto = embedding.create_proto_from_feature_specs(
+        feature_specs,
+        global_device_count=jax.device_count(),
+        num_sparsecore_per_device=2,
+    )
+    chkpt_mgr.save(
+        _NUM_STEPS.value - 1,
+        args=ocp.args.Composite(
+            train_state=ocp.args.PyTreeSave(train_state),
+            stacking_proto=ocp.args.ProtoSave(stacking_proto),
+        ),
+        force=True, # force save even if not on interval
+    )
+    logging.info("Waiting for final checkpoint to save...")
+    chkpt_mgr.wait_until_finished()
+    chkpt_mgr.close()
+    logging.info("Checkpoint manager closed.")
+  # --- Checkpointing Finalize End ---
+
   producer.stop()
 
 
 def main(argv):
   del argv
-  #webserver_start.StartXprofServerBasedOnFlags()
+  # webserver_start.StartXprofServerBasedOnFlags()
+  
   test_dlrm_dcnv2_model()
 
 
