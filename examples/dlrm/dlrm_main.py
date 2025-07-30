@@ -361,6 +361,7 @@ class DLRMDataLoader:
     while True:
       batch = next(self._iterator)
       processed_batch = self.process_inputs(batch)
+      # processed_batch = jax.device_put(processed_batch, self.global_sharding)
 
       with self._sync:
         self._sync.wait_for(lambda: len(self.buffer) < self.buffer.maxlen)
@@ -647,7 +648,7 @@ def test_dlrm_dcnv2_model():
     if step == 200:
       jax.profiler.stop_trace()
 
-    
+    # --- Checkpointing Save Logic Start ---
     if chkpt_mgr and (step + 1) % _CHECKPOINT_INTERVAL.value == 0:
       logging.info("Saving checkpoint at step %d", step)
       stacking_proto = embedding.create_proto_from_feature_specs(
@@ -662,7 +663,7 @@ def test_dlrm_dcnv2_model():
               stacking_proto=ocp.args.ProtoSave(stacking_proto),
           ),
       )
-    
+    # --- Checkpointing Save Logic End ---
 
     if step % 1000 == 0:
       fdo_client.publish()
@@ -671,18 +672,10 @@ def test_dlrm_dcnv2_model():
       )
 
     if step == 1500:
-      (
-          max_ids_per_partition,
-          max_unique_ids_per_partition,
-          required_buffer_size_per_sc,
-      ) = fdo_client.load()
+      loaded_stats = fdo_client.load()
       embedding.update_preprocessing_parameters(
           feature_specs,
-          embedding.SparseDenseMatmulInputStats(
-              max_ids_per_partition=max_ids_per_partition,
-              max_unique_ids_per_partition=max_unique_ids_per_partition,
-              required_buffer_size_per_sc=required_buffer_size_per_sc,
-          ),
+          loaded_stats,
           num_sc_per_device=2,
       )
 
