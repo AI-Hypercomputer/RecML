@@ -1,5 +1,6 @@
 """DLRM DCN v2 model."""
 
+
 from typing import List
 
 from flax import linen as nn
@@ -15,7 +16,7 @@ Nested = embedding.Nested
 
 
 def uniform_init(bound: float):
-  def init(key, shape, dtype=jnp.float_):
+  def init(key, shape, dtype=jnp.float32):
     return jax.random.uniform(
         key,
         shape=shape,
@@ -27,7 +28,6 @@ def uniform_init(bound: float):
 
 
 class DLRMDCNV2(nn.Module):
-  """DLRM DCN v2 model."""
   feature_specs: Nested[embedding_spec.FeatureSpec]
   mesh: jax.sharding.Mesh
   sharding_axis: str
@@ -46,6 +46,7 @@ class DLRMDCNV2(nn.Module):
       x = nn.Dense(
           dim,
           kernel_init=uniform_init(bound),
+          use_bias=True,
           bias_init=uniform_init(bound),
       )(x)
       x = nn.relu(x)
@@ -58,6 +59,7 @@ class DLRMDCNV2(nn.Module):
       x = nn.Dense(
           dim,
           kernel_init=uniform_init(bound),
+          use_bias=True,
           bias_init=uniform_init(bound),
       )(x)
       x = nn.relu(x)
@@ -66,10 +68,11 @@ class DLRMDCNV2(nn.Module):
     bound = jnp.sqrt(1.0 / previous_dim)
     x = nn.Dense(
         self.top_mlp_dims[-1],
+        use_bias=True,
         kernel_init=uniform_init(bound),
         bias_init=uniform_init(bound),
     )(x)
-    x = nn.sigmoid(x)
+    #x = nn.sigmoid(x)
     return x
 
   def dcn_layer(self, x0):
@@ -151,4 +154,3 @@ class DLRMDCNV2(nn.Module):
     predictions = jnp.reshape(predictions, (-1,))
 
     return predictions
-
