@@ -14,6 +14,7 @@
 """Tests or utilities."""
 
 from collections.abc import Sequence
+import logging
 
 from absl import flags
 from absl.testing import absltest
@@ -23,6 +24,7 @@ import jax.numpy as jnp
 import keras
 import keras_hub
 import numpy as np
+import orbax.checkpoint as ocp
 from recml.core.utils import keras_utils
 
 _LEARNING_RATE_SCHEDULE = keras.optimizers.schedules.PolynomialDecay(
@@ -68,31 +70,66 @@ class KerasUtilsTest(parameterized.TestCase):
           "testcase_name": "single_core",
           "data_parallel": False,
           "restore_with_checkpointer": True,
+          "legacy_format": False,
       },
       {
           "testcase_name": "data_parallel",
           "data_parallel": True,
           "restore_with_checkpointer": True,
+          "legacy_format": False,
       },
       {
           "testcase_name": "restore_without_checkpointer_data_parallel",
           "data_parallel": True,
           "restore_with_checkpointer": False,
+          "legacy_format": False,
       },
       {
           "testcase_name": "restore_without_checkpointer_model_parallel",
           "data_parallel": False,
           "restore_with_checkpointer": False,
+          "legacy_format": False,
+      },
+      {
+          "testcase_name": "single_core_legacy_format",
+          "data_parallel": False,
+          "restore_with_checkpointer": True,
+          "legacy_format": True,
+      },
+      {
+          "testcase_name": "data_parallel_legacy_format",
+          "data_parallel": True,
+          "restore_with_checkpointer": True,
+          "legacy_format": True,
+      },
+      {
+          "testcase_name": (
+              "restore_without_checkpointer_data_parallel_legacy_format"
+          ),
+          "data_parallel": True,
+          "restore_with_checkpointer": False,
+          "legacy_format": True,
+      },
+      {
+          "testcase_name": (
+              "restore_without_checkpointer_model_parallel_legacy_format"
+          ),
+          "data_parallel": False,
+          "restore_with_checkpointer": False,
+          "legacy_format": True,
       },
   )
   def test_keras_orbax_checkpointer(
-      self, data_parallel: bool, restore_with_checkpointer: bool
+      self,
+      data_parallel: bool,
+      restore_with_checkpointer: bool,
+      legacy_format: bool,
   ):
     if data_parallel:
       keras.distribution.set_distribution(keras.distribution.DataParallel())
     checkpoint_dir = self.create_tempdir().full_path
     checkpointer = keras_utils.KerasOrbaxCheckpointManager(
-        checkpoint_dir, max_to_keep=5
+        checkpoint_dir, max_to_keep=5, legacy_format=legacy_format
     )
     epoch = 1
     dummy_inputs = {
@@ -142,7 +179,9 @@ class KerasUtilsTest(parameterized.TestCase):
     if restore_with_checkpointer:
       checkpointer.restore_model_variables(bert_pretrainer, epoch)
     else:
-      keras_utils.restore_keras_model(bert_pretrainer, checkpoint_dir)
+      keras_utils.restore_keras_model(
+          bert_pretrainer, checkpoint_dir, legacy_format=legacy_format
+      )
     restored_state = (
         [v.value for v in bert_pretrainer.trainable_variables],
         [v.value for v in bert_pretrainer.non_trainable_variables],
@@ -159,6 +198,40 @@ class KerasUtilsTest(parameterized.TestCase):
 
     # Ensures predictions are identical.
     self.assertTrue(_close(preds, preds_after_restoration))
+
+  def test_path_trie(self):
+    path_trie = keras_utils.PathTrie()
+    input_list_1 = [
+        "seed_generator_31/seed_generator_state",
+        "transformer_layer_0/self_attention_layer/seed_generator_32/seed_generator_state",
+        "transformer_layer_0/seed_generator_33/seed_generator_state",
+        "transformer_layer_0/seed_generator_34/seed_generator_state",
+        "aaa/bcd/ee_0/xyx",
+        "aaa/bcd/ee_0/ee_1",
+        "aaa/bcd/ee_0/ee_2",
+        "aaa/bcd/ee_1/zzz",
+        "aaa/cde/ee_2/fgh",
+        "bbb/data/images/img_01.jpg",
+        "bbb/data/images/img_02.jpg",
+        "bbb/data/text/doc.txt",
+    ]
+    for path in input_list_1:
+      path_trie.insert(path)
+    expected_output = [
+        "seed_generator/seed_generator_state",
+        "transformer_layer/self_attention_layer/seed_generator/seed_generator_state",
+        "transformer_layer/seed_generator/seed_generator_state",
+        "transformer_layer/seed_generator_1/seed_generator_state",
+        "aaa/bcd/ee/xyx",
+        "aaa/bcd/ee/ee",
+        "aaa/bcd/ee/ee_1",
+        "aaa/bcd/ee_1/zzz",
+        "aaa/cde/ee/fgh",
+        "bbb/data/images/img_01.jpg",
+        "bbb/data/images/img_02.jpg",
+        "bbb/data/text/doc.txt",
+    ]
+    self.assertEqual(path_trie.get_all_paths(), expected_output)
 
   def test_restore_keras_model_error_cases(self):
     checkpoint_dir = self.create_tempdir().full_path
@@ -354,6 +427,55 @@ class KerasUtilsTest(parameterized.TestCase):
     self.assertEqual(
         target_bert_pretrainer._initial_epoch, expected_initial_epoch
     )
+
+  def test_restore_ckpt_with_transform(self):
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpointer = keras_utils.KerasOrbaxCheckpointManager(
+        checkpoint_dir, legacy_format=False
+    )
+    epoch = 2
+    dummy_inputs = {
+        "token_ids": jax.random.randint(
+            jax.random.key(0), (64, 128), minval=0, maxval=50_000
+        ),
+        "segment_ids": jax.random.randint(
+            jax.random.key(0), (64, 128), minval=0, maxval=7
+        ),
+        "padding_mask": jax.random.uniform(jax.random.key(0), (64, 128)),
+        "mask_positions": jax.random.randint(
+            jax.random.key(0), (64, 20), minval=0, maxval=128
+        ),
+    }
+
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    checkpointer.save_model_variables(bert_pretrainer, epoch)
+    checkpointer.wait_until_finished()
+    target_bert_pretrainer = _create_model(
+        jax.tree.map(jnp.shape, dummy_inputs)
+    )
+    keras_utils.restore_keras_model(
+        target_bert_pretrainer,
+        checkpoint_dir,
+        legacy_format=False,
+        transforms={
+            r"(.*)transformer_layer_2(.*)": ocp.Transform(
+                original_key=r"\1transformer_layer_1\2"
+            ),
+        },
+    )
+    target_variables_list = []
+    source_variables_list = []
+    for v in target_bert_pretrainer.trainable_variables:
+      if "transformer_layer_2" in v.path:
+        target_variables_list.append(v)
+    for v in bert_pretrainer.trainable_variables:
+      if "transformer_layer_1" in v.path:
+        source_variables_list.append(v)
+    for v1, v2 in zip(target_variables_list, source_variables_list):
+      np.testing.assert_almost_equal(
+          keras.ops.convert_to_numpy(v1.value),
+          keras.ops.convert_to_numpy(v2.value),
+      )
 
 
 if __name__ == "__main__":
