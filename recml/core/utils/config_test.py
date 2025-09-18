@@ -72,8 +72,8 @@ class ConfigTest(parameterized.TestCase):
           'testcase_name': 'relative_fiddler',
           'args': [
               f'config:{_TEST_MODULE_NAME}.config_1',
-              'fiddler:fiddler_1',
-              'fiddler:fiddler_2(value=4)',
+              f'fiddler:{_TEST_MODULE_NAME}.fiddler_1',
+              f'fiddler:{_TEST_MODULE_NAME}.fiddler_2(value=4)',
           ],
           'expected_config': fdl.Config(
               _Object,
