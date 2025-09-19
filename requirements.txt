@@ -36,7 +36,7 @@ jaxlib==0.6.0
 jaxtyping==0.3.1
 jinja2==3.1.6
 kagglehub==0.3.11
-keras==3.9.2
+keras==3.11.3
 keras-hub==0.20.0
 libclang==18.1.1
 libcst==1.7.0
