@@ -107,7 +107,7 @@ class DataParallelPartitioner(Partitioner):
   def partition_init(
       self, init_fn: CreateStateFn, *, abstract_batch: PyTree | None = None
   ) -> CreateStateFn:
-    with jax.sharding.use_mesh(self.mesh):
+    with jax.set_mesh(self.mesh):
       if abstract_batch is not None:
         abstract_state = jax.eval_shape(init_fn, abstract_batch)
         specs = nn.get_partition_spec(abstract_state)
@@ -117,7 +117,7 @@ class DataParallelPartitioner(Partitioner):
       init_fn = jax.jit(init_fn, out_shardings=self.state_sharding)
 
     def _wrapped_init(batch: PyTree) -> State:
-      with jax.sharding.use_mesh(self.mesh):
+      with jax.set_mesh(self.mesh):
         state = init_fn(batch)
         state = _maybe_unbox_state(state)
         return state
@@ -130,7 +130,7 @@ class DataParallelPartitioner(Partitioner):
       jit_kws["out_shardings"] = (self.state_sharding, None)
       jit_kws["donate_argnums"] = (1,)
 
-    with jax.sharding.use_mesh(self.mesh):
+    with jax.set_mesh(self.mesh):
       step_fn = jax.jit(
           fn,
           in_shardings=(self.data_sharding, self.state_sharding),
@@ -138,7 +138,7 @@ class DataParallelPartitioner(Partitioner):
       )
 
     def _wrapped_step(batch: PyTree, state: State) -> Any:
-      with jax.sharding.use_mesh(self.mesh):
+      with jax.set_mesh(self.mesh):
         return step_fn(batch, state)
 
     return _wrapped_step
@@ -217,7 +217,7 @@ class ModelParallelPartitioner(Partitioner):
   def mesh_context_manager(
       self,
   ) -> Callable[[jax.sharding.Mesh], ContextManager[None]]:
-    return jax.sharding.use_mesh
+    return jax.set_mesh
 
   def shard_inputs(self, inputs: PyTree) -> PyTree:
     def _shard(x: np.ndarray) -> jax.Array:
