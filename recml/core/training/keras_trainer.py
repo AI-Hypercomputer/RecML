@@ -18,6 +18,7 @@ from __future__ import annotations
 import abc
 from collections.abc import Mapping
 import dataclasses
+import functools
 import gc
 import os
 import time
@@ -96,7 +97,6 @@ class KerasTask(abc.ABC):
       model: The Keras model constructed by `create_model`.
       model_dir: The model directory passed to the trainer.
     """
-    model.save(os.path.join(model_dir, core.KERAS_MODEL_SAVEFILE))
 
 
 class KerasTrainer(core.Trainer[KerasTask]):
@@ -118,6 +118,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       max_checkpoints_to_keep: int = 5,
       checkpoint_save_interval_epochs: int = 1,
       rng_seed: int = core.DEFAULT_RNG_SEED,
+      legacy_checkpoint_format: bool = True,
   ):
     """Initializes the instance."""
 
@@ -143,60 +144,77 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._steps_per_eval = steps_per_eval
     self._continuous_eval_timeout = continuous_eval_timeout
     self._steps_per_loop = steps_per_loop
-    self._checkpoint_manager = None
     self._marker_path = os.path.join(
         model_dir, core.TRAINING_COMPLETE_MARKER_FILE
     )
     self._checkpoint_dir = os.path.join(model_dir, core.CHECKPOINT_DIR)
+    self._max_checkpoints_to_keep = max_checkpoints_to_keep
+    self._checkpoint_save_interval_epochs = checkpoint_save_interval_epochs
+    self._legacy_checkpoint_format = legacy_checkpoint_format
 
+  @functools.cached_property
+  def train_callbacks(self) -> list[keras.callbacks.Callback]:
+    """Returns the training callbacks."""
     if keras.backend.backend() == "jax":
-      self._checkpoint_manager = keras_utils.KerasOrbaxCheckpointManager(
-          checkpoint_dir=self._checkpoint_dir,
-          max_to_keep=max_checkpoints_to_keep,
-          save_interval_epochs=checkpoint_save_interval_epochs,
-      )
-      self._train_callbacks = [
+      if self._legacy_checkpoint_format:
+        checkpoint_manager = keras_utils.KerasOrbaxCheckpointManager(
+            checkpoint_dir=self._checkpoint_dir,
+            max_to_keep=self._max_checkpoints_to_keep,
+            save_interval_epochs=self._checkpoint_save_interval_epochs,
+        )
+      else:
+        checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+            checkpoint_dir=self._checkpoint_dir,
+            max_to_keep=self._max_checkpoints_to_keep,
+            save_interval_epochs=self._checkpoint_save_interval_epochs,
+        )
+      return [
           keras_utils.EpochSummaryCallback(
-              log_dir=os.path.join(model_dir, core.LOG_DIR),
-              steps_per_epoch=steps_per_loop,
+              log_dir=os.path.join(self._model_dir, core.LOG_DIR),
+              steps_per_epoch=self._steps_per_loop,
               write_steps_per_second=True,
           ),
           keras_utils.EpochOrbaxCheckpointAndRestoreCallback(
-              checkpoint_manager=self._checkpoint_manager,
+              checkpoint_manager=checkpoint_manager,
               marker_path=self._marker_path,
           ),
       ]
-      self._eval_callbacks = [
+    return [
+        keras.callbacks.TensorBoard(
+            log_dir=os.path.join(self._model_dir, core.LOG_DIR),
+            write_steps_per_second=True,
+        ),
+        keras.callbacks.BackupAndRestore(
+            backup_dir=os.path.join(self._model_dir, core.BACKUP_DIR),
+        ),
+        keras.callbacks.ModelCheckpoint(
+            filepath=os.path.join(
+                self._model_dir,
+                core.CHECKPOINT_DIR,
+                "ckpt-{epoch:d}.weights.h5",
+            ),
+            save_weights_only=True,
+            verbose=1,
+        ),
+    ]
+
+  @functools.cached_property
+  def eval_callbacks(self) -> list[keras.callbacks.Callback]:
+    """Returns the evaluation callbacks."""
+    if keras.backend.backend() == "jax":
+      return [
           keras_utils.EpochSummaryCallback(
-              log_dir=os.path.join(model_dir, core.LOG_DIR),
-              steps_per_epoch=steps_per_loop,
+              log_dir=os.path.join(self._model_dir, core.LOG_DIR),
+              steps_per_epoch=self._steps_per_loop,
               write_steps_per_second=False,
           ),
       ]
-    else:
-      self._checkpoint_manager = None
-      self._train_callbacks = [
-          keras.callbacks.TensorBoard(
-              log_dir=os.path.join(model_dir, core.LOG_DIR),
-              write_steps_per_second=True,
-          ),
-          keras.callbacks.BackupAndRestore(
-              backup_dir=os.path.join(model_dir, core.BACKUP_DIR),
-          ),
-          keras.callbacks.ModelCheckpoint(
-              filepath=os.path.join(
-                  model_dir, core.CHECKPOINT_DIR, "ckpt-{epoch:d}.weights.h5"
-              ),
-              save_weights_only=True,
-              verbose=1,
-          ),
-      ]
-      self._eval_callbacks = [
-          keras.callbacks.TensorBoard(
-              log_dir=os.path.join(model_dir, core.LOG_DIR),
-              write_steps_per_second=True,
-          ),
-      ]
+    return [
+        keras.callbacks.TensorBoard(
+            log_dir=os.path.join(self._model_dir, core.LOG_DIR),
+            write_steps_per_second=True,
+        ),
+    ]
 
   def _maybe_get_model_kws(
       self, task: KerasTask, dataset: tf.data.Dataset
@@ -216,9 +234,11 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
     history = model.fit(
         dataset,
-        epochs=self._train_epochs,
+        epochs=self._train_epochs + 1,
         steps_per_epoch=self._steps_per_loop,
-        callbacks=self._train_callbacks,
+        callbacks=self.train_callbacks,
+        initial_epoch=1,
+        verbose=0,  # Disable progbar for better TPU utilization
     )
     model.summary(print_fn=logging.info)
 
@@ -237,15 +257,16 @@ class KerasTrainer(core.Trainer[KerasTask]):
     if keras.backend.backend() == "jax":
       [tb_cbk] = [
           cbk
-          for cbk in self._eval_callbacks
+          for cbk in self.eval_callbacks
           if isinstance(cbk, keras_utils.EpochSummaryCallback)
       ]
       epoch_start_time = time.time()
       history = model.evaluate(
           dataset,
           steps=self._steps_per_eval,
-          callbacks=self._eval_callbacks,
+          callbacks=self.eval_callbacks,
           return_dict=True,
+          verbose=0,  # Disable progbar for better TPU utilization
       )
       epoch_dt = time.time() - epoch_start_time
       steps_per_second = self._steps_per_eval / epoch_dt
@@ -257,7 +278,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
     return model.evaluate(
         dataset,
         steps=self._steps_per_eval,
-        callbacks=self._eval_callbacks,
+        callbacks=self.eval_callbacks,
+        verbose=0,  # Disable progbar for better TPU utilization
     )
 
   def train_and_evaluate(self, task: KerasTask) -> core.Logs:
@@ -273,11 +295,13 @@ class KerasTrainer(core.Trainer[KerasTask]):
     history = model.fit(
         train_dataset,
         validation_data=eval_dataset,
-        epochs=self._train_epochs,
+        epochs=self._train_epochs + 1,
         steps_per_epoch=self._steps_per_loop,
         # Explicitly set to None for deterministic evaluation.
         validation_steps=None,
-        callbacks=self._train_callbacks,
+        callbacks=self.train_callbacks,
+        initial_epoch=1,
+        verbose=0,  # Disable progbar for better TPU utilization
     )
     model.summary(print_fn=logging.info)
 
@@ -308,7 +332,10 @@ class KerasTrainer(core.Trainer[KerasTask]):
     else:
       steps_msg = "running complete evaluation..."
 
+    use_legacy_checkpoint_format = self._legacy_checkpoint_format
+
     class _RestoreCallback(keras.callbacks.Callback):
+      """Callback for restoring the model from the latest checkpoint."""
 
       def __init__(
           self,
@@ -319,9 +346,14 @@ class KerasTrainer(core.Trainer[KerasTask]):
         self._epoch = epoch
 
       def on_test_begin(self, logs: Mapping[str, Any] | None = None):
-        keras_utils.restore_keras_model(
-            model, self._checkpoint_dir, step=self._epoch
-        )
+        if use_legacy_checkpoint_format:
+          keras_utils.restore_keras_model(
+              model, self._checkpoint_dir, step=self._epoch
+          )
+        else:
+          keras_utils.restore_keras_checkpoint(
+              self._checkpoint_dir, model=model, epoch=self._epoch
+          )
 
     history = None
     for epoch in ocp.checkpoint_utils.checkpoints_iterator(
@@ -332,7 +364,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       restore_callback = _RestoreCallback(self._checkpoint_dir, epoch)
       [tb_cbk] = [
           cbk
-          for cbk in self._eval_callbacks
+          for cbk in self.eval_callbacks
           if isinstance(cbk, keras_utils.EpochSummaryCallback)
       ]
       try:
@@ -346,8 +378,9 @@ class KerasTrainer(core.Trainer[KerasTask]):
         history = model.evaluate(
             eval_dataset,
             steps=self._steps_per_eval,
-            callbacks=[restore_callback] + self._eval_callbacks,
+            callbacks=[restore_callback] + self.eval_callbacks,
             return_dict=True,
+            verbose=0,  # Disable progbar for better TPU utilization
         )
 
         logging.info(
