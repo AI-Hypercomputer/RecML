@@ -19,7 +19,6 @@ from collections.abc import Iterator, Mapping, Sequence
 import dataclasses
 from typing import Generic, Literal, TypeVar
 
-from etils import epy
 import fiddle as fdl
 import flax.linen as nn
 import jax
@@ -30,9 +29,6 @@ import optax
 import recml
 from recml.layers.linen import sparsecore
 import tensorflow as tf
-
-with epy.lazy_imports():
-  from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec  # pylint: disable=g-import-not-at-top
 
 
 @dataclasses.dataclass
@@ -254,14 +250,14 @@ class PredictionTask(recml.JaxTask):
     )
     return train_iter, eval_iter
 
-  def create_state(self, batch: jt.PyTree, rng: jt.Array) -> recml.JaxState:
+  def create_state(self, batch: jt.PyTree) -> recml.JaxState:
     inputs, _ = batch
-    params = self.model.init(rng, inputs)
+    params = self.model.init(jax.random.key(42), inputs)
     optimizer = self.optimizer.make()
     return recml.JaxState.create(params=params, tx=optimizer)
 
   def train_step(
-      self, batch: jt.PyTree, state: recml.JaxState, rng: jt.Array
+      self, batch: jt.PyTree, state: recml.JaxState
   ) -> tuple[recml.JaxState, Mapping[str, recml.Metric]]:
     inputs, label = batch
 
@@ -371,7 +367,7 @@ def experiment() -> fdl.Config[recml.Experiment]:
           DLRMModel,
           features=feature_set,
           embedding_optimizer=fdl.Config(
-              embedding_spec.AdagradOptimizerSpec,
+              sparsecore.specs.AdagradOptimizerSpec,
               learning_rate=0.01,
           ),
           bottom_mlp_dims=[512, 256, 128],
