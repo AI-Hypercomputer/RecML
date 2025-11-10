@@ -31,7 +31,7 @@ import tensorflow as tf
 
 with epy.lazy_imports():
   # pylint: disable=g-import-not-at-top
-  from jax_tpu_embedding.sparsecore.lib.flax import embed
+  from jax_tpu_embedding.sparsecore.lib.flax.linen import embed
   from jax_tpu_embedding.sparsecore.lib.nn import embedding
   from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
   from jax_tpu_embedding.sparsecore.lib.nn import table_stacking
@@ -334,7 +334,7 @@ class SparsecorePreprocessor:
           weights[key] = np.reshape(weights[key], (-1, 1))
 
     self._batch_number += 1
-    csr_inputs, _ = embedding.preprocess_sparse_dense_matmul_input(
+    preprocessed_inputs, _ = embedding.preprocess_sparse_dense_matmul_input(
         features=features,
         features_weights=weights,
         feature_specs=self.sparsecore_config.feature_specs,
@@ -345,6 +345,7 @@ class SparsecorePreprocessor:
         allow_id_dropping=self.sparsecore_config.allow_id_dropping,
         batch_number=self._batch_number,
     )
+    csr_inputs = preprocessed_inputs.sparse_dense_matmul_input
 
     processed_inputs = {
         k: v for k, v in inputs.items() if k not in sparse_features
@@ -362,7 +363,7 @@ class SparsecoreEmbed(nn.Module):
   Attributes:
     sparsecore_config: A sparsecore config specifying how to create the tables.
     mesh: The mesh to use for the embedding layer. If not provided, the global
-      mesh set by `jax.sharding.use_mesh` will be used. If neither is set, an
+      mesh set by `jax.set_mesh` will be used. If neither is set, an
       error will be raised.
   """
 
@@ -375,7 +376,7 @@ class SparsecoreEmbed(nn.Module):
     abstract_mesh = jax.sharding.get_abstract_mesh()
     if not abstract_mesh.shape_tuple:
       raise ValueError(
-          'No abstract mesh shape was set with `jax.sharding.use_mesh`. Make'
+          'No abstract mesh shape was set with `jax.set_mesh`. Make'
           ' sure to set the mesh when calling the sparsecore module.'
       )
     return abstract_mesh
