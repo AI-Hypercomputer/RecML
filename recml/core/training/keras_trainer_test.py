@@ -52,23 +52,35 @@ class KerasTrainerTest(parameterized.TestCase):
       flags.FLAGS.mark_as_parsed()
 
   @parameterized.named_parameters(
-      {"testcase_name": "train", "mode": core.Experiment.Mode.TRAIN},
-      {"testcase_name": "eval", "mode": core.Experiment.Mode.EVAL},
+      {"testcase_name": "train", "mode": core.Trainer.Mode.TRAIN},
+      {"testcase_name": "eval", "mode": core.Trainer.Mode.EVAL},
       {
           "testcase_name": "train_and_eval",
-          "mode": core.Experiment.Mode.TRAIN_AND_EVAL,
+          "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
       },
       {
-          "testcase_name": "continuous_eval",
-          "mode": core.Experiment.Mode.CONTINUOUS_EVAL,
+          "testcase_name": "continuous_eval_",
+          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
+      },
+      {
+          "testcase_name": "train_and_eval_legacy_checkpoint_format",
+          "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
+          "legacy_checkpoint_format": True,
+      },
+      {
+          "testcase_name": "continuous_eval_legacy_checkpoint_format",
+          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
+          "legacy_checkpoint_format": True,
       },
   )
-  def test_keras_task_and_trainer(self, mode: str):
+  def test_keras_task_and_trainer(
+      self, mode: str, legacy_checkpoint_format: bool = False
+  ):
     if keras.backend.backend() == "jax":
       distribution = keras.distribution.DataParallel()
     else:
       distribution = None
-      if mode == core.Experiment.Mode.CONTINUOUS_EVAL:
+      if mode == core.Trainer.Mode.CONTINUOUS_EVAL:
         self.skipTest("Continuous eval is only supported on the Jax backend.")
 
     trainer = keras_trainer.KerasTrainer(
@@ -78,18 +90,19 @@ class KerasTrainerTest(parameterized.TestCase):
         steps_per_loop=2,
         model_dir=self.create_tempdir().full_path,
         continuous_eval_timeout=5,
+        legacy_checkpoint_format=legacy_checkpoint_format,
     )
     experiment = core.Experiment(_KerasTask(), trainer)
 
-    if mode == core.Experiment.Mode.CONTINUOUS_EVAL:
+    if mode == core.Trainer.Mode.CONTINUOUS_EVAL:
       # Produce one checkpoint so there is something to evaluate.
-      core.run_experiment(experiment, core.Experiment.Mode.TRAIN)
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN)
 
     history = core.run_experiment(experiment, mode)
 
     if (
         mode
-        in [core.Experiment.Mode.TRAIN, core.Experiment.Mode.TRAIN_AND_EVAL]
+        in [core.Trainer.Mode.TRAIN, core.Trainer.Mode.TRAIN_AND_EVAL]
         and keras.backend.backend() == "jax"
     ):
       self.assertEqual(history.history["num_params/trainable"][0], 2)
