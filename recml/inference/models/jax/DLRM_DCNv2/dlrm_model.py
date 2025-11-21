@@ -18,7 +18,7 @@ from typing import List
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
-from jax_tpu_embedding.sparsecore.lib.flax import embed
+from jax_tpu_embedding.sparsecore.lib.flax.linen import embed
 from jax_tpu_embedding.sparsecore.lib.nn import embedding
 from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
 
@@ -166,4 +166,3 @@ class DLRMDCNV2(nn.Module):
     predictions = jnp.reshape(predictions, (-1,))
 
     return predictions
-
