@@ -43,7 +43,7 @@ class DLRMExperimentTest(absltest.TestCase):
       cfg.embedding_dim = 8
 
     experiment = fdl.build(experiment)
-    recml.run_experiment(experiment, recml.Experiment.Mode.TRAIN_AND_EVAL)
+    recml.run_experiment(experiment, recml.Trainer.Mode.TRAIN_AND_EVAL)
 
 
 if __name__ == "__main__":
