@@ -13,12 +13,15 @@
 # limitations under the License.
 """Core training library for Jax."""
 
+from __future__ import annotations
+
 import abc
 from collections.abc import Mapping, Sequence
 import dataclasses
 import enum
 from typing import Any, Generic, TypeVar
 
+import fiddle as fdl
 import jax
 import jax.numpy as jnp
 from recml.core.data import iterator
@@ -37,7 +40,6 @@ KERAS_MODEL_SAVEFILE = "model.keras"
 ORBAX_CHECKPOINT_DEFAULT_KEY = "default"
 
 DEFAULT_RNG_SEED = 0
-IN_TRAINER_CONTEXT = False  # Set to true when run from the main trainer.
 STATE_CHECKPOINT_KEY = "state"
 
 TaskT = TypeVar("TaskT")
@@ -56,6 +58,14 @@ Logs = Any  # Any metric logs returned by the training or evaluation task.
 
 class Trainer(abc.ABC, Generic[TaskT]):
   """A base trainer interface for training and evaluation."""
+
+  class Mode(enum.StrEnum):
+    """Mode to run an experiment."""
+
+    TRAIN = "train"
+    EVAL = "eval"
+    TRAIN_AND_EVAL = "train_and_eval"
+    CONTINUOUS_EVAL = "continuous_eval"
 
   @abc.abstractmethod
   def __init__(self, model_dir: str, *args, **kwargs):
@@ -77,6 +87,23 @@ class Trainer(abc.ABC, Generic[TaskT]):
   def evaluate_continuously(self, task: TaskT, *args, **kwargs) -> Logs | None:
     """Performs continuous evaluation until a condition is met."""
 
+  def run(self, task: TaskT, mode: Any) -> Logs | None:
+    """Runs the experiment in the given mode."""
+    if mode == Trainer.Mode.TRAIN_AND_EVAL:
+      return self.train_and_evaluate(task)
+    elif mode == Trainer.Mode.TRAIN:
+      return self.train(task)
+    elif mode == Trainer.Mode.EVAL:
+      return self.evaluate(task)
+    elif mode == Trainer.Mode.CONTINUOUS_EVAL:
+      return self.evaluate_continuously(task)
+    else:
+      raise ValueError(f"The job mode provided is not supported: {mode}.")
+
+  @classmethod
+  def setup_experiment(cls, experiment_cfg: fdl.Config[Experiment]):
+    """Sets up the experiment before it is instantiated."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Experiment(Generic[TaskT]):
@@ -90,32 +117,13 @@ class Experiment(Generic[TaskT]):
     trainer: The trainer to use for the experiment.
   """
 
-  class Mode(enum.StrEnum):
-    """Mode to run an experiment."""
-
-    TRAIN = "train"
-    EVAL = "eval"
-    TRAIN_AND_EVAL = "train_and_eval"
-    CONTINUOUS_EVAL = "continuous_eval"
-
   task: TaskT
   trainer: Trainer[TaskT]
 
 
-def run_experiment(
-    experiment: Experiment, mode: Experiment.Mode
-) -> Logs | None:
+def run_experiment(experiment: Experiment, mode: Any) -> Logs | None:
   """Runs an experiment."""
-  if mode == Experiment.Mode.TRAIN_AND_EVAL:
-    return experiment.trainer.train_and_evaluate(experiment.task)
-  elif mode == Experiment.Mode.TRAIN:
-    return experiment.trainer.train(experiment.task)
-  elif mode == Experiment.Mode.EVAL:
-    return experiment.trainer.evaluate(experiment.task)
-  elif mode == Experiment.Mode.CONTINUOUS_EVAL:
-    return experiment.trainer.evaluate_continuously(experiment.task)
-  else:
-    raise ValueError(f"The job mode provided is not supported: {mode}.")
+  return experiment.trainer.run(experiment.task, mode)
 
 
 def get_iterators(
@@ -161,9 +169,7 @@ def get_iterators(
         k: iterator.TFDatasetIterator(v) for k, v in eval_datasets.items()
     }
 
-  if not all(
-      isinstance(v, iterator.Iterator) for v in eval_datasets.values()
-  ):
+  if not all(isinstance(v, iterator.Iterator) for v in eval_datasets.values()):
     raise ValueError(
         "Expected all values in the evaluation datasets mapping to be either"
         " `tf.data.Dataset` instances or CLU `DatasetIterator` instances,"
@@ -179,7 +185,7 @@ def get_shape(
   """Gets the shape of a dense / sparse / ragged tensor or tensor spec."""
   if isinstance(x, tf.SparseTensor):
     return [x.shape[0]] + [None for _ in x.shape[1:]]
-  return x.shape.as_list()
+  return x.shape.as_list()  # pylint: disable=attribute-error
 
 
 def in_tracing_context() -> bool:
