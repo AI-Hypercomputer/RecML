@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from recml.core.ops import embedding_ops
+from recml.layers import common
 import tensorflow as tf
 
 
@@ -33,7 +34,7 @@ with epy.lazy_imports():
   # pylint: disable=g-import-not-at-top
   from jax_tpu_embedding.sparsecore.lib.flax import embed
   from jax_tpu_embedding.sparsecore.lib.nn import embedding
-  from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
+  from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec as specs
   from jax_tpu_embedding.sparsecore.lib.nn import table_stacking
   from jax_tpu_embedding.sparsecore.utils import utils
   # pylint: enable=g-import-not-at-top
@@ -42,54 +43,12 @@ A = TypeVar('A')
 CSR_INPUTS_KEY = 'csr_inputs'
 EMBEDDING_PARAM_NAME = 'sc_embedding_variables'
 OptimizerSpec = Any
+EmbeddingSpec = common.EmbeddingSpec
 
 
 def _num_sparsecores_per_device() -> int:
   """Returns the number of sparsecores per tensorcore device."""
   return utils.num_sparsecores_per_device()
-
-
-# TODO(aahil): This should be common between Keras, Flax, NNX.
-@dataclasses.dataclass
-class EmbeddingSpec:
-  """Sparsecore embedding spec.
-
-  Attributes:
-    input_dim: The cardinality of the input feature or size of its vocabulary.
-    embedding_dim: The length of each embedding vector.
-    max_sequence_length: An optional maximum sequence length. If set, the looked
-      up embeddings will not be aggregated over the sequence dimension.
-      Otherwise the embeddings will be aggregated over the sequence dimension
-      using the `combiner`. Defaults to None.
-    combiner: The combiner to use to aggregate the embeddings over the sequence
-      dimension. This is ignored when `max_sequence_length` is set. Allowed
-      values are 'sum', 'mean', and 'sqrtn'. Defaults to 'mean'.
-    initializer: The initializer to use for the embedding table. Defaults to
-      truncated_normal(stddev=1 / sqrt(embedding_dim)) if not set.
-    optimizer: An optional custom optimizer to use for the embedding table.
-    weight_name: An optional weight feature name to use for performing a
-      weighted aggregation on the output of the embedding lookup. Defaults to
-      None.
-  """
-
-  input_dim: int
-  embedding_dim: int
-  max_sequence_length: int | None = None
-  combiner: Literal['sum', 'mean', 'sqrtn'] = 'mean'
-  initializer: jax.nn.initializers.Initializer | None = None
-  optimizer: OptimizerSpec | None = None
-  weight_name: str | None = None
-
-  def __post_init__(self):
-    if self.max_sequence_length is not None and self.weight_name is not None:
-      raise ValueError(
-          '`max_sequence_length` and `weight_name` cannot both be set. Weighted'
-          ' aggregation can only be performed when the embeddings are'
-          ' aggregated over the sequence dimension.'
-      )
-
-  def __hash__(self):
-    return id(self)
 
 
 @dataclasses.dataclass
@@ -161,7 +120,7 @@ class SparsecoreConfig:
   ```
   """
 
-  specs: Mapping[str, EmbeddingSpec]
+  specs: Mapping[str, common.EmbeddingSpec]
   optimizer: OptimizerSpec
   sharding_axis: str | int = 0
   sharding_strategy: str = 'MOD'
@@ -228,7 +187,7 @@ class SparsecoreConfig:
       if spec in shared_tables:
         table_spec = shared_tables[spec]
       else:
-        table_spec = embedding_spec.TableSpec(
+        table_spec = specs.TableSpec(
             vocabulary_size=spec.input_dim,
             embedding_dim=spec.embedding_dim,
             initializer=(
@@ -248,7 +207,7 @@ class SparsecoreConfig:
       else:
         batch_dim = batch_size
 
-      feature_specs[name] = embedding_spec.FeatureSpec(
+      feature_specs[name] = specs.FeatureSpec(
           name=name,
           table_spec=table_spec,
           input_shape=(batch_dim, 1),
@@ -334,7 +293,7 @@ class SparsecorePreprocessor:
           weights[key] = np.reshape(weights[key], (-1, 1))
 
     self._batch_number += 1
-    csr_inputs, _ = embedding.preprocess_sparse_dense_matmul_input(
+    preprocessed_inputs, _ = embedding.preprocess_sparse_dense_matmul_input(
         features=features,
         features_weights=weights,
         feature_specs=self.sparsecore_config.feature_specs,
@@ -345,6 +304,7 @@ class SparsecorePreprocessor:
         allow_id_dropping=self.sparsecore_config.allow_id_dropping,
         batch_number=self._batch_number,
     )
+    csr_inputs = preprocessed_inputs.sparse_dense_matmul_input
 
     processed_inputs = {
         k: v for k, v in inputs.items() if k not in sparse_features
@@ -362,8 +322,8 @@ class SparsecoreEmbed(nn.Module):
   Attributes:
     sparsecore_config: A sparsecore config specifying how to create the tables.
     mesh: The mesh to use for the embedding layer. If not provided, the global
-      mesh set by `jax.sharding.use_mesh` will be used. If neither is set, an
-      error will be raised.
+      mesh set by `jax.set_mesh` will be used. If neither is set, an error will
+      be raised.
   """
 
   sparsecore_config: SparsecoreConfig
@@ -375,7 +335,7 @@ class SparsecoreEmbed(nn.Module):
     abstract_mesh = jax.sharding.get_abstract_mesh()
     if not abstract_mesh.shape_tuple:
       raise ValueError(
-          'No abstract mesh shape was set with `jax.sharding.use_mesh`. Make'
+          'No abstract mesh shape was set with `jax.set_mesh`. Make'
           ' sure to set the mesh when calling the sparsecore module.'
       )
     return abstract_mesh
