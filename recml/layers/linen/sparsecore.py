@@ -362,7 +362,7 @@ class SparsecoreEmbed(nn.Module):
   Attributes:
     sparsecore_config: A sparsecore config specifying how to create the tables.
     mesh: The mesh to use for the embedding layer. If not provided, the global
-      mesh set by `jax.sharding.use_mesh` will be used. If neither is set, an
+      mesh set by `jax.set_mesh` will be used. If neither is set, an
       error will be raised.
   """
 
@@ -375,7 +375,7 @@ class SparsecoreEmbed(nn.Module):
     abstract_mesh = jax.sharding.get_abstract_mesh()
     if not abstract_mesh.shape_tuple:
       raise ValueError(
-          'No abstract mesh shape was set with `jax.sharding.use_mesh`. Make'
+          'No abstract mesh shape was set with `jax.set_mesh`. Make'
           ' sure to set the mesh when calling the sparsecore module.'
       )
     return abstract_mesh
