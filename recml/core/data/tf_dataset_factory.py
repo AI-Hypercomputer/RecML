@@ -24,6 +24,7 @@ import os
 import re
 from typing import Any, Protocol
 
+from absl import flags
 from absl import logging
 import jax
 from recml.core.utils import types
@@ -162,12 +163,12 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
       Defaults to False.
     seed: An optional seed to use for deterministic shuffling / preprocessing.
       Defaults to None.
-    tf_data_service_address: An optional URI of a tf.data service to offload
-      preprocessing onto during training. The URI should be in the format
-      "protocol://address", e.g. "grpc://tf-data-service:5050". If `None` no
-      data service will be applied.
+    enable_tf_data_service: Whether to apply tf.data service for this dataset.
+      If True, flag `tf_data_service_address` must be set.
     tf_data_service_policy: Sharding policy to use for tf.data service when it
       is enabled.
+    tf_data_service_job_name: Job name to use for tf.data service. If None, the
+      default job name will be used.
     feature_spec: A mapping of feature keys to `FixedLenFeature`,
       `VarLenFeature`, `SparseFeature`, or `RaggedFeature` values. This will be
       used to parse the TF examples, or as context_features spec to parse TF
@@ -208,7 +209,7 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
       tensorflow.
     debug: An optional boolean indicating whether to debug input boundedness. If
       `True`, the dataset will consist of a single batch that's cached and
-      infinitely repeated
+      infinitely repeated.
   """
 
   cache_reading: bool = False
@@ -231,7 +232,8 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
   readahead: str | None = None
   group_uris_by_dir: bool = False
   seed: int | None = None
-  tf_data_service_address: str | None = None
+  enable_tf_data_service: bool = False
+  tf_data_service_job_name: str | None = None
   tf_data_service_policy: tf.data.experimental.service.ShardingPolicy = (
       tf.data.experimental.service.ShardingPolicy.OFF
   )
@@ -249,7 +251,12 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
   debug: bool = False
 
   def __post_init__(self):
-    if self.tf_data_service_address is not None:
+    if self.enable_tf_data_service:
+      if flags.FLAGS.tf_data_service_address is None:
+        raise ValueError(
+            "Flag `tf_data_service_address` must be set when"
+            " `enable_tf_data_service` is True."
+        )
       if self.seed is not None:
         raise ValueError("`seed` must be None for data service.")
       if self.sharding:
@@ -533,8 +540,10 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
       self, dataset: tf.data.Dataset
   ) -> tf.data.Dataset:
     """Applies the tf.data service to the dataset."""
-    if self.tf_data_service_address is None:
+    if not self.enable_tf_data_service:
       return dataset
+
+    tf_data_service_address = flags.FLAGS.tf_data_service_address
 
     per_proc_batch_size = self.sharding_info.per_process_batch_size(
         self.global_batch_size
@@ -542,14 +551,15 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
     logging.info(
         "Applying tf.data service with address %s and per replica batch"
         " size %s",
-        self.tf_data_service_address,
+        tf_data_service_address,
         per_proc_batch_size,
     )
     return dataset.apply(
         tf.data.experimental.service.distribute(
             processing_mode=self.tf_data_service_policy,
-            service=self.tf_data_service_address,
-            job_name=f"bs_{per_proc_batch_size}",
+            service=tf_data_service_address,
+            job_name=self.tf_data_service_job_name
+            or "tf_data_service_shared_job_name",
         )
     )
 
