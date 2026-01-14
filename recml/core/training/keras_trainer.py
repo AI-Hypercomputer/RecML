@@ -18,12 +18,15 @@ from __future__ import annotations
 import abc
 from collections.abc import Mapping
 import dataclasses
+import functools
 import gc
 import os
 import time
 from typing import Any
 
 from absl import logging
+from etils import epy
+import fiddle as fdl
 import jax
 import keras
 import orbax.checkpoint as ocp
@@ -32,8 +35,7 @@ from recml.core.training import core
 from recml.core.utils import py_utils
 import tensorflow as tf
 
-# Only import Jax utils when using Jax backend.
-if keras.backend.backend() == "jax":
+with epy.lazy_imports():
   from recml.core.utils import keras_utils  # pylint: disable=g-import-not-at-top, g-bad-import-order
 
 
@@ -96,7 +98,6 @@ class KerasTask(abc.ABC):
       model: The Keras model constructed by `create_model`.
       model_dir: The model directory passed to the trainer.
     """
-    model.save(os.path.join(model_dir, core.KERAS_MODEL_SAVEFILE))
 
 
 class KerasTrainer(core.Trainer[KerasTask]):
@@ -118,11 +119,12 @@ class KerasTrainer(core.Trainer[KerasTask]):
       max_checkpoints_to_keep: int = 5,
       checkpoint_save_interval_epochs: int = 1,
       rng_seed: int = core.DEFAULT_RNG_SEED,
+      legacy_checkpoint_format: bool = True,
+      s2_stepwise_log: bool = False,
   ):
     """Initializes the instance."""
 
-    if not core.IN_TRAINER_CONTEXT:
-      keras.utils.set_random_seed(rng_seed)
+    keras.utils.set_random_seed(rng_seed)
 
     if model_dir is None:
       model_dir = "/tmp"
@@ -143,60 +145,93 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._steps_per_eval = steps_per_eval
     self._continuous_eval_timeout = continuous_eval_timeout
     self._steps_per_loop = steps_per_loop
-    self._checkpoint_manager = None
+    self._s2_stepwise_log = s2_stepwise_log
     self._marker_path = os.path.join(
         model_dir, core.TRAINING_COMPLETE_MARKER_FILE
     )
     self._checkpoint_dir = os.path.join(model_dir, core.CHECKPOINT_DIR)
+    self._max_checkpoints_to_keep = max_checkpoints_to_keep
+    self._checkpoint_save_interval_epochs = checkpoint_save_interval_epochs
+    self._legacy_checkpoint_format = legacy_checkpoint_format
 
+  @functools.cached_property
+  def train_callbacks(self) -> list[keras.callbacks.Callback]:
+    """Returns the training callbacks."""
     if keras.backend.backend() == "jax":
-      self._checkpoint_manager = keras_utils.KerasOrbaxCheckpointManager(
-          checkpoint_dir=self._checkpoint_dir,
-          max_to_keep=max_checkpoints_to_keep,
-          save_interval_epochs=checkpoint_save_interval_epochs,
+      if self._legacy_checkpoint_format:
+        checkpoint_manager = keras_utils.KerasOrbaxCheckpointManager(
+            checkpoint_dir=self._checkpoint_dir,
+            max_to_keep=self._max_checkpoints_to_keep,
+            save_interval_epochs=self._checkpoint_save_interval_epochs,
+        )
+      else:
+        checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+            checkpoint_dir=self._checkpoint_dir,
+            max_to_keep=self._max_checkpoints_to_keep,
+            save_interval_epochs=self._checkpoint_save_interval_epochs,
+        )
+      s2_callback = None
+
+      epoch_summary_callback = keras_utils.EpochSummaryCallback(
+          log_dir=os.path.join(self._model_dir, core.LOG_DIR),
+          steps_per_epoch=self._steps_per_loop,
+          write_steps_per_second=True,
       )
-      self._train_callbacks = [
-          keras_utils.EpochSummaryCallback(
-              log_dir=os.path.join(model_dir, core.LOG_DIR),
-              steps_per_epoch=steps_per_loop,
-              write_steps_per_second=True,
-          ),
+      epoch_checkpoint_callback = (
           keras_utils.EpochOrbaxCheckpointAndRestoreCallback(
-              checkpoint_manager=self._checkpoint_manager,
+              checkpoint_manager=checkpoint_manager,
               marker_path=self._marker_path,
-          ),
+          )
+      )
+
+      # Order of the callbacks matters. Since we need to make sure s2_callback
+      # is initialized before epoch_checkpoint_callback.
+      callback_list = [
+          c
+          for c in [
+              s2_callback,
+              epoch_summary_callback,
+              epoch_checkpoint_callback,
+          ]
+          if c is not None
       ]
-      self._eval_callbacks = [
+      return callback_list
+    return [
+        keras.callbacks.TensorBoard(
+            log_dir=os.path.join(self._model_dir, core.LOG_DIR),
+            write_steps_per_second=True,
+        ),
+        keras.callbacks.BackupAndRestore(
+            backup_dir=os.path.join(self._model_dir, core.BACKUP_DIR),
+        ),
+        keras.callbacks.ModelCheckpoint(
+            filepath=os.path.join(
+                self._model_dir,
+                core.CHECKPOINT_DIR,
+                "ckpt-{epoch:d}.weights.h5",
+            ),
+            save_weights_only=True,
+            verbose=1,
+        ),
+    ]
+
+  @functools.cached_property
+  def eval_callbacks(self) -> list[keras.callbacks.Callback]:
+    """Returns the evaluation callbacks."""
+    if keras.backend.backend() == "jax":
+      return [
           keras_utils.EpochSummaryCallback(
-              log_dir=os.path.join(model_dir, core.LOG_DIR),
-              steps_per_epoch=steps_per_loop,
+              log_dir=os.path.join(self._model_dir, core.LOG_DIR),
+              steps_per_epoch=self._steps_per_loop,
               write_steps_per_second=False,
           ),
       ]
-    else:
-      self._checkpoint_manager = None
-      self._train_callbacks = [
-          keras.callbacks.TensorBoard(
-              log_dir=os.path.join(model_dir, core.LOG_DIR),
-              write_steps_per_second=True,
-          ),
-          keras.callbacks.BackupAndRestore(
-              backup_dir=os.path.join(model_dir, core.BACKUP_DIR),
-          ),
-          keras.callbacks.ModelCheckpoint(
-              filepath=os.path.join(
-                  model_dir, core.CHECKPOINT_DIR, "ckpt-{epoch:d}.weights.h5"
-              ),
-              save_weights_only=True,
-              verbose=1,
-          ),
-      ]
-      self._eval_callbacks = [
-          keras.callbacks.TensorBoard(
-              log_dir=os.path.join(model_dir, core.LOG_DIR),
-              write_steps_per_second=True,
-          ),
-      ]
+    return [
+        keras.callbacks.TensorBoard(
+            log_dir=os.path.join(self._model_dir, core.LOG_DIR),
+            write_steps_per_second=True,
+        ),
+    ]
 
   def _maybe_get_model_kws(
       self, task: KerasTask, dataset: tf.data.Dataset
@@ -216,9 +251,10 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
     history = model.fit(
         dataset,
-        epochs=self._train_epochs,
+        epochs=self._train_epochs + 1,
         steps_per_epoch=self._steps_per_loop,
-        callbacks=self._train_callbacks,
+        callbacks=self.train_callbacks,
+        initial_epoch=1,
     )
     model.summary(print_fn=logging.info)
 
@@ -237,14 +273,14 @@ class KerasTrainer(core.Trainer[KerasTask]):
     if keras.backend.backend() == "jax":
       [tb_cbk] = [
           cbk
-          for cbk in self._eval_callbacks
+          for cbk in self.eval_callbacks
           if isinstance(cbk, keras_utils.EpochSummaryCallback)
       ]
       epoch_start_time = time.time()
       history = model.evaluate(
           dataset,
           steps=self._steps_per_eval,
-          callbacks=self._eval_callbacks,
+          callbacks=self.eval_callbacks,
           return_dict=True,
       )
       epoch_dt = time.time() - epoch_start_time
@@ -257,7 +293,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     return model.evaluate(
         dataset,
         steps=self._steps_per_eval,
-        callbacks=self._eval_callbacks,
+        callbacks=self.eval_callbacks,
     )
 
   def train_and_evaluate(self, task: KerasTask) -> core.Logs:
@@ -273,11 +309,12 @@ class KerasTrainer(core.Trainer[KerasTask]):
     history = model.fit(
         train_dataset,
         validation_data=eval_dataset,
-        epochs=self._train_epochs,
+        epochs=self._train_epochs + 1,
         steps_per_epoch=self._steps_per_loop,
         # Explicitly set to None for deterministic evaluation.
         validation_steps=None,
-        callbacks=self._train_callbacks,
+        callbacks=self.train_callbacks,
+        initial_epoch=1,
     )
     model.summary(print_fn=logging.info)
 
@@ -308,7 +345,10 @@ class KerasTrainer(core.Trainer[KerasTask]):
     else:
       steps_msg = "running complete evaluation..."
 
+    use_legacy_checkpoint_format = self._legacy_checkpoint_format
+
     class _RestoreCallback(keras.callbacks.Callback):
+      """Callback for restoring the model from the latest checkpoint."""
 
       def __init__(
           self,
@@ -319,9 +359,14 @@ class KerasTrainer(core.Trainer[KerasTask]):
         self._epoch = epoch
 
       def on_test_begin(self, logs: Mapping[str, Any] | None = None):
-        keras_utils.restore_keras_model(
-            model, self._checkpoint_dir, step=self._epoch
-        )
+        if use_legacy_checkpoint_format:
+          keras_utils.restore_keras_model(
+              model, self._checkpoint_dir, step=self._epoch
+          )
+        else:
+          keras_utils.restore_keras_checkpoint(
+              self._checkpoint_dir, model=model, epoch=self._epoch
+          )
 
     history = None
     for epoch in ocp.checkpoint_utils.checkpoints_iterator(
@@ -332,7 +377,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       restore_callback = _RestoreCallback(self._checkpoint_dir, epoch)
       [tb_cbk] = [
           cbk
-          for cbk in self._eval_callbacks
+          for cbk in self.eval_callbacks
           if isinstance(cbk, keras_utils.EpochSummaryCallback)
       ]
       try:
@@ -346,7 +391,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         history = model.evaluate(
             eval_dataset,
             steps=self._steps_per_eval,
-            callbacks=[restore_callback] + self._eval_callbacks,
+            callbacks=[restore_callback] + self.eval_callbacks,
             return_dict=True,
         )
 
@@ -369,3 +414,29 @@ class KerasTrainer(core.Trainer[KerasTask]):
         logging.info("Checkpoint epoch: %s did not finish writing...", epoch)
 
     return history
+
+  @classmethod
+  def setup_experiment(cls, experiment_cfg: fdl.Config[core.Experiment]):
+    # Disable Keras traceback filtering to get more informative stack traces.
+    keras.config.disable_traceback_filtering()
+
+    # Building the RNG seed and setting it globally before building the rest of
+    # the experiment ensures that any random operations in `__init__` are also
+    # deterministic. We do this before setting the distribution in case the
+    # distribution uses random operations, for instance by overriding the seed
+    # generator.
+    if isinstance(experiment_cfg.trainer.rng_seed, fdl.Buildable):
+      seed = fdl.build(experiment_cfg.trainer.rng_seed)
+    else:
+      seed = experiment_cfg.trainer.rng_seed
+    keras.utils.set_random_seed(seed)
+
+    # Building the distribution and setting it globally before building the
+    # rest of the experiment ensures that any layers passed to the task are
+    # constructed under the distribution.
+    if (distribution_cfg := experiment_cfg.trainer.distribution) is not None:
+      distribution = fdl.build(distribution_cfg)
+      keras.distribution.set_distribution(distribution)
+
+    # Set the threefry 2x32 key to be partitionable by default.
+    jax.config.update("jax_threefry_partitionable", True)
