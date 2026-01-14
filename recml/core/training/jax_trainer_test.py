@@ -55,10 +55,10 @@ class _JaxTask(jax_trainer.JaxTask):
         "eval_on_test": tf.data.Dataset.range(2000).map(_map_fn).batch(2),
     }
 
-  def create_state(self, batch: jt.PyTree, rng: jax.Array) -> ts.TrainState:
+  def create_state(self, batch: jt.PyTree) -> ts.TrainState:
     x, _ = batch
     model = _DummyFlaxModel()
-    params = model.init(rng, x)
+    params = model.init(jax.random.key(0), x)
     optimizer = optax.adagrad(0.1)
     return ts.TrainState.create(
         apply_fn=model.apply,
@@ -67,7 +67,7 @@ class _JaxTask(jax_trainer.JaxTask):
     )
 
   def train_step(
-      self, batch: jt.PyTree, state: ts.TrainState, rng: jax.Array
+      self, batch: jt.PyTree, state: ts.TrainState
   ) -> tuple[ts.TrainState, Mapping[str, clu_metrics.Metric]]:
     x, y = batch
 
@@ -104,9 +104,7 @@ class _KerasJaxTask(jax_trainer.JaxTask):
         tf.data.Dataset.range(2000).map(_map_fn).batch(2),
     )
 
-  def create_state(
-      self, batch: jt.PyTree, rng: jax.Array
-  ) -> jax_trainer.KerasState:
+  def create_state(self, batch: jt.PyTree) -> jax_trainer.KerasState:
     x, _ = batch
 
     model = keras.Sequential(
@@ -125,7 +123,7 @@ class _KerasJaxTask(jax_trainer.JaxTask):
     return jax_trainer.KerasState.create(model=model, tx=optimizer)
 
   def train_step(
-      self, batch: jt.PyTree, state: jax_trainer.KerasState, rng: jax.Array
+      self, batch: jt.PyTree, state: jax_trainer.KerasState
   ) -> tuple[jax_trainer.KerasState, Mapping[str, clu_metrics.Metric]]:
     x, y = batch
 
@@ -160,49 +158,49 @@ class JaxTest(parameterized.TestCase):
       {
           "testcase_name": "jax_task_train",
           "task_cls": _JaxTask,
-          "mode": core.Experiment.Mode.TRAIN,
+          "mode": core.Trainer.Mode.TRAIN,
           "expected_keys": ["train"],
       },
       {
           "testcase_name": "keras_jax_task_train",
           "task_cls": _KerasJaxTask,
-          "mode": core.Experiment.Mode.TRAIN,
+          "mode": core.Trainer.Mode.TRAIN,
           "expected_keys": ["train"],
       },
       {
           "testcase_name": "jax_task_eval",
           "task_cls": _JaxTask,
-          "mode": core.Experiment.Mode.EVAL,
+          "mode": core.Trainer.Mode.EVAL,
           "expected_keys": ["val_eval_on_train", "val_eval_on_test"],
       },
       {
           "testcase_name": "keras_jax_task_eval",
           "task_cls": _KerasJaxTask,
-          "mode": core.Experiment.Mode.EVAL,
+          "mode": core.Trainer.Mode.EVAL,
           "expected_keys": ["val"],
       },
       {
           "testcase_name": "jax_task_train_and_eval",
           "task_cls": _JaxTask,
-          "mode": core.Experiment.Mode.TRAIN_AND_EVAL,
+          "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
           "expected_keys": ["train", "val_eval_on_train", "val_eval_on_test"],
       },
       {
           "testcase_name": "keras_jax_task_train_and_eval",
           "task_cls": _KerasJaxTask,
-          "mode": core.Experiment.Mode.TRAIN_AND_EVAL,
+          "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
           "expected_keys": ["train", "val"],
       },
       {
           "testcase_name": "jax_task_continuous_eval",
           "task_cls": _JaxTask,
-          "mode": core.Experiment.Mode.CONTINUOUS_EVAL,
+          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
           "expected_keys": ["val_eval_on_train", "val_eval_on_test"],
       },
       {
           "testcase_name": "keras_jax_task_continuous_eval",
           "task_cls": _KerasJaxTask,
-          "mode": core.Experiment.Mode.CONTINUOUS_EVAL,
+          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
           "expected_keys": ["val"],
       },
   )
@@ -223,9 +221,9 @@ class JaxTest(parameterized.TestCase):
         continuous_eval_timeout=5,
     )
     experiment = core.Experiment(task, trainer)
-    if mode == core.Experiment.Mode.CONTINUOUS_EVAL:
+    if mode == core.Trainer.Mode.CONTINUOUS_EVAL:
       # Produce one checkpoint so there is something to evaluate.
-      core.run_experiment(experiment, core.Experiment.Mode.TRAIN)
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN)
     logs = core.run_experiment(experiment, mode)
 
     for key in expected_keys:
@@ -233,8 +231,8 @@ class JaxTest(parameterized.TestCase):
       self.assertIn("loss", logs[key])
 
     if mode in [
-        core.Experiment.Mode.TRAIN,
-        core.Experiment.Mode.TRAIN_AND_EVAL,
+        core.Trainer.Mode.TRAIN,
+        core.Trainer.Mode.TRAIN_AND_EVAL,
     ]:
       checkpointed_steps = ocp.utils.checkpoint_steps(
           os.path.join(model_dir, core.CHECKPOINT_DIR)
