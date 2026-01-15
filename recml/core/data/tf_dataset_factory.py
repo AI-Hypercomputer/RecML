@@ -24,6 +24,7 @@ import os
 import re
 from typing import Any, Protocol
 
+from absl import flags
 from absl import logging
 import jax
 from recml.core.utils import types
@@ -162,12 +163,23 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
       Defaults to False.
     seed: An optional seed to use for deterministic shuffling / preprocessing.
       Defaults to None.
-    tf_data_service_address: An optional URI of a tf.data service to offload
-      preprocessing onto during training. The URI should be in the format
-      "protocol://address", e.g. "grpc://tf-data-service:5050". If `None` no
-      data service will be applied.
+    enable_tf_data_service: Whether to apply tf.data service for this dataset.
+      If True, flag `tf_data_service_address` must be set.
     tf_data_service_policy: Sharding policy to use for tf.data service when it
       is enabled.
+    tf_data_service_job_name: Job name to use for tf.data service. If None, the
+      default job name will be used.
+    offload_preprocessing_to_tf_data_service: Whether to offload preprocessing
+      to tf.data service. If True, enable_tf_data_service must also be True, and
+      the preprocessing transformation will be offloaded to tf data service
+      workers. Otherwise, the preprocessing transformation will be applied on
+      the host CPU. If tf data service is not enabled, this arg must be set
+      False. Defaults to False.
+    tf_data_service_replicate_on_split: Whether to replicate the file dataset on
+      split when distributing data to tf.data service workers. Note: it could be
+      used in the case where multiple datasets are processed together under
+      `Dynamic` mode. The dataset with `tf_data_service_replicate_on_split`
+      enabled is equivalent to having that dataset processed as `Off` mode.
     feature_spec: A mapping of feature keys to `FixedLenFeature`,
       `VarLenFeature`, `SparseFeature`, or `RaggedFeature` values. This will be
       used to parse the TF examples, or as context_features spec to parse TF
@@ -208,7 +220,7 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
       tensorflow.
     debug: An optional boolean indicating whether to debug input boundedness. If
       `True`, the dataset will consist of a single batch that's cached and
-      infinitely repeated
+      infinitely repeated.
   """
 
   cache_reading: bool = False
@@ -231,10 +243,12 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
   readahead: str | None = None
   group_uris_by_dir: bool = False
   seed: int | None = None
-  tf_data_service_address: str | None = None
+  enable_tf_data_service: bool = False
+  tf_data_service_job_name: str | None = None
   tf_data_service_policy: tf.data.experimental.service.ShardingPolicy = (
       tf.data.experimental.service.ShardingPolicy.OFF
   )
+  offload_preprocessing_to_tf_data_service: bool = False
   feature_spec: Mapping[str, IO_Feature] | None = None
   sequence_feature_spec: Mapping[str, IO_Feature] | None = None
   tf_transform_output: TFTransformOutput | None = None
@@ -246,14 +260,26 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
   sharding_info: DatasetShardingInfo = dataclasses.field(
       default_factory=DatasetShardingInfo
   )
+  tf_data_service_replicate_on_split: bool = False
   debug: bool = False
 
   def __post_init__(self):
-    if self.tf_data_service_address is not None:
+    if self.enable_tf_data_service:
+      if flags.FLAGS.tf_data_service_address is None:
+        raise ValueError(
+            "Flag `tf_data_service_address` must be set when"
+            " `enable_tf_data_service` is True."
+        )
       if self.seed is not None:
         raise ValueError("`seed` must be None for data service.")
       if self.sharding:
         raise ValueError("`sharding` must be set to False for data service.")
+    else:
+      if self.offload_preprocessing_to_tf_data_service:
+        raise ValueError(
+            "`offload_preprocessing_to_tf_data_service` must be False when"
+            " `enable_tf_data_service` is False."
+        )
 
   @functools.cached_property
   def tfds_metadata(self) -> TFDSMetadata | None:
@@ -464,6 +490,9 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
     # Create a dataset of file / file group uris.
     dataset = tf.data.Dataset.from_tensor_slices(uris)
 
+    if self.tf_data_service_replicate_on_split:
+      dataset = tf.data.apply_rewrite(dataset, rewrite="replicate_on_split")
+
     # Repeat the dataset. We might need to repeat the dataset here in case the
     # issue is encountered: internal screenshot link:6jAKKoEMT3afXRe
     # even we do have enough shards for the input data.
@@ -533,8 +562,10 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
       self, dataset: tf.data.Dataset
   ) -> tf.data.Dataset:
     """Applies the tf.data service to the dataset."""
-    if self.tf_data_service_address is None:
+    if not self.enable_tf_data_service:
       return dataset
+
+    tf_data_service_address = flags.FLAGS.tf_data_service_address
 
     per_proc_batch_size = self.sharding_info.per_process_batch_size(
         self.global_batch_size
@@ -542,14 +573,15 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
     logging.info(
         "Applying tf.data service with address %s and per replica batch"
         " size %s",
-        self.tf_data_service_address,
+        tf_data_service_address,
         per_proc_batch_size,
     )
     return dataset.apply(
         tf.data.experimental.service.distribute(
             processing_mode=self.tf_data_service_policy,
-            service=self.tf_data_service_address,
-            job_name=f"bs_{per_proc_batch_size}",
+            service=tf_data_service_address,
+            job_name=self.tf_data_service_job_name
+            or "tf_data_service_shared_job_name",
         )
     )
 
@@ -566,11 +598,17 @@ class TFDatasetFactory(types.Factory[tf.data.Dataset]):
     dataset = self._parse_dataset(dataset)
     # Apply filters to the batched dataset.
     dataset = self._maybe_filter_dataset(dataset)
-    # Apply data service.
-    dataset = self._maybe_apply_tf_data_service(dataset)
+    # Apply TF Data service before preprocessing.
+    if not self.offload_preprocessing_to_tf_data_service:
+      dataset = self._maybe_apply_tf_data_service(dataset)
+
     # Apply transformations on the dataset.
     for fn in self.map_fns:
       dataset = dataset.map(fn, num_parallel_calls=self.num_parallel_threads)
+
+    # Apply TF Data Service after preprocessing.
+    if self.offload_preprocessing_to_tf_data_service:
+      dataset = self._maybe_apply_tf_data_service(dataset)
 
     if self.debug:
       dataset = dataset.take(1).cache().repeat()
@@ -778,8 +816,7 @@ def vectorized_filter(
       if isinstance(features[name], tf.SparseTensor):
         outputs[name] = tf.sparse_boolean_mask(features[name], mask)
       elif isinstance(features[name], tf.RaggedTensor):
-        # TODO(b/307323524): Support this when we start using Ragged tensors.
-        raise ValueError("Filtering ragged tensors is not supported.")
+        outputs[name] = tf.ragged.boolean_mask(features[name], mask)
       else:
         outputs[name] = tf.boolean_mask(features[name], mask)
     return outputs
