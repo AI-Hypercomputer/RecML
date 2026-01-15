@@ -59,11 +59,23 @@ class KerasTrainerTest(parameterized.TestCase):
           "mode": core.Experiment.Mode.TRAIN_AND_EVAL,
       },
       {
-          "testcase_name": "continuous_eval",
+          "testcase_name": "continuous_eval_",
           "mode": core.Experiment.Mode.CONTINUOUS_EVAL,
       },
+      {
+          "testcase_name": "train_and_eval_legacy_checkpoint_format",
+          "mode": core.Experiment.Mode.TRAIN_AND_EVAL,
+          "legacy_checkpoint_format": True,
+      },
+      {
+          "testcase_name": "continuous_eval_legacy_checkpoint_format",
+          "mode": core.Experiment.Mode.CONTINUOUS_EVAL,
+          "legacy_checkpoint_format": True,
+      },
   )
-  def test_keras_task_and_trainer(self, mode: str):
+  def test_keras_task_and_trainer(
+      self, mode: str, legacy_checkpoint_format: bool = False
+  ):
     if keras.backend.backend() == "jax":
       distribution = keras.distribution.DataParallel()
     else:
@@ -78,6 +90,7 @@ class KerasTrainerTest(parameterized.TestCase):
         steps_per_loop=2,
         model_dir=self.create_tempdir().full_path,
         continuous_eval_timeout=5,
+        legacy_checkpoint_format=legacy_checkpoint_format,
     )
     experiment = core.Experiment(_KerasTask(), trainer)
 
