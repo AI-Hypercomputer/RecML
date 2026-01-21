@@ -6,7 +6,7 @@ This guide explains how to set up the environment and train the HSTU/DLRM models
 
 If you are developing on a TPU VM directly, use a virtual environment to avoid conflicts with the system-level Python packages.
 
-#### 1. Prerequisites
+### 1. Prerequisites
 Ensure you have **Python 3.12+** installed.
 ```bash
 python3 --version
