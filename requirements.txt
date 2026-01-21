@@ -34,7 +34,6 @@ importlib-resources==6.5.2
 iniconfig==2.1.0
 isort==6.0.1
 jax==0.8.2
-jax-tpu-embedding==0.1.0.dev20251208
 jaxlib==0.8.2
 jaxtyping==0.3.1
 Jinja2==3.1.6
