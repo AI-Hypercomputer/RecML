@@ -15,9 +15,6 @@
 
 import jax
 from absl import logging
-
-jax.distributed.initialize()
-
 import sys
 import os
 # Add the RecML folder to the system path
