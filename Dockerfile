@@ -16,7 +16,7 @@ ENV CUDA_VISIBLE_DEVICES=-1
 # Install system tools
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
-# Install standard requirements FIRST
+# Install standard requirements
 COPY requirements.txt ./
 RUN pip install --upgrade pip
 RUN pip install -r ./requirements.txt
