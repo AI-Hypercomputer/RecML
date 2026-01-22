@@ -398,6 +398,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
       continuous_eval_timeout: int = 30,
       rng_seed: int = core.DEFAULT_RNG_SEED,
       rng_impl: str | None = None,
+      enable_checkpointing: bool = True,
   ):
     """Initializes the instance.
 
@@ -436,6 +437,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
       rng_impl: The implementation of the PRNG key. By default this is set to
         None which means that the default implementation (generally
         partitionable threefry) will be used.
+      enable_checkpointing: Whether to enable checkpointing. Defaults to True.
     """
 
     if not isinstance(steps_per_loop, int) or steps_per_loop < 1:
@@ -453,6 +455,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
     self._max_checkpoints_to_keep = max_checkpoints_to_keep
     self._rng_impl = rng_impl
     self._rng_seed = rng_seed
+    self._enable_checkpointing = enable_checkpointing
 
   @functools.cached_property
   def checkpoint_manager(self) -> ocp.CheckpointManager:
@@ -467,14 +470,19 @@ class JaxTrainer(core.Trainer[JaxTask]):
       save_on_steps.append(self._train_steps - 1)
 
     save_on_steps = set(save_on_steps)
+    
+    if self._enable_checkpointing:
 
-    return ocp.CheckpointManager(
-        directory=os.path.join(self._model_dir, core.CHECKPOINT_DIR),
-        options=ocp.CheckpointManagerOptions(
-            should_save_fn=lambda step, _: step in save_on_steps,
-            max_to_keep=self._max_checkpoints_to_keep,
-        ),
-    )
+      return ocp.CheckpointManager(
+          directory=os.path.join(self._model_dir, core.CHECKPOINT_DIR),
+          options=ocp.CheckpointManagerOptions(
+              should_save_fn=lambda step, _: step in save_on_steps,
+              max_to_keep=self._max_checkpoints_to_keep,
+          ),
+      )
+    else:
+      
+      return None
 
   @functools.cached_property
   def train_summary_writer(self) -> metrics_tools.AsyncMultiWriter:
@@ -510,6 +518,9 @@ class JaxTrainer(core.Trainer[JaxTask]):
       metrics: Mapping[str, Any] | None = None,
   ):
     """Saves a checkpoint and returns a bool indicating whether it was saved."""
+    if not self._enable_checkpointing:
+      return
+
     items = {core.STATE_CHECKPOINT_KEY: ocp.args.StandardSave(state)}
     with self.report_progress.timed("checkpointing"):
       self.checkpoint_manager.save(
@@ -564,7 +575,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
         state, metrics_update = train_step(inputs, state)
         metrics_accum.accumulate(metrics_update, step)
         self.report_progress(step)
-        if step != start_step + num_steps - 1:
+        if (step != start_step + num_steps - 1) and self._enable_checkpointing:
           self._maybe_save_checkpoint(step, state)
 
     metrics = metrics_accum.compute_and_log_scalars(start_step + num_steps - 1)
@@ -651,6 +662,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
 
     if (
         check_for_checkpoints
+        and self._enable_checkpointing
         and self.checkpoint_manager.latest_step() is not None
     ):
       step_to_resume_from = self.checkpoint_manager.latest_step()
@@ -674,7 +686,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
   def train(self, task: JaxTask) -> core.Logs:
     """Trains the model."""
     train_iter, _, state, train_step, _, step = self.process_task(
-        task, training=True, check_for_checkpoints=True
+        task, training=True, check_for_checkpoints=False
     )
 
     logging.info(
@@ -698,25 +710,27 @@ class JaxTrainer(core.Trainer[JaxTask]):
           f" {_format_output(train_metrics)}"
       )
       metrics[core.TRAIN_LOG_DIRNAME] = train_metrics
-
-      self._maybe_save_checkpoint(curr_step, state, metrics=metrics)
+      if self._enable_checkpointing:
+        self._maybe_save_checkpoint(curr_step, state, metrics=metrics)
       step = curr_step + 1
 
-    self.checkpoint_manager.wait_until_finished()
+    if self._enable_checkpointing:
+      self.checkpoint_manager.wait_until_finished()
 
     if jax.process_index() == 0:
       self._write_marker_file()
       task.export_model(state, self._model_dir)
 
-    self.checkpoint_manager.close()
-    del self.checkpoint_manager
+    if self._enable_checkpointing:
+      self.checkpoint_manager.close()
+      del self.checkpoint_manager
 
     return metrics
 
   def evaluate(self, task: JaxTask) -> core.Logs:
     """Evaluates the model."""
     _, eval_iters, state, _, eval_step, step = self.process_task(
-        task, training=False, check_for_checkpoints=True
+        task, training=False, check_for_checkpoints=False
     )
     eval_summary_writers = self._create_eval_summary_writers(eval_iters)
 
@@ -749,7 +763,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
   def train_and_evaluate(self, task: JaxTask) -> core.Logs:
     """Trains and evaluates the model."""
     train_iter, eval_iters, state, train_step, eval_step, step = (
-        self.process_task(task, training=True, check_for_checkpoints=True)
+        self.process_task(task, training=True, check_for_checkpoints=False)
     )
     eval_summary_writers = self._create_eval_summary_writers(eval_iters)
 
@@ -794,18 +808,20 @@ class JaxTrainer(core.Trainer[JaxTask]):
               f" {_format_output(eval_metrics)}"
           )
           metrics[_val_logdir(key)] = eval_metrics
-
-      self._maybe_save_checkpoint(curr_step, state, metrics=metrics)
+      if self._enable_checkpointing:
+        self._maybe_save_checkpoint(curr_step, state, metrics=metrics)
       step = curr_step + 1
 
-    self.checkpoint_manager.wait_until_finished()
+    if self._enable_checkpointing:
+      self.checkpoint_manager.wait_until_finished()
 
     if jax.process_index() == 0:
       self._write_marker_file()
       task.export_model(state, self._model_dir)
 
-    self.checkpoint_manager.close()
-    del self.checkpoint_manager
+    if self._enable_checkpointing:
+      self.checkpoint_manager.close()
+      del self.checkpoint_manager
 
     return metrics
 
@@ -833,7 +849,8 @@ class JaxTrainer(core.Trainer[JaxTask]):
         timeout_fn=timeout_fn,
     ):
       try:
-        state = self._maybe_restore_checkpoint(state, step)
+        if self._enable_checkpointing:
+          state = self._maybe_restore_checkpoint(state, step)
         logging.info(f"eval | step: {step: 6d} | {steps_msg}")
         with self.report_progress.timed("eval"):
           for key, eval_iter in eval_iters.items():
@@ -930,3 +947,4 @@ def _format_output(output: Any, indent: int = 4, width: int = 80) -> str:
     return formatted
   lines = [" " * indent + line for line in lines]
   return "\n" + "\n".join(lines)
+

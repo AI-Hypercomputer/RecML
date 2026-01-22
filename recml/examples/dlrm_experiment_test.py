@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for the DLRM experiment."""
 
+import jax
+from absl import logging
 import sys
 import os
 # Add the RecML folder to the system path
@@ -43,6 +45,7 @@ class DLRMExperimentTest(absltest.TestCase):
     experiment.trainer.train_steps = 12
     experiment.trainer.steps_per_loop = 4
     experiment.trainer.steps_per_eval = 4
+    experiment.trainer.enable_checkpointing = False
 
     for cfg in selectors.select(experiment, dlrm_experiment.SparseFeature):
       cfg.vocab_size = 200

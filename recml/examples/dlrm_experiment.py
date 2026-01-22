@@ -398,5 +398,6 @@ def experiment() -> fdl.Config[recml.Experiment]:
       train_steps=1_000,
       steps_per_eval=100,
       steps_per_loop=100,
+      enable_checkpointing=False
   )
   return fdl.Config(recml.Experiment, task=task, trainer=trainer)
