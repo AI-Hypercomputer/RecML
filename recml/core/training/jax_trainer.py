@@ -575,7 +575,8 @@ class JaxTrainer(core.Trainer[JaxTask]):
         step_start = time.time()
         inputs = self._partitioner.shard_inputs(train_batch)
         state, metrics_update = train_step(inputs, state)
-        jax.block_until_ready(state)
+
+        jax.block_until_ready(metrics_update)
         step_duration = time.time() - step_start
         
 
@@ -590,6 +591,10 @@ class JaxTrainer(core.Trainer[JaxTask]):
             timing_metrics['perf/throughput_ex_per_sec'] = base_metrics.scalar(bs / step_duration)
 
         metrics_accum.accumulate({**metrics_update, **timing_metrics}, step)
+
+        if step == start_step:
+          global_step = int(jax.device_get(state.step))
+          logging.info(f"DEBUG: Trainer running step {global_step}. Duration: {step_duration:.4f}s")
 
         self.report_progress(step)
         if (step != start_step + num_steps - 1) and self._enable_checkpointing:

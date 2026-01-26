@@ -281,6 +281,7 @@ class PredictionTask(recml.JaxTask):
     (loss, logits), grads = grad_fn(state.params)
     state = state.update(grads=grads)
 
+    print(f"DEBUG: Trainer global step {global_batch_size}.")
     metrics = {
         'loss': recml.metrics.scalar(loss),
         'accuracy': recml.metrics.binary_accuracy(label, logits, threshold=0.0),
