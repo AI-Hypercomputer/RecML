@@ -42,7 +42,7 @@ class DLRMExperimentTest(absltest.TestCase):
 
     experiment.task.train_data.global_batch_size = 128
     experiment.task.eval_data.global_batch_size = 128
-    experiment.trainer.train_steps = 12
+    experiment.trainer.train_steps = 120
     experiment.trainer.steps_per_loop = 4
     experiment.trainer.steps_per_eval = 4
     experiment.trainer.enable_checkpointing = False
