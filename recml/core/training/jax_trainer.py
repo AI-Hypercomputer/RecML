@@ -20,6 +20,7 @@ import math
 import os
 import pprint
 from typing import Any, Generic, Protocol, Self, TypeVar
+import time
 
 from absl import logging
 from clu import data as clu_data
@@ -558,28 +559,49 @@ class JaxTrainer(core.Trainer[JaxTask]):
       f.write("COMPLETED")
 
   def _train_n_steps(
-      self,
-      train_iter: Iterator[PyTree],
-      train_step: partitioning.StepFn,
-      state: State,
-      start_step: int,
-      num_steps: int,
-      summary_writer: metrics_tools.AsyncMultiWriter,
-  ) -> tuple[State, Mapping[str, Any]]:
-    """Performs a training loop and returns the updated state and metrics."""
-    metrics_accum = metrics_tools.MetricAccumulator(summary_writer)
-    for step in range(start_step, start_step + num_steps):
-      with jax.profiler.StepTraceAnnotation("train", step_num=step):
-        train_batch = next(train_iter)
-        inputs = self._partitioner.shard_inputs(train_batch)
-        state, metrics_update = train_step(inputs, state)
-        metrics_accum.accumulate(metrics_update, step)
-        self.report_progress(step)
-        if (step != start_step + num_steps - 1) and self._enable_checkpointing:
-          self._maybe_save_checkpoint(step, state)
+        self,
+        train_iter: Iterator[PyTree],
+        train_step: partitioning.StepFn,
+        state: State,
+        start_step: int,
+        num_steps: int,
+        summary_writer: metrics_tools.AsyncMultiWriter,
+    ) -> tuple[State, Mapping[str, Any]]:
+        """Performs a training loop and returns the updated state and metrics."""
+        metrics_accum = metrics_tools.MetricAccumulator(summary_writer)
+        for step in range(start_step, start_step + num_steps):
+            with jax.profiler.StepTraceAnnotation("train", step_num=step):
+                train_batch = next(train_iter)
+                step_start = time.time()
+                inputs = self._partitioner.shard_inputs(train_batch)
+                state, metrics_update = train_step(inputs, state)
 
-    metrics = metrics_accum.compute_and_log_scalars(start_step + num_steps - 1)
-    return state, metrics
+                timing_metrics = {}
+                if step - start_step > 10:
+                    jax.block_until_ready(metrics_update)
+                    step_duration = time.time() - step_start
+
+                    timing_metrics = {
+                        "perf/step_time_ms": base_metrics.scalar(step_duration * 1000),
+                        "perf/steps_per_sec": base_metrics.scalar(
+                            1.0 / step_duration if step_duration > 0 else 0
+                        ),
+                    }
+
+                    if "common/batch_size" in metrics_update:
+                        bs = metrics_update["common/batch_size"].compute()
+                        timing_metrics["perf/throughput_ex_per_sec"] = (
+                            base_metrics.scalar(bs / step_duration)
+                        )
+
+                metrics_accum.accumulate({**metrics_update, **timing_metrics}, step)
+
+                self.report_progress(step)
+                if (step != start_step + num_steps - 1) and self._enable_checkpointing:
+                    self._maybe_save_checkpoint(step, state)
+
+        metrics = metrics_accum.compute_and_log_scalars(start_step + num_steps - 1)
+        return state, metrics
 
   def _evaluate_n_steps(
       self,
