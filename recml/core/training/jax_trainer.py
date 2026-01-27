@@ -567,14 +567,16 @@ class JaxTrainer(core.Trainer[JaxTask]):
     loop_start_time = time.time()
 
     for step in range(start_step, start_step + num_steps):
-      with jax.profiler.StepTraceAnnotation("train", step_num=step):
-        if step == warmup_steps:
+      if num_steps == warmup_steps:
           loop_start_time = time.time()
+          total_examples_in_loop = 0
+          valid_steps_in_loop = 0
+      with jax.profiler.StepTraceAnnotation("train", step_num=step):
         train_batch = next(train_iter)
         inputs = self._partitioner.shard_inputs(train_batch)
       
         state, metrics_update = train_step(inputs, state)
-        if step >= warmup_steps:
+        if num_steps >= warmup_steps:
           if 'common/batch_size' in metrics_update:
              total_examples_in_loop += metrics_update['common/batch_size'].compute()
              valid_steps_in_loop += 1
@@ -585,6 +587,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
         if (step != start_step + num_steps - 1) and self._enable_checkpointing:
           self._maybe_save_checkpoint(step, state)
 
+    jax.block_until_ready(state)
     duration = time.time() - loop_start_time
     
     metrics = metrics_accum.compute_and_log_scalars(start_step + num_steps - 1)
