@@ -44,24 +44,28 @@ python dlrm_experiment_test.py
 
 ## Option 2: Docker (Recommended for Production)
 
-If you prefer not to manage a virtual environment or want to deploy this as a container, you can build a Docker image.
+If you prefer not to manage a virtual environment or want to deploy this as a container, you can use a docker image. We provide two options: (1) Building your own docker image with the Dockerfile provided in this repo; (2) Use our latest docker image from Dockerhub to run the code. 
 
 ### 1. Build the Image
 
-Run this command from the root of the repository. It reads the `Dockerfile`, installs all dependencies, and creates a ready-to-run image.
+Run this command from the root of the repository. It reads the `Dockerfile`, installs all dependencies, and creates a ready-to-run image. You will need to have the jax-tpu-embedding wheel for building your own docker image. Steps to get the wheel can be found here: https://github.com/jax-ml/jax-tpu-embedding. 
 
 ```bash
 docker build -t recml-training .
 ```
 
-### 2. Run the Image
+### 2. Use Our Image From Dockerhub
 
-This will run the docker image and execute the command specified, which is currently set to run DLRM. 
+The image name is: `docker.io/recsyscmcs/recml-tpu:v1.0.0`. This image contains all the latest dependencies and sets up the env for RecML to run the algorithms successfully on V6 and V7 TPUs. 
+
+### Run DLRM Using Docker Image
+
+This will run the docker image and execute the command specified, which is currently set to run DLRM. The below command uses our latest image, but feel free to change the image to your own. 
 
 ```bash
 docker run --rm --privileged \
   --net=host \
   --ipc=host \
   --name recml-experiment \
-  recml-training
+  docker.io/recsyscmcs/recml-tpu:v1.0.0
 ```
