@@ -564,7 +564,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
     warmup_steps = 3
     total_examples_in_loop = 0
     valid_steps_in_loop = 0
-
+    loop_start_time = time.time()
 
     for step in range(start_step, start_step + num_steps):
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
