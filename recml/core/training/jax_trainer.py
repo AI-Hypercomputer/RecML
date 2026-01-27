@@ -20,6 +20,7 @@ import math
 import os
 import pprint
 from typing import Any, Generic, Protocol, Self, TypeVar
+import time
 
 from absl import logging
 from clu import data as clu_data
@@ -557,28 +558,52 @@ class JaxTrainer(core.Trainer[JaxTask]):
     ) as f:
       f.write("COMPLETED")
 
-  def _train_n_steps(
-      self,
-      train_iter: Iterator[PyTree],
-      train_step: partitioning.StepFn,
-      state: State,
-      start_step: int,
-      num_steps: int,
-      summary_writer: metrics_tools.AsyncMultiWriter,
-  ) -> tuple[State, Mapping[str, Any]]:
-    """Performs a training loop and returns the updated state and metrics."""
+  def _train_n_steps(self, train_iter, train_step, state, start_step, num_steps, summary_writer):
     metrics_accum = metrics_tools.MetricAccumulator(summary_writer)
+  
+    warmup_steps = 3
+    total_examples_in_loop = 0
+    valid_steps_in_loop = 0
+    loop_start_time = time.time()
+
     for step in range(start_step, start_step + num_steps):
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
+        if step == warmup_steps:
+          loop_start_time = time.time()
         train_batch = next(train_iter)
         inputs = self._partitioner.shard_inputs(train_batch)
+      
         state, metrics_update = train_step(inputs, state)
+        if step >= warmup_steps:
+          if 'common/batch_size' in metrics_update:
+             total_examples_in_loop += metrics_update['common/batch_size'].compute()
+             valid_steps_in_loop += 1
+
         metrics_accum.accumulate(metrics_update, step)
         self.report_progress(step)
+        
         if (step != start_step + num_steps - 1) and self._enable_checkpointing:
           self._maybe_save_checkpoint(step, state)
 
+    duration = time.time() - loop_start_time
+    
     metrics = metrics_accum.compute_and_log_scalars(start_step + num_steps - 1)
+    
+    # Calculate and inject overall loop performance
+    if valid_steps_in_loop > 0 and duration > 0:
+        throughput = total_examples_in_loop / duration
+        ms_per_step = (duration / valid_steps_in_loop) * 1000
+        
+        metrics.update({
+            'perf/loop_throughput_ex_per_sec': throughput,
+            'perf/loop_ms_per_step': ms_per_step,
+        })
+        
+        summary_writer.write_scalars(start_step + num_steps - 1, {
+            'perf/loop_throughput_ex_per_sec': throughput,
+            'perf/loop_ms_per_step': ms_per_step,
+        })
+
     return state, metrics
 
   def _evaluate_n_steps(

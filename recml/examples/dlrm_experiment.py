@@ -276,6 +276,7 @@ class PredictionTask(recml.JaxTask):
       loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, label), axis=0)
       return loss, logits
 
+    global_batch_size = self.train_data.global_batch_size
     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True, allow_int=True)
     (loss, logits), grads = grad_fn(state.params)
     state = state.update(grads=grads)
@@ -287,6 +288,7 @@ class PredictionTask(recml.JaxTask):
         'aucroc': recml.metrics.aucroc(label, logits, from_logits=True),
         'label/mean': recml.metrics.mean(label),
         'prediction/mean': recml.metrics.mean(jax.nn.sigmoid(logits)),
+        "common/batch_size": recml.metrics.scalar(global_batch_size),
     }
     return state, metrics
 
