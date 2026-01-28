@@ -1,0 +1,45 @@
+[project]
+name = "recml"
+version = "0.1.1"
+description = "RecML is envisioned as a high-performance, large-scale deep learning recommender system library optimized for Cloud TPUs"
+readme = "README.md"
+requires-python = ">=3.12"
+license-files = ["LICENSE"]
+dynamic = ["dependencies"]
+
+[dependency-groups]
+dev = [
+    "einops>=0.8.1",
+    "ml-dtypes>=0.5.1",
+    "pre-commit>=4.2.0",
+    "pylint>=3.3.6",
+    "pytest>=8.3.5",
+    "pytest-env>=1.1.5",
+    "torch>=2.6.0",
+]
+
+jax = [
+    "chex>=0.1.89",
+    "clu>=0.0.12",
+    "fiddle>=0.3.0",
+    "jax>=0.6.0",
+    "jaxtyping>=0.3.1",
+    "keras>=3.9.2",
+    "keras-hub>=0.20.0",
+    "tensorflow>=2.19.0",
+    "tensorflow-datasets>=4.9.8",
+]
+
+
+[tool.uv]
+default-groups = "all"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
