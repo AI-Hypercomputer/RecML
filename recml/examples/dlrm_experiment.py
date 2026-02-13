@@ -128,7 +128,9 @@ class DLRMModel(nn.Module):
             for f in self.features.sparse_features()
         },
         optimizer=self.embedding_optimizer,
-        allow_id_dropping=True,
+        allow_id_dropping=False,
+        max_ids_per_partition_fn=lambda n, bs: min(bs, 4096),
+        max_unique_ids_per_partition_fn=lambda n, bs: min(bs, 4096),
     )
     object.__setattr__(self, '_sparsecore_config', sparsecore_config)
     return sparsecore_config
