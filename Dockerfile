@@ -25,8 +25,8 @@ RUN pip install -r ./requirements.txt
 RUN pip install "protobuf>=6.31.1"
 
 # Install the latest jax-tpu-embedding wheel
-COPY jax_tpu_embedding-0.1.0.dev20260121-cp312-cp312-manylinux_2_31_x86_64.whl ./
-RUN pip install ./jax_tpu_embedding-0.1.0.dev20260121-cp312-cp312-manylinux_2_31_x86_64.whl
+COPY jax_tpu_embedding-0.1.0.dev20260226-cp312-cp312-manylinux_2_31_x86_64.whl ./
+RUN pip install ./jax_tpu_embedding-0.1.0.dev20260226-cp312-cp312-manylinux_2_31_x86_64.whl
 
 # Copy the current directory contents into the container
 COPY . /app

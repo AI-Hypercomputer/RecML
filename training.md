@@ -26,7 +26,7 @@ source venv/bin/activate
 
 Install the latest version of the jax-tpu-embedding library:
 ```bash
-pip install ./jax_tpu_embedding-0.1.0.dev20260121-cp312-cp312-manylinux_2_31_x86_64.whl
+pip install ./jax_tpu_embedding-0.1.0.dev20260226-cp312-cp312-manylinux_2_31_x86_64.whl
 ```
 ```bash
 pip install -r requirements.txt
