@@ -94,6 +94,22 @@ class KerasTrainerTest(parameterized.TestCase):
     ):
       self.assertEqual(history.history["num_params/trainable"][0], 2)
 
+  def test_new_checkpoint_format(self):
+    if keras.backend.backend() != "jax":
+      self.skipTest("Only supported on the Jax backend.")
+    trainer = keras_trainer.KerasTrainer(
+        distribution=keras.distribution.DataParallel(),
+        train_steps=5,
+        steps_per_eval=3,
+        steps_per_loop=2,
+        model_dir=self.create_tempdir().full_path,
+        continuous_eval_timeout=5,
+        legacy_format=False,
+    )
+    experiment = core.Experiment(_KerasTask(), trainer)
+    core.run_experiment(experiment, core.Experiment.Mode.TRAIN)
+    core.run_experiment(experiment, core.Experiment.Mode.CONTINUOUS_EVAL)
+
 
 if __name__ == "__main__":
   absltest.main()
