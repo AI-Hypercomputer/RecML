@@ -100,7 +100,7 @@ treescope==0.1.9
 triton==3.2.0
 typing_extensions==4.13.2
 urllib3==2.4.0
-virtualenv==20.30.0
+virtualenv==20.36.1
 wadler-lindig==0.1.5
 Werkzeug==3.1.3
 wheel==0.45.1
