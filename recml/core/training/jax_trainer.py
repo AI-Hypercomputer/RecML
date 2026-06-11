@@ -20,12 +20,12 @@ import math
 import os
 import pprint
 from typing import Any, Generic, Protocol, Self, TypeVar
-import time
 
 from absl import logging
 from clu import data as clu_data
 from clu import periodic_actions
 import clu.metrics as clu_metrics
+import fiddle as fdl
 from flax import struct
 import flax.linen as nn
 import jax
@@ -46,7 +46,7 @@ import tensorflow as tf
 
 StateT = TypeVar("StateT")
 MetricsT = TypeVar("MetricsT", bound=Mapping[str, clu_metrics.Metric])
-MetaT = TypeVar("MetaT")
+ModelT = TypeVar("ModelT")
 PyTree = Any
 
 
@@ -62,7 +62,7 @@ class State(Protocol):
     """Returns the optimizer state."""
 
 
-class JaxState(struct.PyTreeNode, Generic[MetaT]):
+class JaxState(struct.PyTreeNode, Generic[ModelT]):
   """A training state for a Jax model created using Flax / Haiku.
 
   Attributes:
@@ -78,7 +78,7 @@ class JaxState(struct.PyTreeNode, Generic[MetaT]):
     _apply: An optional function that can be used to apply the forward pass of
       the model. For Flax models this is usually set to `model.apply` while for
       Haiku models this is usually set to `transform.apply`.
-    _model: An optional reference to a stateless Flax model for convenience.
+    _model: An optional reference to a model for convenience.
     mutable: A pytree of mutable variables that are used by `apply`.
     meta: Arbitrary metadata that is recorded on the state. This can be useful
       for tracking additional references in the state.
@@ -89,14 +89,14 @@ class JaxState(struct.PyTreeNode, Generic[MetaT]):
   tx: optax.GradientTransformation = struct.field(pytree_node=False)
   opt_state: optax.OptState = struct.field(pytree_node=True)
   mutable: PyTree = struct.field(pytree_node=True, default_factory=dict)
-  meta: MetaT = struct.field(pytree_node=False, default_factory=dict)
+  meta: Any = struct.field(pytree_node=False, default_factory=dict)
   _apply: Callable[..., Any] | None = struct.field(
       pytree_node=False, default_factory=None
   )
-  _model: nn.Module | None = struct.field(pytree_node=False, default=None)
+  _model: ModelT | None = struct.field(pytree_node=False, default=None)
 
   @property
-  def model(self) -> nn.Module:
+  def model(self) -> ModelT:
     """Returns a reference to the model used to create the state."""
     if self._model is None:
       raise ValueError("No Flax `model` is set on the state.")
@@ -113,7 +113,7 @@ class JaxState(struct.PyTreeNode, Generic[MetaT]):
       cls,
       *,
       apply: Callable[..., Any] | None = None,
-      model: nn.Module | None = None,
+      model: ModelT | None = None,
       params: PyTree,
       tx: optax.GradientTransformation,
       **kwargs,
@@ -124,9 +124,8 @@ class JaxState(struct.PyTreeNode, Generic[MetaT]):
       apply: A function that can be used to apply the forward pass of the model.
         For Flax models this is usually set to `model.apply`. This cannot be set
         along with `model`.
-      model: A reference to a stateless Flax model. This cannot be set along
-        with `apply`. When set the `apply` attribute of the state will be set to
-        `model.apply`.
+      model: A reference to a model. This cannot be set along with `apply`. When
+        set the `apply` attribute of the state will be set to `model.apply`.
       params: A pytree of trainable variables that will be updated by `tx` and
         used in `apply`.
       tx: An optax gradient transformation that will be used to update the
@@ -138,7 +137,7 @@ class JaxState(struct.PyTreeNode, Generic[MetaT]):
     """
     if apply is not None and model is not None:
       raise ValueError("Only one of `apply` or `model` can be provided.")
-    elif model is not None:
+    elif model is not None and isinstance(model, nn.Module):
       apply = model.apply
 
     return cls(
@@ -312,14 +311,12 @@ class JaxTask(abc.ABC, Generic[StateT]):
     """
 
   @abc.abstractmethod
-  def create_state(self, batch: PyTree, rng: jax.Array) -> StateT:
+  def create_state(self, batch: PyTree) -> StateT:
     """Creates the training state.
 
     Args:
       batch: A pytree of arrays making up a dummy batch for state
         initialization.
-      rng: A prng key that is passed from the trainer to control randomness
-        during variable initialization.
 
     Returns:
       The state to use for training.
@@ -327,15 +324,13 @@ class JaxTask(abc.ABC, Generic[StateT]):
 
   @abc.abstractmethod
   def train_step(
-      self, batch: PyTree, state: StateT, rng: jax.Array
+      self, batch: PyTree, state: StateT
   ) -> tuple[StateT, Mapping[str, clu_metrics.Metric]]:
     """Updates the training state and accumulates metrics.
 
     Args:
       batch: A pytree of arrays sampled from the training dataset.
       state: The training state created by `create_state`.
-      rng: A prng key that is passed from the trainer to control randomness
-        during training such as dropout.
 
     Returns:
       A tuple[state, metrics] where the state is the updated training state
@@ -397,9 +392,6 @@ class JaxTrainer(core.Trainer[JaxTask]):
       checkpoint_interval: int | None = None,
       max_checkpoints_to_keep: int = 5,
       continuous_eval_timeout: int = 30,
-      rng_seed: int = core.DEFAULT_RNG_SEED,
-      rng_impl: str | None = None,
-      enable_checkpointing: bool = True,
   ):
     """Initializes the instance.
 
@@ -433,12 +425,6 @@ class JaxTrainer(core.Trainer[JaxTask]):
         checkpoint before timing out during continuous evaluation. When a
         timeout happens, the job will check for a marker file on disk and if it
         exists, it will terminate successfully. Defaults to 30 seconds.
-      rng_seed: The seed to use for the PRNG key. By default this is set to a
-        fixed constant.
-      rng_impl: The implementation of the PRNG key. By default this is set to
-        None which means that the default implementation (generally
-        partitionable threefry) will be used.
-      enable_checkpointing: Whether to enable checkpointing. Defaults to True.
     """
 
     if not isinstance(steps_per_loop, int) or steps_per_loop < 1:
@@ -454,9 +440,6 @@ class JaxTrainer(core.Trainer[JaxTask]):
     self._continuous_eval_timeout = continuous_eval_timeout
     self._checkpoint_interval = checkpoint_interval or steps_per_loop
     self._max_checkpoints_to_keep = max_checkpoints_to_keep
-    self._rng_impl = rng_impl
-    self._rng_seed = rng_seed
-    self._enable_checkpointing = enable_checkpointing
 
   @functools.cached_property
   def checkpoint_manager(self) -> ocp.CheckpointManager:
@@ -471,19 +454,14 @@ class JaxTrainer(core.Trainer[JaxTask]):
       save_on_steps.append(self._train_steps - 1)
 
     save_on_steps = set(save_on_steps)
-    
-    if self._enable_checkpointing:
 
-      return ocp.CheckpointManager(
-          directory=os.path.join(self._model_dir, core.CHECKPOINT_DIR),
-          options=ocp.CheckpointManagerOptions(
-              should_save_fn=lambda step, _: step in save_on_steps,
-              max_to_keep=self._max_checkpoints_to_keep,
-          ),
-      )
-    else:
-      
-      return None
+    return ocp.CheckpointManager(
+        directory=os.path.join(self._model_dir, core.CHECKPOINT_DIR),
+        options=ocp.CheckpointManagerOptions(
+            should_save_fn=lambda step, _: step in save_on_steps,
+            max_to_keep=self._max_checkpoints_to_keep,
+        ),
+    )
 
   @functools.cached_property
   def train_summary_writer(self) -> metrics_tools.AsyncMultiWriter:
@@ -519,9 +497,6 @@ class JaxTrainer(core.Trainer[JaxTask]):
       metrics: Mapping[str, Any] | None = None,
   ):
     """Saves a checkpoint and returns a bool indicating whether it was saved."""
-    if not self._enable_checkpointing:
-      return
-
     items = {core.STATE_CHECKPOINT_KEY: ocp.args.StandardSave(state)}
     with self.report_progress.timed("checkpointing"):
       self.checkpoint_manager.save(
@@ -558,52 +533,28 @@ class JaxTrainer(core.Trainer[JaxTask]):
     ) as f:
       f.write("COMPLETED")
 
-  def _train_n_steps(self, train_iter, train_step, state, start_step, num_steps, summary_writer):
+  def _train_n_steps(
+      self,
+      train_iter: Iterator[PyTree],
+      train_step: partitioning.StepFn,
+      state: State,
+      start_step: int,
+      num_steps: int,
+      summary_writer: metrics_tools.AsyncMultiWriter,
+  ) -> tuple[State, Mapping[str, Any]]:
+    """Performs a training loop and returns the updated state and metrics."""
     metrics_accum = metrics_tools.MetricAccumulator(summary_writer)
-  
-    warmup_steps = 3
-    total_examples_in_loop = 0
-    valid_steps_in_loop = 0
-    loop_start_time = time.time()
-
     for step in range(start_step, start_step + num_steps):
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
-        if step == warmup_steps:
-          loop_start_time = time.time()
         train_batch = next(train_iter)
         inputs = self._partitioner.shard_inputs(train_batch)
-      
         state, metrics_update = train_step(inputs, state)
-        if step >= warmup_steps:
-          if 'common/batch_size' in metrics_update:
-             total_examples_in_loop += metrics_update['common/batch_size'].compute()
-             valid_steps_in_loop += 1
-
         metrics_accum.accumulate(metrics_update, step)
         self.report_progress(step)
-        
-        if (step != start_step + num_steps - 1) and self._enable_checkpointing:
+        if step != start_step + num_steps - 1:
           self._maybe_save_checkpoint(step, state)
 
-    duration = time.time() - loop_start_time
-    
     metrics = metrics_accum.compute_and_log_scalars(start_step + num_steps - 1)
-    
-    # Calculate and inject overall loop performance
-    if valid_steps_in_loop > 0 and duration > 0:
-        throughput = total_examples_in_loop / duration
-        ms_per_step = (duration / valid_steps_in_loop) * 1000
-        
-        metrics.update({
-            'perf/loop_throughput_ex_per_sec': throughput,
-            'perf/loop_ms_per_step': ms_per_step,
-        })
-        
-        summary_writer.write_scalars(start_step + num_steps - 1, {
-            'perf/loop_throughput_ex_per_sec': throughput,
-            'perf/loop_ms_per_step': ms_per_step,
-        })
-
     return state, metrics
 
   def _evaluate_n_steps(
@@ -646,18 +597,10 @@ class JaxTrainer(core.Trainer[JaxTask]):
   ]:
     """Initializes the objects required for training from the task."""
 
-    init_rng, step_rng = jax.random.split(
-        jax.random.key(self._rng_seed, impl=self._rng_impl)
-    )
-
-    def _create_state(inputs: PyTree) -> State:
-      return task.create_state(inputs, init_rng)
-
     def _train_step(
         inputs: PyTree, state: State
     ) -> tuple[State, Mapping[str, clu_metrics.Metric]]:
-      rng = jax.random.fold_in(step_rng, state.step)  # pytype: disable=attribute-error
-      state, metrics = task.train_step(inputs, state, rng)
+      state, metrics = task.train_step(inputs, state)
       return state, {**_state_metrics(state), **metrics}
 
     def _eval_step(
@@ -677,7 +620,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
 
     sharded_abstract_batch = self._partitioner.shard_inputs(abstract_batch)
     init_fn = self._partitioner.partition_init(
-        _create_state, abstract_batch=sharded_abstract_batch
+        task.create_state, abstract_batch=sharded_abstract_batch
     )
     train_step = self._partitioner.partition_step(_train_step, training=True)
     eval_step = self._partitioner.partition_step(_eval_step)
@@ -687,7 +630,6 @@ class JaxTrainer(core.Trainer[JaxTask]):
 
     if (
         check_for_checkpoints
-        and self._enable_checkpointing
         and self.checkpoint_manager.latest_step() is not None
     ):
       step_to_resume_from = self.checkpoint_manager.latest_step()
@@ -711,7 +653,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
   def train(self, task: JaxTask) -> core.Logs:
     """Trains the model."""
     train_iter, _, state, train_step, _, step = self.process_task(
-        task, training=True, check_for_checkpoints=False
+        task, training=True, check_for_checkpoints=True
     )
 
     logging.info(
@@ -735,27 +677,25 @@ class JaxTrainer(core.Trainer[JaxTask]):
           f" {_format_output(train_metrics)}"
       )
       metrics[core.TRAIN_LOG_DIRNAME] = train_metrics
-      if self._enable_checkpointing:
-        self._maybe_save_checkpoint(curr_step, state, metrics=metrics)
+
+      self._maybe_save_checkpoint(curr_step, state, metrics=metrics)
       step = curr_step + 1
 
-    if self._enable_checkpointing:
-      self.checkpoint_manager.wait_until_finished()
+    self.checkpoint_manager.wait_until_finished()
 
     if jax.process_index() == 0:
       self._write_marker_file()
       task.export_model(state, self._model_dir)
 
-    if self._enable_checkpointing:
-      self.checkpoint_manager.close()
-      del self.checkpoint_manager
+    self.checkpoint_manager.close()
+    del self.checkpoint_manager
 
     return metrics
 
   def evaluate(self, task: JaxTask) -> core.Logs:
     """Evaluates the model."""
     _, eval_iters, state, _, eval_step, step = self.process_task(
-        task, training=False, check_for_checkpoints=False
+        task, training=False, check_for_checkpoints=True
     )
     eval_summary_writers = self._create_eval_summary_writers(eval_iters)
 
@@ -788,7 +728,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
   def train_and_evaluate(self, task: JaxTask) -> core.Logs:
     """Trains and evaluates the model."""
     train_iter, eval_iters, state, train_step, eval_step, step = (
-        self.process_task(task, training=True, check_for_checkpoints=False)
+        self.process_task(task, training=True, check_for_checkpoints=True)
     )
     eval_summary_writers = self._create_eval_summary_writers(eval_iters)
 
@@ -833,20 +773,18 @@ class JaxTrainer(core.Trainer[JaxTask]):
               f" {_format_output(eval_metrics)}"
           )
           metrics[_val_logdir(key)] = eval_metrics
-      if self._enable_checkpointing:
-        self._maybe_save_checkpoint(curr_step, state, metrics=metrics)
+
+      self._maybe_save_checkpoint(curr_step, state, metrics=metrics)
       step = curr_step + 1
 
-    if self._enable_checkpointing:
-      self.checkpoint_manager.wait_until_finished()
+    self.checkpoint_manager.wait_until_finished()
 
     if jax.process_index() == 0:
       self._write_marker_file()
       task.export_model(state, self._model_dir)
 
-    if self._enable_checkpointing:
-      self.checkpoint_manager.close()
-      del self.checkpoint_manager
+    self.checkpoint_manager.close()
+    del self.checkpoint_manager
 
     return metrics
 
@@ -874,8 +812,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
         timeout_fn=timeout_fn,
     ):
       try:
-        if self._enable_checkpointing:
-          state = self._maybe_restore_checkpoint(state, step)
+        state = self._maybe_restore_checkpoint(state, step)
         logging.info(f"eval | step: {step: 6d} | {steps_msg}")
         with self.report_progress.timed("eval"):
           for key, eval_iter in eval_iters.items():
@@ -898,6 +835,16 @@ class JaxTrainer(core.Trainer[JaxTask]):
         logging.info("Checkpoint step: %s did not finish writing...", step)
 
     return metrics
+
+  @classmethod
+  def setup_experiment(cls, experiment_cfg: fdl.Config[core.Experiment]):
+    # Set the threefry 2x32 key to be partitionable.
+    # When True, the random values generated for a given key will be the same
+    # at a given JAX version (or a given commit on the main branch), but may
+    # vary across releases. For details, see [1] and [2].
+    # [1] https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html#generating-random-numbers  pylint: disable=line-too-long
+    # [2] https://github.com/jax-ml/jax/blob/67fef1550ae902feddbd36ac924e2afc899b20ec/jax/random.py#L165  pylint: disable=line-too-long
+    jax.config.update("jax_threefry_partitionable", True)
 
 
 def _state_metrics(state: State) -> Mapping[str, base_metrics.Metric]:
@@ -972,4 +919,3 @@ def _format_output(output: Any, indent: int = 4, width: int = 80) -> str:
     return formatted
   lines = [" " * indent + line for line in lines]
   return "\n" + "\n".join(lines)
-

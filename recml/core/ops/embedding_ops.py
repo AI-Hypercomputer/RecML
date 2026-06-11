@@ -38,7 +38,7 @@ class SparsecoreParams:
   """Embedding parameters."""
 
   feature_specs: Nested[FeatureSpec]
-  mesh: jax.sharding.Mesh 
+  mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh
   data_axes: Sequence[str | None]
   embedding_axes: Sequence[str | None]
   sharding_strategy: str

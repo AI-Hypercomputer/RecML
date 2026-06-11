@@ -93,6 +93,12 @@ def ssd_minimal_discrete(
   b = keras.ops.reshape(b, (batch_size, c_value, block_len, n_groups, d_state))
   c = keras.ops.reshape(c, (batch_size, c_value, block_len, n_groups, d_state))
 
+  # Squeeze out n_groups dimension (axis=3) since n_groups is required to be 1.
+  # This avoids the einsum string index clash on 'h' for n_groups vs n_heads.
+  if n_groups == 1:
+    b = keras.ops.squeeze(b, axis=3)
+    c = keras.ops.squeeze(c, axis=3)
+
   # (batch, c, block_len, n_heads) -> (batch, n_heads, c, block_len)
   reshaped_a = keras.ops.transpose(a, (0, 3, 1, 2))
 
@@ -102,14 +108,20 @@ def ssd_minimal_discrete(
 
   length = keras.ops.exp(segsum(reshaped_a))
 
-  y_diag = keras.ops.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", c, b, length, x)
+  if n_groups == 1:
+    y_diag = keras.ops.einsum("bcln,bcsn,bhcls,bcshp->bclhp", c, b, length, x)
+  else:
+    y_diag = keras.ops.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", c, b, length, x)
 
   # 2. Compute the state for each intra-chunk
   # (right term of low-rank factorization of off-diagonal blocks; B terms)
 
   decay_states = keras.ops.exp((cumsum_a[:, :, :, -1:] - cumsum_a))
 
-  states = keras.ops.einsum("bclhn,bhcl,bclhp->bchpn", b, decay_states, x)
+  if n_groups == 1:
+    states = keras.ops.einsum("bcln,bhcl,bclhp->bchpn", b, decay_states, x)
+  else:
+    states = keras.ops.einsum("bclhn,bhcl,bclhp->bchpn", b, decay_states, x)
 
   # 3. Compute the inter-chunk SSM recurrence;
   # produces correct SSM states at chunk boundaries
@@ -132,9 +144,14 @@ def ssd_minimal_discrete(
   # (left term of low-rank factorization of off-diagonal blocks; C terms)
 
   state_decay_out = keras.ops.exp(cumsum_a)
-  y_off = keras.ops.einsum(
-      "bclhn,bchpn,bhcl->bclhp", c, states, state_decay_out
-  )
+  if n_groups == 1:
+    y_off = keras.ops.einsum(
+        "bcln,bchpn,bhcl->bclhp", c, states, state_decay_out
+    )
+  else:
+    y_off = keras.ops.einsum(
+        "bclhn,bchpn,bhcl->bclhp", c, states, state_decay_out
+    )
 
   # Add output of intra-chunk and inter-chunk terms
   # (diagonal and off-diagonal blocks)

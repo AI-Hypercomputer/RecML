@@ -35,7 +35,7 @@ def default_bucketization(tensor: Tensor, bucket_size: float = 0.301):
   """Default bucketization function for RelativeBucketedTimeAndPositionBasedBias.
 
   From the original paper's code base:
-  https://github.com/meta-recsys/generative-recommenders/blob/main/generative_recommenders/research/modeling/sequential/hstu.py#L87
+  https://github.com/facebookresearch/generative-recommenders/blob/main/modeling/sequential/hstu.py#L79
 
   Args:
     tensor: The tensor of timestamps to bucketize.

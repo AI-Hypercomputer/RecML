@@ -34,8 +34,8 @@ import jax.numpy as jnp
 import jax.profiler
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from jax_tpu_embedding.sparsecore.lib.flax import embed
-from jax_tpu_embedding.sparsecore.lib.flax import embed_optimizer
+from jax_tpu_embedding.sparsecore.lib.flax.linen import embed
+from jax_tpu_embedding.sparsecore.lib.flax.linen import embed_optimizer
 from jax_tpu_embedding.sparsecore.lib.nn import embedding
 from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
 import metrax
@@ -317,7 +317,7 @@ def eval_loop(
     if max_steps > 0 and step_count >= max_steps:
       info("Reached max evaluation steps (%d).", max_steps)
       break
-  
+
   info("Finished evaluation after %d steps.", step_count)
   metrics_on_host = jax.device_get(eval_metrics_collection)
   loss_val = metrics_on_host.loss.compute()
@@ -382,7 +382,7 @@ def train_loop(
       params, optax.adagrad(learning_rate=_LEARNING_RATE.value)
   )
   opt_state = tx.init(params)
-  
+
   checkpoint_dir = os.path.join(_MODEL_DIR.value, "checkpoints")
   checkpointer = ocp.CheckpointManager(checkpoint_dir)
 
@@ -622,4 +622,3 @@ def main(argv):
 
 if __name__ == "__main__":
   app.run(main)
-

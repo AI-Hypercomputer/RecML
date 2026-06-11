@@ -14,6 +14,12 @@
 """Tests or utilities."""
 
 from collections.abc import Sequence
+import getpass
+import json
+import os
+from typing import Any
+
+from unittest import mock
 
 from absl import flags
 from absl.testing import absltest
@@ -25,12 +31,15 @@ import keras_hub
 import numpy as np
 from recml.core.utils import keras_utils
 
-_LEARNING_RATE_SCHEDULE = keras.optimizers.schedules.PolynomialDecay(
-    initial_learning_rate=0.1,
-    decay_steps=100,
-    end_learning_rate=0.01,
-    power=1.0,
-)
+
+def _create_dummy_inputs() -> dict[str, jax.Array]:
+  k1, k2, k3, k4 = jax.random.split(jax.random.key(42), 4)
+  return {
+      "token_ids": jax.random.randint(k1, (64, 128), minval=0, maxval=2048),
+      "segment_ids": jax.random.randint(k2, (64, 128), minval=0, maxval=8),
+      "padding_mask": jax.random.uniform(k3, (64, 128)),
+      "mask_positions": jax.random.randint(k4, (64, 20), minval=0, maxval=32),
+  }
 
 
 def _create_model(input_shapes: Sequence[int]) -> keras.Model:
@@ -46,7 +55,14 @@ def _create_model(input_shapes: Sequence[int]) -> keras.Model:
           dropout=0.1,
       )
   )
-  optimizer = keras.optimizers.Adam(learning_rate=_LEARNING_RATE_SCHEDULE)
+  optimizer = keras.optimizers.Adam(
+      learning_rate=keras.optimizers.schedules.PolynomialDecay(
+          initial_learning_rate=0.1,
+          decay_steps=100,
+          end_learning_rate=0.01,
+          power=1.0,
+      )
+  )
   loss = keras.losses.SparseCategoricalCrossentropy()
   metrics = [keras.metrics.SparseCategoricalAccuracy()]
   model.compile(optimizer, loss, weighted_metrics=metrics)
@@ -75,12 +91,232 @@ class KerasUtilsTest(parameterized.TestCase):
           "restore_with_checkpointer": True,
       },
       {
+          "testcase_name": "restore_without_checkpointer_single_core",
+          "data_parallel": False,
+          "restore_with_checkpointer": False,
+      },
+      {
+          "testcase_name": "restore_without_checkpointer_data_parallel",
+          "data_parallel": True,
+          "restore_with_checkpointer": False,
+      },
+  )
+  def test_keras_orbax_checkpointer_v2(
+      self, data_parallel: bool, restore_with_checkpointer: bool
+  ):
+    if data_parallel:
+      keras.distribution.set_distribution(keras.distribution.DataParallel())
+    else:
+      keras.distribution.set_distribution(None)
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+        checkpoint_dir, max_to_keep=5
+    )
+    dummy_inputs = _create_dummy_inputs()
+
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    state = (
+        [v.value for v in bert_pretrainer.trainable_variables],
+        [v.value for v in bert_pretrainer.non_trainable_variables],
+        [v.value for v in bert_pretrainer.optimizer.variables],
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, 0)
+    checkpoint_manager.wait_until_finished()
+
+    preds = bert_pretrainer(dummy_inputs)
+
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    if restore_with_checkpointer:
+      checkpoint_manager.restore_model_variables(bert_pretrainer, 0)
+    else:
+      keras_utils.restore_keras_checkpoint(
+          checkpoint_dir, model=bert_pretrainer, restore_optimizer_vars=True
+      )
+
+    checkpoint_manager.close()
+
+    restored_state = (
+        [v.value for v in bert_pretrainer.trainable_variables],
+        [v.value for v in bert_pretrainer.non_trainable_variables],
+        [v.value for v in bert_pretrainer.optimizer.variables],
+    )
+    preds_after_restoration = bert_pretrainer(dummy_inputs)
+
+    keras.tree.assert_same_structure(state, restored_state)
+    for expected, observed in zip(
+        jax.tree.flatten(state)[0], jax.tree.flatten(restored_state)[0]
+    ):
+      # Ensures the objects are different but the values are the same.
+      self.assertNotEqual(id(expected), id(observed))
+      self.assertEqual(expected.shape, observed.shape)
+      self.assertEqual(expected.dtype, observed.dtype)
+      self.assertEqual(expected.sharding, observed.sharding)
+      np.testing.assert_allclose(observed, expected)
+
+    # Ensures predictions are identical.
+    np.testing.assert_allclose(preds, preds_after_restoration)
+
+  def test_restore_keras_checkpoint(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    preds = bert_pretrainer(dummy_inputs)
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+        checkpoint_dir
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
+    checkpoint_manager.close()
+
+    restored_model = keras_utils.restore_keras_checkpoint(checkpoint_dir)
+    preds_after_restoration = restored_model(dummy_inputs)
+
+    for expected, observed in zip(
+        [v.value for v in bert_pretrainer.variables],
+        [v.value for v in restored_model.variables],
+    ):
+      # Ensures the objects are different but the values are the same.
+      self.assertNotEqual(id(expected), id(observed))
+      self.assertEqual(expected.shape, observed.shape)
+      self.assertEqual(expected.dtype, observed.dtype)
+      self.assertEqual(expected.sharding, observed.sharding)
+      np.testing.assert_allclose(observed, expected)
+
+    self.assertDictEqual(
+        bert_pretrainer.get_config(), restored_model.get_config()
+    )
+    np.testing.assert_allclose(preds, preds_after_restoration)
+
+  def test_load_keras_model_config(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    config = keras.utils.serialize_keras_object(bert_pretrainer)
+    config = json.loads(json.dumps(config))  # Converts tuples to lists.
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+        checkpoint_dir
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
+    checkpoint_manager.close()
+
+    self.assertEqual(
+        config, keras_utils.load_keras_model_config(checkpoint_dir, epoch=1)
+    )
+
+  def test_restore_keras_checkpoint_flat_path_matches_predictions(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    preds = bert_pretrainer(dummy_inputs)
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+        checkpoint_dir
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
+    checkpoint_manager.close()
+    flat_checkpoint_dir = os.path.join(checkpoint_dir, "1")
+
+    restored_model = keras_utils.restore_keras_checkpoint(flat_checkpoint_dir)
+    preds_after_restoration = restored_model(dummy_inputs)
+
+    np.testing.assert_allclose(preds, preds_after_restoration)
+
+  def test_load_keras_model_config_flat_path_returns_same_config(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    config = keras.utils.serialize_keras_object(bert_pretrainer)
+    config = json.loads(json.dumps(config))
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+        checkpoint_dir
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
+    checkpoint_manager.close()
+    flat_checkpoint_dir = os.path.join(checkpoint_dir, "1")
+
+    restored_config = keras_utils.load_keras_model_config(flat_checkpoint_dir)
+
+    self.assertEqual(config, restored_config)
+
+  @parameterized.named_parameters(
+      {
+          "testcase_name": "nested_with_epoch",
+          "test_path_suffix": "",
+          "input_epoch": 42,
+          "expected_epoch": 42,
+      },
+      {
+          "testcase_name": "nested_without_epoch",
+          "test_path_suffix": "",
+          "input_epoch": None,
+          "expected_epoch": 42,
+      },
+      {
+          "testcase_name": "flat_path",
+          "test_path_suffix": "42",
+          "input_epoch": None,
+          "expected_epoch": None,
+      },
+  )
+  def test_resolve_orbax_checkpoint_path_success(
+      self,
+      test_path_suffix,
+      input_epoch,
+      expected_epoch,
+  ):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+        checkpoint_dir
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=42)
+    checkpoint_manager.close()
+    test_path = os.path.join(checkpoint_dir, test_path_suffix)
+
+    resolved_path, resolved_epoch = keras_utils._resolve_orbax_checkpoint_path(
+        test_path, epoch=input_epoch
+    )
+
+    self.assertEqual(resolved_epoch, expected_epoch)
+    self.assertEqual(resolved_path, os.path.join(checkpoint_dir, "42"))
+
+  def test_resolve_orbax_checkpoint_path_missing_step(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    test_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(test_dir)
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=42)
+    checkpoint_manager.close()
+
+    with self.assertRaisesRegex(ValueError, "Step 99 not found"):
+      keras_utils._resolve_orbax_checkpoint_path(test_dir, epoch=99)
+
+  def test_resolve_orbax_checkpoint_path_empty_dir(self):
+    test_dir = self.create_tempdir().full_path
+
+    with self.assertRaisesRegex(FileNotFoundError, "No checkpoints found"):
+      keras_utils._resolve_orbax_checkpoint_path(test_dir, epoch=None)
+
+  @parameterized.named_parameters(
+      {
+          "testcase_name": "single_core",
+          "data_parallel": False,
+          "restore_with_checkpointer": True,
+      },
+      {
+          "testcase_name": "data_parallel",
+          "data_parallel": True,
+          "restore_with_checkpointer": True,
+      },
+      {
           "testcase_name": "restore_without_checkpointer_data_parallel",
           "data_parallel": True,
           "restore_with_checkpointer": False,
       },
       {
-          "testcase_name": "restore_without_checkpointer_model_parallel",
+          "testcase_name": "restore_without_checkpointer_single_core",
           "data_parallel": False,
           "restore_with_checkpointer": False,
       },
@@ -90,44 +326,14 @@ class KerasUtilsTest(parameterized.TestCase):
   ):
     if data_parallel:
       keras.distribution.set_distribution(keras.distribution.DataParallel())
+    else:
+      keras.distribution.set_distribution(None)
+
     checkpoint_dir = self.create_tempdir().full_path
-    checkpointer = keras_utils.KerasOrbaxCheckpointManager(
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManager(
         checkpoint_dir, max_to_keep=5
     )
-    epoch = 1
-    dummy_inputs = {
-        "token_ids": jax.random.randint(
-            jax.random.key(0), (64, 128), minval=0, maxval=50_000
-        ),
-        "segment_ids": jax.random.randint(
-            jax.random.key(0), (64, 128), minval=0, maxval=7
-        ),
-        "padding_mask": jax.random.uniform(jax.random.key(0), (64, 128)),
-        "mask_positions": jax.random.randint(
-            jax.random.key(0), (64, 20), minval=0, maxval=128
-        ),
-    }
-
-    def _create_model(input_shapes: Sequence[int]) -> keras.Model:
-      model = keras_hub.models.BertMaskedLM(
-          backbone=keras_hub.models.BertBackbone(
-              vocabulary_size=50_000,
-              num_layers=10,
-              num_heads=8,
-              hidden_dim=256,
-              intermediate_dim=3072,
-              max_sequence_length=128,
-              num_segments=7,
-              dropout=0.1,
-          )
-      )
-      optimizer = keras.optimizers.Adam(learning_rate=0.1)
-      loss = keras.losses.SparseCategoricalCrossentropy()
-      metrics = [keras.metrics.SparseCategoricalAccuracy()]
-      model.compile(optimizer, loss, weighted_metrics=metrics)
-      model.build(input_shapes)
-      optimizer.build(model.trainable_variables)
-      return model
+    dummy_inputs = _create_dummy_inputs()
 
     bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
     state = (
@@ -135,14 +341,18 @@ class KerasUtilsTest(parameterized.TestCase):
         [v.value for v in bert_pretrainer.non_trainable_variables],
         [v.value for v in bert_pretrainer.optimizer.variables],
     )
-    checkpointer.save_model_variables(bert_pretrainer, epoch)
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
+    checkpoint_manager.wait_until_finished()
     preds = bert_pretrainer(dummy_inputs)
 
     bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
     if restore_with_checkpointer:
-      checkpointer.restore_model_variables(bert_pretrainer, epoch)
+      checkpoint_manager.restore_model_variables(bert_pretrainer, epoch=1)
     else:
       keras_utils.restore_keras_model(bert_pretrainer, checkpoint_dir)
+
+    checkpoint_manager.close()
+
     restored_state = (
         [v.value for v in bert_pretrainer.trainable_variables],
         [v.value for v in bert_pretrainer.non_trainable_variables],
@@ -161,24 +371,12 @@ class KerasUtilsTest(parameterized.TestCase):
     self.assertTrue(_close(preds, preds_after_restoration))
 
   def test_restore_keras_model_error_cases(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+
     checkpoint_dir = self.create_tempdir().full_path
     checkpointer = keras_utils.KerasOrbaxCheckpointManager(checkpoint_dir)
-    epoch = 2
-    dummy_inputs = {
-        "token_ids": jax.random.randint(
-            jax.random.key(0), (64, 128), minval=0, maxval=50_000
-        ),
-        "segment_ids": jax.random.randint(
-            jax.random.key(0), (64, 128), minval=0, maxval=7
-        ),
-        "padding_mask": jax.random.uniform(jax.random.key(0), (64, 128)),
-        "mask_positions": jax.random.randint(
-            jax.random.key(0), (64, 20), minval=0, maxval=128
-        ),
-    }
-
-    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
-    checkpointer.save_model_variables(bert_pretrainer, epoch)
+    checkpointer.save_model_variables(bert_pretrainer, epoch=2)
     checkpointer.wait_until_finished()
     with self.assertRaises(ValueError):
       keras_utils.restore_keras_model(bert_pretrainer, checkpoint_dir, step=0)
@@ -202,18 +400,7 @@ class KerasUtilsTest(parameterized.TestCase):
     checkpoint_dir = self.create_tempdir().full_path
     checkpointer = keras_utils.KerasOrbaxCheckpointManager(checkpoint_dir)
     epoch = 1
-    dummy_inputs = {
-        "token_ids": jax.random.randint(
-            jax.random.key(0), (64, 128), minval=0, maxval=50_000
-        ),
-        "segment_ids": jax.random.randint(
-            jax.random.key(0), (64, 128), minval=0, maxval=7
-        ),
-        "padding_mask": jax.random.uniform(jax.random.key(0), (64, 128)),
-        "mask_positions": jax.random.randint(
-            jax.random.key(0), (64, 20), minval=0, maxval=128
-        ),
-    }
+    dummy_inputs = _create_dummy_inputs()
 
     source_bert_pretrainer = _create_model(
         jax.tree.map(jnp.shape, dummy_inputs)
@@ -258,6 +445,7 @@ class KerasUtilsTest(parameterized.TestCase):
           "expected_learning_rate": 0.01,
           "expected_iterations": 100,
           "expected_initial_epoch": 2,
+          "legacy_format": True,
       },
       {
           "testcase_name": "restore_without_optimizer_vars",
@@ -267,6 +455,7 @@ class KerasUtilsTest(parameterized.TestCase):
           "expected_learning_rate": 0.1,
           "expected_iterations": 0,
           "expected_initial_epoch": 2,
+          "legacy_format": True,
       },
       {
           "testcase_name": "restore_without_steps",
@@ -276,6 +465,7 @@ class KerasUtilsTest(parameterized.TestCase):
           "expected_learning_rate": 0.01,
           "expected_iterations": 100,
           "expected_initial_epoch": None,
+          "legacy_format": True,
       },
       {
           "testcase_name": "restore_without_iterations",
@@ -285,6 +475,7 @@ class KerasUtilsTest(parameterized.TestCase):
           "expected_learning_rate": 0.1,
           "expected_iterations": 0,
           "expected_initial_epoch": 2,
+          "legacy_format": True,
       },
       {
           "testcase_name": "restore_only_model_variables",
@@ -294,6 +485,27 @@ class KerasUtilsTest(parameterized.TestCase):
           "expected_learning_rate": 0.1,
           "expected_iterations": 0,
           "expected_initial_epoch": None,
+          "legacy_format": True,
+      },
+      {
+          "testcase_name": "restore_all_variables_with_new_format",
+          "restore_optimizer_vars": True,
+          "restore_steps": True,
+          "restore_iterations": True,
+          "expected_learning_rate": 0.01,
+          "expected_iterations": 100,
+          "expected_initial_epoch": 2,
+          "legacy_format": False,
+      },
+      {
+          "testcase_name": "restore_only_model_variables_with_new_format",
+          "restore_optimizer_vars": False,
+          "restore_steps": False,
+          "restore_iterations": False,
+          "expected_learning_rate": 0.1,
+          "expected_iterations": 0,
+          "expected_initial_epoch": None,
+          "legacy_format": False,
       },
   )
   def test_restore_keras_model_with_different_options(
@@ -304,23 +516,15 @@ class KerasUtilsTest(parameterized.TestCase):
       expected_learning_rate: float,
       expected_iterations: int,
       expected_initial_epoch: int | None,
+      legacy_format: bool,
   ):
     checkpoint_dir = self.create_tempdir().full_path
-    checkpointer = keras_utils.KerasOrbaxCheckpointManager(checkpoint_dir)
+    if legacy_format:
+      checkpointer = keras_utils.KerasOrbaxCheckpointManager(checkpoint_dir)
+    else:
+      checkpointer = keras_utils.KerasOrbaxCheckpointManagerV2(checkpoint_dir)
     epoch = 1
-    dummy_inputs = {
-        "token_ids": jax.random.randint(
-            jax.random.key(0), (64, 128), minval=0, maxval=50_000
-        ),
-        "segment_ids": jax.random.randint(
-            jax.random.key(0), (64, 128), minval=0, maxval=7
-        ),
-        "padding_mask": jax.random.uniform(jax.random.key(0), (64, 128)),
-        "mask_positions": jax.random.randint(
-            jax.random.key(0), (64, 20), minval=0, maxval=128
-        ),
-    }
-
+    dummy_inputs = _create_dummy_inputs()
     source_bert_pretrainer = _create_model(
         jax.tree.map(jnp.shape, dummy_inputs)
     )
@@ -330,19 +534,31 @@ class KerasUtilsTest(parameterized.TestCase):
         non_trainable_variables=True,
         optimizer_variables=True,
     )
-    checkpointer.save(step=epoch, items=source_state)
+    if legacy_format:
+      checkpointer.save(step=epoch, items=source_state)
+    else:
+      checkpointer.save_model_variables(source_bert_pretrainer, epoch=epoch)
     checkpointer.wait_until_finished()
 
     target_bert_pretrainer = _create_model(
         jax.tree.map(jnp.shape, dummy_inputs)
     )
-    keras_utils.restore_keras_model(
-        target_bert_pretrainer,
-        checkpoint_dir,
-        restore_optimizer_vars=restore_optimizer_vars,
-        restore_steps=restore_steps,
-        restore_iterations=restore_iterations,
-    )
+    if legacy_format:
+      keras_utils.restore_keras_model(
+          target_bert_pretrainer,
+          checkpoint_dir,
+          restore_optimizer_vars=restore_optimizer_vars,
+          restore_steps=restore_steps,
+          restore_iterations=restore_iterations,
+      )
+    else:
+      keras_utils.restore_keras_checkpoint(
+          checkpoint_dir,
+          model=target_bert_pretrainer,
+          restore_optimizer_vars=restore_optimizer_vars,
+          restore_model_epoch=restore_steps,
+          restore_iterations=restore_iterations,
+      )
 
     self.assertEqual(
         target_bert_pretrainer.optimizer.iterations.value, expected_iterations
@@ -354,6 +570,36 @@ class KerasUtilsTest(parameterized.TestCase):
     self.assertEqual(
         target_bert_pretrainer._initial_epoch, expected_initial_epoch
     )
+
+  @parameterized.named_parameters(
+      {
+          "testcase_name": "KerasOrbaxCheckpointManager",
+          "checkpoint_manager_cls": keras_utils.KerasOrbaxCheckpointManager,
+      },
+      {
+          "testcase_name": "KerasOrbaxCheckpointManagerV2",
+          "checkpoint_manager_cls": keras_utils.KerasOrbaxCheckpointManagerV2,
+      },
+  )
+  def test_epoch_orbax_checkpoint_and_restore_callback_saves_at_epoch_0(
+      self, checkpoint_manager_cls
+  ):
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = checkpoint_manager_cls(
+        checkpoint_dir, max_to_keep=5
+    )
+    dummy_inputs = _create_dummy_inputs()
+    model = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    callback = keras_utils.EpochOrbaxCheckpointAndRestoreCallback(
+        checkpoint_manager
+    )
+    callback.set_model(model)
+
+    self.assertIsNone(checkpoint_manager.latest_step())
+
+    callback.on_train_begin()
+    checkpoint_manager.wait_until_finished()
+    self.assertTrue(os.path.exists(os.path.join(checkpoint_dir, "0")))
 
 
 if __name__ == "__main__":

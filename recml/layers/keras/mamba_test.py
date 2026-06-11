@@ -100,14 +100,24 @@ def ssd_minimal_discrete(x, a, b, c, block_len, initial_states=None):
 class MambaSSDTest(testing.TestCase):
 
   # Simple equivalence test
-  @parameterized.parameters(dict(seed=40), dict(seed=50), dict(seed=70))
-  def test_ssd_correctness(self, seed: int):
+  @parameterized.parameters(
+      # Multi-Query SSM (ngroups = 1, varying heads)
+      dict(seed=40, ngroups=1, nheads=1),
+      dict(seed=40, ngroups=1, nheads=8),
+      dict(seed=40, ngroups=1, nheads=32),
+      dict(seed=50, ngroups=1, nheads=1),
+      dict(seed=50, ngroups=1, nheads=8),
+      dict(seed=50, ngroups=1, nheads=32),
+      # Multi-Head SSM (ngroups = nheads)
+      dict(seed=70, ngroups=8, nheads=8),
+      dict(seed=70, ngroups=32, nheads=32),
+  )
+  def test_ssd_correctness(self, seed: int, ngroups: int, nheads: int):
     keras.utils.set_random_seed(seed)
 
     ## Dimensions
     # Denoted (B, T, Q, D, P) in the paper
-    batch, seqlen, chunk_size, dim, nheads = 1, 2048, 64, 2048, 32
-    ngroups = 1  # (G) in the paper
+    batch, seqlen, chunk_size, dim = 1, 2048, 64, 2048
     dstate = 64  # (N) in the paper
 
     dtype = "float32"

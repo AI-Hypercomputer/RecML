@@ -38,3 +38,4 @@ from recml.core.training.partitioning import Partitioner
 from recml.core.utils.types import Factory
 from recml.core.utils.types import FactoryProtocol
 from recml.core.utils.types import ObjectFactory
+from recml.layers.common import EmbeddingSpec

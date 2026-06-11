@@ -13,6 +13,9 @@
 # limitations under the License.
 """Tests for Jax training library."""
 
+import os
+from unittest import mock
+
 from absl import flags
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -24,7 +27,12 @@ import tensorflow as tf
 
 class _KerasTask(keras_trainer.KerasTask):
 
-  def create_dataset(self, training: bool) -> tf.data.Dataset:
+  def create_dataset(
+      self, training: bool, eval_name: str | None = None
+  ) -> tf.data.Dataset:
+    if eval_name:
+      self.last_eval_name = eval_name
+
     def _map_fn(x: int):
       return (tf.cast(x, tf.float32), 0.1 * tf.cast(x, tf.float32) + 3)
 
@@ -52,23 +60,35 @@ class KerasTrainerTest(parameterized.TestCase):
       flags.FLAGS.mark_as_parsed()
 
   @parameterized.named_parameters(
-      {"testcase_name": "train", "mode": core.Experiment.Mode.TRAIN},
-      {"testcase_name": "eval", "mode": core.Experiment.Mode.EVAL},
+      {"testcase_name": "train", "mode": core.Trainer.Mode.TRAIN},
+      {"testcase_name": "eval", "mode": core.Trainer.Mode.EVAL},
       {
           "testcase_name": "train_and_eval",
-          "mode": core.Experiment.Mode.TRAIN_AND_EVAL,
+          "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
       },
       {
-          "testcase_name": "continuous_eval",
-          "mode": core.Experiment.Mode.CONTINUOUS_EVAL,
+          "testcase_name": "continuous_eval_",
+          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
+      },
+      {
+          "testcase_name": "train_and_eval_legacy_checkpoint_format",
+          "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
+          "legacy_checkpoint_format": True,
+      },
+      {
+          "testcase_name": "continuous_eval_legacy_checkpoint_format",
+          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
+          "legacy_checkpoint_format": True,
       },
   )
-  def test_keras_task_and_trainer(self, mode: str):
+  def test_keras_task_and_trainer(
+      self, mode: str, legacy_checkpoint_format: bool = False
+  ):
     if keras.backend.backend() == "jax":
       distribution = keras.distribution.DataParallel()
     else:
       distribution = None
-      if mode == core.Experiment.Mode.CONTINUOUS_EVAL:
+      if mode == core.Trainer.Mode.CONTINUOUS_EVAL:
         self.skipTest("Continuous eval is only supported on the Jax backend.")
 
     trainer = keras_trainer.KerasTrainer(
@@ -78,21 +98,49 @@ class KerasTrainerTest(parameterized.TestCase):
         steps_per_loop=2,
         model_dir=self.create_tempdir().full_path,
         continuous_eval_timeout=5,
+        legacy_checkpoint_format=legacy_checkpoint_format,
     )
     experiment = core.Experiment(_KerasTask(), trainer)
 
-    if mode == core.Experiment.Mode.CONTINUOUS_EVAL:
+    if mode == core.Trainer.Mode.CONTINUOUS_EVAL:
       # Produce one checkpoint so there is something to evaluate.
-      core.run_experiment(experiment, core.Experiment.Mode.TRAIN)
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN)
 
     history = core.run_experiment(experiment, mode)
 
     if (
-        mode
-        in [core.Experiment.Mode.TRAIN, core.Experiment.Mode.TRAIN_AND_EVAL]
+        mode in [core.Trainer.Mode.TRAIN, core.Trainer.Mode.TRAIN_AND_EVAL]
         and keras.backend.backend() == "jax"
     ):
       self.assertEqual(history.history["num_params/trainable"][0], 2)
+
+  def test_eval_name(self):
+    if keras.backend.backend() != "jax":
+      self.skipTest(
+          "`EpochSummaryCallback` and `eval_name` are only supported on the Jax"
+          " backend."
+      )
+
+    model_dir = self.create_tempdir().full_path
+    eval_name = "custom_eval"
+
+    trainer = keras_trainer.KerasTrainer(
+        model_dir=model_dir,
+        steps_per_eval=1,
+        distribution=keras.distribution.DataParallel(),
+    )
+    trainer.set_job_info(
+        core.JobInfo(eval_name, core.Trainer.Mode.EVAL).to_string()
+    )
+    experiment = core.Experiment(_KerasTask(), trainer)
+
+    # Run evaluation
+    core.run_experiment(experiment, core.Trainer.Mode.EVAL)
+
+    # Check if log directory exists
+    expected_log_dir = os.path.join(model_dir, "logs", eval_name)
+    self.assertTrue(os.path.exists(expected_log_dir))
+    self.assertEqual(experiment.task.last_eval_name, eval_name)
 
 
 if __name__ == "__main__":

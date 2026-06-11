@@ -54,7 +54,7 @@ class _MNISTTask(jax_trainer.JaxTask):
 
     return _create_dataset(training=True), _create_dataset(training=False)
 
-  def create_state(self, batch: jt.PyTree, rng: jax.Array) -> ts.TrainState:
+  def create_state(self, batch: jt.PyTree) -> ts.TrainState:
     images, _ = batch
     model = nn.Sequential([
         nn.Conv(32, kernel_size=(3, 3)),
@@ -68,14 +68,14 @@ class _MNISTTask(jax_trainer.JaxTask):
         nn.relu,
         nn.Dense(10),
     ])
-    variables = model.init(rng, jnp.zeros_like(images))
+    variables = model.init(jax.random.key(42), jnp.zeros_like(images))
     optimizer = optax.sgd(0.1)
     return ts.TrainState.create(
         apply_fn=model.apply, params=variables, tx=optimizer
     )
 
   def train_step(
-      self, batch: jt.PyTree, state: ts.TrainState, rng: jax.Array
+      self, batch: jt.PyTree, state: ts.TrainState
   ) -> tuple[ts.TrainState, Mapping[str, clu_metrics.Metric]]:
     images, labels = batch
 
@@ -133,7 +133,6 @@ class JaxQualityTest(absltest.TestCase):
         steps_per_loop=100,
         continuous_eval_timeout=5,
         model_dir=model_dir,
-        rng_seed=42,
     )
     logs = trainer.train_and_evaluate(task)
     self.assertGreater(logs['train']['accuracy'], 0.95)

@@ -14,6 +14,10 @@
 """Utilities for training Keras models on Jax backend."""
 
 from collections.abc import Mapping
+import dataclasses
+import datetime
+import os
+import re
 from typing import Any
 
 from absl import logging
@@ -22,6 +26,12 @@ import keras
 import orbax.checkpoint as ocp
 import tensorflow as tf
 
+
+STATE_CHECKPOINT_KEY = "state"
+TRAINABLE_VARIABLES_KEY = "trainable_variables"
+NON_TRAINABLE_VARIABLES_KEY = "non_trainable_variables"
+OPTIMIZER_VARIABLES_KEY = "optimizer_variables"
+CONFIG_CHECKPOINT_KEY = "config"
 ORBAX_CHECKPOINT_DEFAULT_KEY = "default"
 
 
@@ -31,6 +41,383 @@ def _assert_variables_built(model: keras.Model):
         "To use methods on `KerasOrbaxCheckpointManager`, your model and"
         f" optimizer must be built. Model built: {model.built}, Optimizer"
         f" built: {model.optimizer.built}"
+    )
+
+
+def _assert_all_layers_built(model: keras.Model):
+  flattened_layers = model._flatten_layers(include_self=True)  # pylint: disable=protected-access
+  if not all(layer.built for layer in flattened_layers):
+    raise ValueError(
+        "To save or restore a checkpoint with a Keras model, the model and"
+        " all of its layers must be built. The layers that are not built"
+        " properly are the following:"
+        f" {[layer for layer in flattened_layers if not layer.built]}."
+    )
+
+
+def _to_shape_dtype_struct(x: keras.Variable) -> jax.ShapeDtypeStruct:
+  if not isinstance(x, keras.Variable):
+    raise ValueError(f"Expected a `keras.Variable`, got {type(x)}.")
+  return jax.ShapeDtypeStruct(
+      shape=x.value.shape,
+      dtype=x.value.dtype,
+      sharding=x.value.sharding,
+  )
+
+
+class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
+  """An Orbax checkpoint manager for Keras 3."""
+
+  def __init__(
+      self,
+      checkpoint_dir: str,
+      max_to_keep: int = 5,
+      save_interval_epochs: int = 1,
+  ):
+    """Initializes a KerasOrbaxCheckpointManager.
+
+    Args:
+      checkpoint_dir: The directory to save checkpoints to.
+      max_to_keep: The maximum number of checkpoints to keep.
+      save_interval_epochs: The interval (in epochs) to save checkpoints.
+    """
+    if keras.backend.backend() != "jax":
+      raise ValueError(
+          "`KerasOrbaxCheckpointManagerV2` is only supported on a `jax`"
+          " backend."
+      )
+    super().__init__(
+        directory=checkpoint_dir,
+        options=ocp.CheckpointManagerOptions(
+            save_interval_steps=save_interval_epochs,
+            max_to_keep=max_to_keep,
+        ),
+    )
+
+  def save_model_variables(
+      self,
+      model: keras.Model,
+      epoch: int,
+      logs: Mapping[str, Any] | None = None,
+  ):
+    """Saves the model variables and optimizer variables to a checkpoint."""
+    _assert_variables_built(model)
+    _assert_all_layers_built(model)
+
+    if not model._jax_state_synced:  # pylint: disable=protected-access
+      model.jax_state_sync()
+
+    variables = {
+        TRAINABLE_VARIABLES_KEY: model.trainable_variables,
+        NON_TRAINABLE_VARIABLES_KEY: model.non_trainable_variables,
+        OPTIMIZER_VARIABLES_KEY: model.optimizer.variables,
+    }
+    state = jax.tree.map(lambda x: x.value, variables)
+    config = keras.utils.serialize_keras_object(model)
+
+    logging.info("Saving checkpoint for epoch %s...", epoch)
+    self.save(
+        step=epoch,
+        args=ocp.args.Composite(**{
+            STATE_CHECKPOINT_KEY: ocp.args.StandardSave(state),
+            CONFIG_CHECKPOINT_KEY: ocp.args.JsonSave(config),
+        }),
+        metrics=logs,
+    )
+
+  def restore_model_variables(self, model: keras.Model, epoch: int):
+    """Restores the model variables and optimizer variables during training."""
+
+    _assert_variables_built(model)
+    _assert_all_layers_built(model)
+
+    if not model._jax_state_synced:  # pylint: disable=protected-access
+      model.jax_state_sync()
+
+    variables = {
+        TRAINABLE_VARIABLES_KEY: model.trainable_variables,
+        NON_TRAINABLE_VARIABLES_KEY: model.non_trainable_variables,
+        OPTIMIZER_VARIABLES_KEY: model.optimizer.variables,
+    }
+
+    # TODO(zixiangzhou): Update variables to use a nested dictionary and index
+    # map instead of flattened list.
+
+    # Construct abstract variables to ensure the checkpoint is restored with
+    # the same sharding as the current variables. This is so we can delete the
+    # variables from device memory to reduce peak memory usage.
+    abstract_variables = jax.tree.map(_to_shape_dtype_struct, variables)
+    for var in jax.tree.flatten(variables)[0]:
+      var.value.delete()
+      var._value = None  # pylint: disable=protected-access
+
+    logging.info("Restoring checkpoint for epoch %s...", epoch)
+
+    restored_items = self.restore(
+        step=epoch,
+        args=ocp.args.Composite(**{
+            STATE_CHECKPOINT_KEY: ocp.args.StandardRestore(abstract_variables)
+        }),
+    )
+    restored_variables = restored_items[STATE_CHECKPOINT_KEY]
+
+    logging.info("Restored checkpoint for epoch %s.", epoch)
+
+    model._initial_epoch = epoch + 1  # pylint: disable=protected-access
+
+    keras.tree.assert_same_structure(variables, restored_variables)
+    for var, restored_var in zip(
+        jax.tree.flatten(variables)[0], jax.tree.flatten(restored_variables)[0]
+    ):
+      var._value = restored_var  # pylint: disable=protected-access
+
+
+def _resolve_orbax_checkpoint_path(
+    checkpoint_dir: str, epoch: int | None = None
+) -> tuple[str, int | None]:
+  """Resolves the checkpoint path and epoch for an Orbax checkpoint.
+
+  This function handles two cases:
+  1. Flat Orbax Checkpoint: If `checkpoint_dir` is itself a valid Orbax
+     checkpoint (as determined by `ocp.path.format_utils.is_orbax_checkpoint`),
+     it is returned as-is along with the provided epoch.
+  2. Nested Step Directories: If `checkpoint_dir` contains step subdirectories
+     (e.g., `0`, `1000`), it resolves to the latest step if `epoch` is
+     None, or the specified `epoch`.
+
+  Args:
+    checkpoint_dir: The directory of or containing the Orbax checkpoints.
+    epoch: Optional epoch (step) number to resolve. Defaults to None, which
+      resolves to the latest step for nested directories. Ignored if the
+      checkpoint_dir is detected as a flat Orbax checkpoint directly.
+
+  Returns:
+    A tuple (resolved_checkpoint_path, resolved_epoch), where
+    resolved_checkpoint_path is the directory of the resolved checkpoint, and
+    resolved_epoch is the resolved epoch number.
+
+  Raises:
+    FileNotFoundError: If no checkpoints are found in `checkpoint_dir`.
+    ValueError: If the specified `epoch` is not found in `checkpoint_dir`.
+  """
+  if ocp.path.format_utils.is_orbax_checkpoint(checkpoint_dir):
+    return checkpoint_dir, epoch
+
+  metadata = ocp.path.step.latest_step_metadata(
+      checkpoint_dir, ocp.path.step.standard_name_format()
+  )
+  if metadata is None:
+    raise FileNotFoundError(
+        f"No checkpoints found in {checkpoint_dir}. Please ensure that the"
+        " checkpoint directory contains Orbax checkpoints."
+    )
+  if epoch is None:
+    epoch = metadata.step
+  elif epoch not in ocp.path.step.checkpoint_steps(checkpoint_dir):
+    raise ValueError(
+        f"Step {epoch} not found in {checkpoint_dir}. Please ensure you"
+        " specify a valid step. Available steps:"
+        f" {ocp.path.step.checkpoint_steps(checkpoint_dir)}"
+    )
+
+  checkpoint_path = ocp.path.step.build_step_path(
+      checkpoint_dir, ocp.path.step.standard_name_format(), epoch
+  )
+  return os.fspath(checkpoint_path), epoch
+
+
+def restore_keras_checkpoint(
+    checkpoint_dir: str,
+    *,
+    model: keras.Model | None = None,
+    epoch: int | None = None,
+    compile: bool = False,  # pylint: disable=redefined-builtin
+    restore_optimizer_vars: bool = False,
+    restore_model_epoch: bool = False,
+    restore_iterations: bool = True,
+) -> keras.Model:
+  """Restores a Keras 3 Jax backend model from an Orbax checkpoint.
+
+  Args:
+    checkpoint_dir: The directory containing the Orbax checkpoint(s).
+    model: The Keras model to restore. If not provided, the model will be
+      instantiated from the config stored in the checkpoint if available.
+      Otherwise and error will be thrown.
+    epoch: The epoch to restore the checkpoint from. If None, the latest
+      checkpoint will be used.
+    compile: Whether to compile the model when it is instantiated from the
+      checkpoint config. If `model` is provided, this argument is ignored.
+      Defaults to False.
+    restore_optimizer_vars: Whether to restore the optimizer variables from the
+      checkpoint. Defaults to False.
+    restore_model_epoch: Whether to restore the epoch on the model. If set, the
+      epoch on the model will be restored to `epoch + 1` so the model can
+      continue training from where it left off. Defaults to False.
+    restore_iterations: Whether to restore the optimizer iterations from the
+      checkpoint when `restore_optimizer_vars` is True. This is an optimizer
+      variable used for controlling the learning rate schedule. Defaults to
+      True.
+
+  Returns:
+    A Keras model with the weights restored from the checkpoint. If the model
+    was provided, a reference to the same model is returned.
+
+  Raises:
+    ValueError: If the Keras backend is not "jax" or if the checkpoint does not
+      contain a model config and `model` is not provided.
+    FileNotFoundError: If no checkpoints are found in the checkpoint directory.
+    ValueError: If the specified `epoch` is not found in the checkpoint
+      directory.
+    ValueError: If the model is not built when `restore_optimizer_vars` is True.
+  """
+
+  if keras.backend.backend() != "jax":
+    raise ValueError(
+        "This function only supports restoring a Keras 3 Jax backend model."
+    )
+  if restore_optimizer_vars and model is None:
+    raise ValueError(
+        "To use `restore_keras_checkpoint` with `restore_optimizer_vars` set to"
+        " True, a model must be provided."
+    )
+
+  checkpoint_path, epoch = _resolve_orbax_checkpoint_path(checkpoint_dir, epoch)
+
+  if model is None:
+    cfg = {**load_keras_model_config(checkpoint_dir, epoch=epoch)}
+    if not compile and "compile_config" in cfg:
+      cfg.pop("compile_config")
+
+    model: keras.Model = keras.utils.deserialize_keras_object(cfg)
+    if not model.built:
+      if "build_config" not in cfg:
+        raise ValueError(
+            "To use `restore_keras_checkpoint` on a model checkpoint without"
+            " passing a model the `build_config` must be present in the config."
+            " Make sure the you have implemented `get_build_config` correctly."
+            " Generally, you shouldn't need to do this and the default"
+            " implementation should work for most cases."
+        )
+      model.build_from_config(cfg["build_config"])
+  elif not model._jax_state_synced:  # pylint: disable=protected-access
+    model.jax_state_sync()
+
+  _assert_all_layers_built(model)
+
+  variables = {
+      TRAINABLE_VARIABLES_KEY: model.trainable_variables,
+      NON_TRAINABLE_VARIABLES_KEY: model.non_trainable_variables,
+  }
+  if restore_optimizer_vars:
+    if not model.optimizer.built:
+      raise ValueError(
+          "To use `restore_keras_checkpoint` on an existing model with"
+          " `restore_optimizer_vars` set to True, the optimizer must be"
+          " built."
+      )
+    variables[OPTIMIZER_VARIABLES_KEY] = model.optimizer.variables
+
+  # TODO(zixiangzhou): Update variables to use a nested dictionary and index map
+  # instead of flattened list.
+
+  # Construct abstract variables to ensure the checkpoint is restored with
+  # the same sharding as the current variables.
+  abstract_state = jax.tree.map(_to_shape_dtype_struct, variables)
+
+  # Delete the variables from device memory to reduce peak memory usage.
+  for var in jax.tree.flatten(variables)[0]:
+    var.value.delete()
+    var._value = None  # pylint: disable=protected-access
+
+  # TODO(aahil): Look into converging the logic here with the checkpointing
+  # logic in KerasOrbaxCheckpointManagerV2.
+  checkpointer = ocp.Checkpointer(
+      ocp.CompositeCheckpointHandler(**{
+          STATE_CHECKPOINT_KEY: ocp.handlers.PyTreeCheckpointHandler(
+              restore_concurrent_gb=96,
+          ),
+      })
+  )
+  restored_state = checkpointer.restore(
+      checkpoint_path,
+      args=ocp.args.Composite(**{
+          STATE_CHECKPOINT_KEY: ocp.args.PyTreeRestore(
+              abstract_state,
+              transforms={},
+              restore_args=ocp.checkpoint_utils.construct_restore_args(
+                  abstract_state
+              ),
+          ),
+      }),
+  )[STATE_CHECKPOINT_KEY]
+  checkpointer.close()
+
+  # TODO(zixiangzhou): Unflatten the variables based on index here.
+  keras.tree.assert_same_structure(variables, restored_state)
+  for var, restored_var in zip(
+      jax.tree.flatten(variables)[0], jax.tree.flatten(restored_state)[0]
+  ):
+    var._value = restored_var  # pylint: disable=protected-access
+
+  if restore_model_epoch:
+    model._initial_epoch = epoch + 1  # pylint: disable=protected-access
+  if restore_optimizer_vars and not restore_iterations:
+    model.optimizer.iterations.assign(0)
+
+  return model
+
+
+def load_keras_model_config(
+    checkpoint_dir: str, epoch: int | None = None
+) -> Mapping[str, Any]:
+  """Loads a Keras model from a checkpoint directory."""
+  if keras.backend.backend() != "jax":
+    raise ValueError(
+        "This function only supports loading a Keras 3 Jax backend model."
+    )
+
+  checkpoint_path, _ = _resolve_orbax_checkpoint_path(checkpoint_dir, epoch)
+
+  json_checkpointer = ocp.Checkpointer(
+      ocp.CompositeCheckpointHandler(
+          **{CONFIG_CHECKPOINT_KEY: ocp.handlers.JsonCheckpointHandler()}
+      )
+  )
+  cfg = json_checkpointer.restore(
+      checkpoint_path,
+      args=ocp.args.Composite(
+          **{CONFIG_CHECKPOINT_KEY: ocp.args.JsonRestore()}
+      ),
+  )[CONFIG_CHECKPOINT_KEY]
+  json_checkpointer.close()
+  return cfg
+
+
+def check_all_layers_built(model: keras.layers.Layer):
+  """Checks if any layers in a Keras model are not built."""
+  unbuilt_layers = []
+  for layer in model._flatten_layers(include_self=True):  # pylint: disable=protected-access
+    if not layer.built:
+      unbuilt_layers.append(layer)
+
+  if unbuilt_layers:
+    raise ValueError(
+        "The following layers are not built:"
+        f" {[layer.name for layer in unbuilt_layers]}."
+    )
+
+
+def check_no_layers_built(model: keras.layers.Layer):
+  """Checks if any layers in a Keras model already built."""
+  built_layers = []
+  for layer in model._flatten_layers(include_self=True):  # pylint: disable=protected-access
+    if layer.built:
+      built_layers.append(layer)
+
+  if built_layers:
+    raise ValueError(
+        "The following layers are already built:"
+        f" {[layer.name for layer in built_layers]}."
     )
 
 
@@ -142,7 +529,9 @@ class EpochOrbaxCheckpointAndRestoreCallback(keras.callbacks.Callback):
 
   def __init__(
       self,
-      checkpoint_manager: KerasOrbaxCheckpointManager,
+      checkpoint_manager: (
+          KerasOrbaxCheckpointManager | KerasOrbaxCheckpointManagerV2
+      ),
       marker_path: str | None = None,
   ):
     if keras.backend.backend() != "jax":
@@ -167,6 +556,10 @@ class EpochOrbaxCheckpointAndRestoreCallback(keras.callbacks.Callback):
     latest_epoch = self._checkpoint_manager.latest_step()
     if latest_epoch is not None:
       self._checkpoint_manager.restore_model_variables(self.model, latest_epoch)
+    else:
+      # save the model checkpoint at the begining of the training.
+      # So that the continuous eval job finds it and logs the eval at step 0.
+      self._checkpoint_manager.save_model_variables(self.model, 0, logs)
 
   def on_epoch_end(self, epoch: int, logs: Mapping[str, Any] | None = None):
     self._checkpoint_manager.save_model_variables(self.model, epoch, logs)
@@ -188,6 +581,9 @@ def restore_keras_model(
 ):
   """Restores a Keras 3 Jax backend model from an Orbax checkpoint.
 
+  This is only compatible with `KerasOrbaxCheckpointManager`. If you are using
+  `KerasOrbaxCheckpointManagerV2`, use `restore_keras_checkpoint` instead.
+
   Args:
     model: The Keras model to restore.
     checkpoint_dir: The directory containing the Orbax checkpoints.
@@ -203,8 +599,8 @@ def restore_keras_model(
     restore_iterations: Whether to restore the model's iterations. If `True`
       then the model will continue training from the iteration the checkpoint
       was saved at. This is an optimizer variable used for controlling the
-      learning rate schedule. This is not supported if restore_optimizer_vars
-      is `False`.
+      learning rate schedule. This is not supported if restore_optimizer_vars is
+      `False`.
 
   Raises:
     FileNotFoundError: If no checkpoints are found in the checkpoint directory.
@@ -304,6 +700,7 @@ class EpochSummaryCallback(keras.callbacks.TensorBoard):
       log_dir: str,
       steps_per_epoch: int,
       write_steps_per_second: bool = True,
+      eval_subdir: str = "validation",
   ):
     super().__init__(
         log_dir,
@@ -313,9 +710,21 @@ class EpochSummaryCallback(keras.callbacks.TensorBoard):
     )
     self._steps_per_epoch = steps_per_epoch
     self._num_params = None
+    self._eval_subdir = eval_subdir
     # Marks the callback as async safe so batch end callbacks can be dispatched
     # asynchronously.
     self.async_safe = True
+
+  def set_model(self, model: keras.Model):
+    """Sets Keras model and writes graph if specified."""
+    super().set_model(model)
+    if self._eval_subdir != "validation":
+      # We need to manually set `_val_dir` to point to the correct subdirectory.
+      # `super().set_model(model)` sets `_val_dir` to `log_dir/validation`.
+      self._val_dir = os.path.join(self.log_dir, self._eval_subdir)
+      # `super().set_model(model)` lazily creates the writers so we need to
+      # reset them here to make sure they point to the correct subdirectories.
+      self._writers = {}
 
   def _get_num_params(self, training: bool) -> dict[str, int]:
     if self._num_params is None:

@@ -19,13 +19,6 @@ from collections.abc import Iterator, Mapping, Sequence
 import dataclasses
 from typing import Generic, Literal, TypeVar
 
-import sys
-import os
-# Add the RecML folder to the system path
-sys.path.append(os.path.join(os.getcwd(), "../../../RecML"))
-os.environ["KERAS_BACKEND"] = "jax"
-
-from etils import epy
 import fiddle as fdl
 import flax.linen as nn
 import jax
@@ -36,9 +29,6 @@ import optax
 import recml
 from recml.layers.linen import sparsecore
 import tensorflow as tf
-
-with epy.lazy_imports():
-  from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec  # pylint: disable=g-import-not-at-top
 
 
 @dataclasses.dataclass
@@ -260,14 +250,14 @@ class PredictionTask(recml.JaxTask):
     )
     return train_iter, eval_iter
 
-  def create_state(self, batch: jt.PyTree, rng: jt.Array) -> recml.JaxState:
+  def create_state(self, batch: jt.PyTree) -> recml.JaxState:
     inputs, _ = batch
-    params = self.model.init(rng, inputs)
+    params = self.model.init(jax.random.key(42), inputs)
     optimizer = self.optimizer.make()
     return recml.JaxState.create(params=params, tx=optimizer)
 
   def train_step(
-      self, batch: jt.PyTree, state: recml.JaxState, rng: jt.Array
+      self, batch: jt.PyTree, state: recml.JaxState
   ) -> tuple[recml.JaxState, Mapping[str, recml.Metric]]:
     inputs, label = batch
 
@@ -276,7 +266,6 @@ class PredictionTask(recml.JaxTask):
       loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, label), axis=0)
       return loss, logits
 
-    global_batch_size = self.train_data.global_batch_size
     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True, allow_int=True)
     (loss, logits), grads = grad_fn(state.params)
     state = state.update(grads=grads)
@@ -288,7 +277,6 @@ class PredictionTask(recml.JaxTask):
         'aucroc': recml.metrics.aucroc(label, logits, from_logits=True),
         'label/mean': recml.metrics.mean(label),
         'prediction/mean': recml.metrics.mean(jax.nn.sigmoid(logits)),
-        "common/batch_size": recml.metrics.scalar(global_batch_size),
     }
     return state, metrics
 
@@ -379,7 +367,7 @@ def experiment() -> fdl.Config[recml.Experiment]:
           DLRMModel,
           features=feature_set,
           embedding_optimizer=fdl.Config(
-              embedding_spec.AdagradOptimizerSpec,
+              sparsecore.specs.AdagradOptimizerSpec,
               learning_rate=0.01,
           ),
           bottom_mlp_dims=[512, 256, 128],
@@ -400,6 +388,5 @@ def experiment() -> fdl.Config[recml.Experiment]:
       train_steps=1_000,
       steps_per_eval=100,
       steps_per_loop=100,
-      enable_checkpointing=False
   )
   return fdl.Config(recml.Experiment, task=task, trainer=trainer)
