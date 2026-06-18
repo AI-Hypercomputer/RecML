@@ -60,8 +60,8 @@ including:
 
 ## Roadmap / Future Work
 
-*   Expand reference model implementations (Retrieval, Uplift, foundation user
-    model).
+*   Expand reference model implementations (Ranking,
+    Retrieval, Uplift, foundation user model).
 *   Add support for optimized configurations and lower precision training
     (bfloat16, fp16).
 *   Improve support for Cloud GPU training and inference
