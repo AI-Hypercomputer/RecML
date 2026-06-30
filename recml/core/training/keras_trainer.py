@@ -122,9 +122,32 @@ class KerasTrainer(core.Trainer[KerasTask]):
       max_checkpoints_to_keep: int = 5,
       checkpoint_save_interval_epochs: int = 1,
       rng_seed: int = core.DEFAULT_RNG_SEED,
-      legacy_checkpoint_format: bool = True,
+      checkpoint_version: keras_utils.CheckpointVersion | str = "v2",
+      legacy_checkpoint_format: bool | None = None,
   ):
-    """Initializes the instance."""
+    """Initializes the instance.
+
+    Args:
+      distribution: The distribution strategy to use.
+      model_dir: The directory to save checkpoints and logs.
+      train_steps: Total number of training steps.
+      steps_per_eval: Number of steps between evaluations.
+      continuous_eval_timeout: Timeout for continuous evaluation.
+      steps_per_loop: Number of steps per training loop.
+      max_checkpoints_to_keep: Maximum number of checkpoints to keep.
+      checkpoint_save_interval_epochs: Interval in epochs to save checkpoints.
+      rng_seed: Random seed.
+      checkpoint_version: The checkpoint version to use. Supported versions:
+        "v1" (legacy V1), "v2" (V2, default), "v3" (V3).
+      legacy_checkpoint_format: Deprecated. Use checkpoint_version instead. If
+        set, True maps to V1, and False maps to V2. TODO(b/542602169): Remove
+        this in v2.
+      resume_training_launcher: Launcher to resume training.
+      enable_xmanager_measurements: Whether to enable XManager measurements.
+      enable_autoxprof: Whether to enable AutoXprof.
+      autoxprof_settings: Settings for AutoXprof.
+      s2_logging_settings: Settings for S2 logging.
+    """
 
     keras.utils.set_random_seed(rng_seed)
 
@@ -153,24 +176,41 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._checkpoint_dir = os.path.join(model_dir, core.CHECKPOINT_DIR)
     self._max_checkpoints_to_keep = max_checkpoints_to_keep
     self._checkpoint_save_interval_epochs = checkpoint_save_interval_epochs
-    self._legacy_checkpoint_format = legacy_checkpoint_format
+    if legacy_checkpoint_format is not None:
+      logging.warning(
+          "legacy_checkpoint_format is deprecated, use checkpoint_version"
+          " instead."
+      )
+      self._checkpoint_version = (
+          keras_utils.CheckpointVersion.V1
+          if legacy_checkpoint_format
+          else keras_utils.CheckpointVersion.V2
+      )
+    else:
+      self._checkpoint_version = keras_utils.CheckpointVersion(
+          checkpoint_version
+      )
 
   @functools.cached_property
   def train_callbacks(self) -> list[keras.callbacks.Callback]:
     """Returns the training callbacks."""
     if keras.backend.backend() == "jax":
-      if self._legacy_checkpoint_format:
-        checkpoint_manager = keras_utils.KerasOrbaxCheckpointManager(
-            checkpoint_dir=self._checkpoint_dir,
-            max_to_keep=self._max_checkpoints_to_keep,
-            save_interval_epochs=self._checkpoint_save_interval_epochs,
-        )
+      if self._checkpoint_version == keras_utils.CheckpointVersion.V1:
+        manager_cls = keras_utils.KerasOrbaxCheckpointManager
+      elif self._checkpoint_version == keras_utils.CheckpointVersion.V2:
+        manager_cls = keras_utils.KerasOrbaxCheckpointManagerV2
+      elif self._checkpoint_version == keras_utils.CheckpointVersion.V3:
+        manager_cls = keras_utils.KerasOrbaxCheckpointManagerV3
       else:
-        checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
-            checkpoint_dir=self._checkpoint_dir,
-            max_to_keep=self._max_checkpoints_to_keep,
-            save_interval_epochs=self._checkpoint_save_interval_epochs,
+        raise ValueError(
+            f"Unsupported checkpoint version: {self._checkpoint_version}"
         )
+
+      checkpoint_manager = manager_cls(
+          checkpoint_dir=self._checkpoint_dir,
+          max_to_keep=self._max_checkpoints_to_keep,
+          save_interval_epochs=self._checkpoint_save_interval_epochs,
+      )
 
       callbacks = [
           keras_utils.EpochSummaryCallback(
@@ -379,7 +419,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     else:
       steps_msg = "running complete evaluation..."
 
-    use_legacy_checkpoint_format = self._legacy_checkpoint_format
+    checkpoint_version = self._checkpoint_version
 
     class _RestoreCallback(keras.callbacks.Callback):
       """Callback for restoring the model from the latest checkpoint."""
@@ -393,13 +433,20 @@ class KerasTrainer(core.Trainer[KerasTask]):
         self._epoch = epoch
 
       def on_test_begin(self, logs: Mapping[str, Any] | None = None):
-        if use_legacy_checkpoint_format:
+        if checkpoint_version == keras_utils.CheckpointVersion.V1:
           keras_utils.restore_keras_model(
               model, self._checkpoint_dir, step=self._epoch
           )
-        else:
+        elif checkpoint_version in (
+            keras_utils.CheckpointVersion.V2,
+            keras_utils.CheckpointVersion.V3,
+        ):
           keras_utils.restore_keras_checkpoint(
               self._checkpoint_dir, model=model, epoch=self._epoch
+          )
+        else:
+          raise ValueError(
+              f"Unsupported checkpoint version: {checkpoint_version}"
           )
 
     history = None
