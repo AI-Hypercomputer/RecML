@@ -332,7 +332,7 @@ def restore_keras_checkpoint(
   # TODO(aahil): Look into converging the logic here with the checkpointing
   # logic in KerasOrbaxCheckpointManagerV2.
   checkpointer = ocp.Checkpointer(
-      ocp.CompositeCheckpointHandler(**{
+      ocp.CompositeCheckpointHandler(**{  # pyrefly: ignore[bad-argument-type]
           STATE_CHECKPOINT_KEY: ocp.handlers.PyTreeCheckpointHandler(
               restore_concurrent_gb=96,
           ),
@@ -360,7 +360,7 @@ def restore_keras_checkpoint(
     var._value = restored_var  # pylint: disable=protected-access
 
   if restore_model_epoch:
-    model._initial_epoch = epoch + 1  # pylint: disable=protected-access
+    model._initial_epoch = epoch + 1  # pylint: disable=protected-access  # pyrefly: ignore[unsupported-operation]
   if restore_optimizer_vars and not restore_iterations:
     model.optimizer.iterations.assign(0)
 
@@ -380,7 +380,7 @@ def load_keras_model_config(
 
   json_checkpointer = ocp.Checkpointer(
       ocp.CompositeCheckpointHandler(
-          **{CONFIG_CHECKPOINT_KEY: ocp.handlers.JsonCheckpointHandler()}
+          **{CONFIG_CHECKPOINT_KEY: ocp.handlers.JsonCheckpointHandler()}  # pyrefly: ignore[bad-argument-type]
       )
   )
   cfg = json_checkpointer.restore(
@@ -633,7 +633,7 @@ def restore_keras_model(
     )
 
   checkpointer = ocp.Checkpointer(
-      ocp.CompositeCheckpointHandler(**{
+      ocp.CompositeCheckpointHandler(**{  # pyrefly: ignore[bad-argument-type]
           ORBAX_CHECKPOINT_DEFAULT_KEY: ocp.handlers.PyTreeCheckpointHandler()
       })
   )

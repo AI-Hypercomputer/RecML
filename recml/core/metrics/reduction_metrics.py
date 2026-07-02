@@ -39,7 +39,7 @@ class ReductionMetric(base_metrics.Metric):
     base_cls = cls
     bound_kwargs = kwargs
 
-    class _FromFun(cls):
+    class _FromFun(cls):  # pyrefly: ignore[invalid-inheritance]
       """A reduction metric that is computed from a function."""
 
       @classmethod

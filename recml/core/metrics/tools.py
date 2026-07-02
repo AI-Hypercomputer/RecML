@@ -112,7 +112,7 @@ class MetricAccumulator:
         for k, v in scalars.items()
         if not isinstance(metrics[k], base_metrics.ScalarMetric)
     }
-    self._writer.write_scalars(step, non_reported_scalars)
+    self._writer.write_scalars(step, non_reported_scalars)  # pyrefly: ignore[bad-argument-type]
     self._writer.flush()
 
     return scalars
@@ -133,7 +133,7 @@ def merge_metrics(
   merged_metrics = {}
   for k in [*a.keys(), *b.keys()]:
     if k in a and k in b:
-      merged_metrics[k] = a[k].merge(b[k])
+      merged_metrics[k] = a[k].merge(b[k])  # pyrefly: ignore[bad-argument-type]
     elif k in a:
       merged_metrics[k] = a[k]
     elif k in b:
@@ -156,4 +156,4 @@ def _localize_and_log_scalars(
 ) -> None:
   """Localizes the metrics from device to host and logs scalars."""
   scalar_metrics = jax.tree.map(_localize, scalar_metrics)
-  summary_writer.write_scalars(step, compute_metrics(scalar_metrics))
+  summary_writer.write_scalars(step, compute_metrics(scalar_metrics))  # pyrefly: ignore[bad-argument-type]

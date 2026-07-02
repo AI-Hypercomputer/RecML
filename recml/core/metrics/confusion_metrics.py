@@ -83,7 +83,7 @@ class Precision(ConfusionMetric):
     precision_ = _np_divide_no_nan(
         self.true_positives, self.true_positives + self.false_positives
     )
-    return _maybe_squeeze(precision_)
+    return _maybe_squeeze(precision_)  # pyrefly: ignore[bad-return]
 
 
 class Recall(ConfusionMetric):
@@ -93,7 +93,7 @@ class Recall(ConfusionMetric):
     recall_ = _np_divide_no_nan(
         self.true_positives, self.true_positives + self.false_negatives
     )
-    return _maybe_squeeze(recall_)
+    return _maybe_squeeze(recall_)  # pyrefly: ignore[bad-return]
 
 
 class FBeta(ConfusionMetric):
@@ -145,7 +145,7 @@ class FBeta(ConfusionMetric):
     recall_ = _np_divide_no_nan(
         self.true_positives, self.true_positives + self.false_negatives
     )
-    return _maybe_squeeze(
+    return _maybe_squeeze(  # pyrefly: ignore[bad-return]
         _np_divide_no_nan(
             np.multiply(precision_, recall_) * (self.beta + 1.0),
             np.multiply(precision_, self.beta) + recall_,
@@ -174,7 +174,7 @@ class AUCPR(ConfusionMetric):
         predictions=y_pred,
         labels=y_true,
         weights=weights,
-        thresholds=default_thresholds(num_thresholds),
+        thresholds=default_thresholds(num_thresholds),  # pyrefly: ignore[bad-argument-type]
     )
     return cls(
         true_positives=tp,
@@ -237,7 +237,7 @@ class AUCROC(AUCPR):
         self.false_positives, self.false_positives + self.true_negatives
     )
     # We negate the integral because the thresholds are in ascending order.
-    return -np.trapezoid(tp_rate, fp_rate)
+    return -np.trapezoid(tp_rate, fp_rate)  # pyrefly: ignore[bad-return]
 
 
 class PrecisionAtRecall(ConfusionMetric):
@@ -261,7 +261,7 @@ class PrecisionAtRecall(ConfusionMetric):
         predictions=y_pred,
         labels=y_true,
         weights=weights,
-        thresholds=default_thresholds(num_thresholds),
+        thresholds=default_thresholds(num_thresholds),  # pyrefly: ignore[bad-argument-type]
     )
     return cls(
         true_positives=tp,
@@ -593,7 +593,7 @@ def estimate_confusion_matrix(
 
     return jnp.sum(tp), jnp.sum(tn), jnp.sum(fp), jnp.sum(fn)
 
-  thresholds = jnp.asarray(thresholds, dtype=jnp.float32)
+  thresholds = jnp.asarray(thresholds, dtype=jnp.float32)  # pyrefly: ignore[bad-assignment]
   return jax.vmap(_estimate_confusion_matrix)(thresholds)
 
 

@@ -184,7 +184,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
           ),
       ]
 
-      return callbacks
+      return callbacks  # pyrefly: ignore[bad-return]
 
     return [
         keras.callbacks.TensorBoard(
@@ -310,7 +310,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
           return_dict=True,
       )
       epoch_dt = time.time() - epoch_start_time
-      steps_per_second = self._steps_per_eval / epoch_dt
+      steps_per_second = self._steps_per_eval / epoch_dt  # pyrefly: ignore[unsupported-operation]
       val_logs = {"val_" + k: v for k, v in history.items()}
       val_logs["val_steps_per_second"] = steps_per_second
       tb_cbk.on_epoch_end(0, val_logs)
@@ -439,7 +439,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
             f" {psutil.Process().memory_info().rss / 1024 ** 2:.1f} MB"
         )
         epoch_dt = time.time() - epoch_start_time
-        steps_per_second = self._steps_per_eval / epoch_dt
+        steps_per_second = self._steps_per_eval / epoch_dt  # pyrefly: ignore[unsupported-operation]
 
         val_logs = {"val_" + k: v for k, v in history.items()}
         val_logs["val_steps_per_second"] = steps_per_second

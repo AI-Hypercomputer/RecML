@@ -161,8 +161,8 @@ def get_iterators(
   """Creates and unpacks the datasets returned by the task."""
   if isinstance(datasets, (iterator.Iterator, tf.data.Dataset)):
     if isinstance(datasets, tf.data.Dataset):
-      datasets = iterator.TFDatasetIterator(datasets)
-    return datasets, {}
+      datasets = iterator.TFDatasetIterator(datasets)  # pyrefly: ignore[bad-assignment]
+    return datasets, {}  # pyrefly: ignore[bad-return]
   elif not isinstance(datasets, tuple) and len(datasets) != 2:
     raise ValueError(
         "Expected `datasets` to be a single dataset or a tuple of training"
@@ -195,7 +195,7 @@ def get_iterators(
 
   if all(isinstance(v, tf.data.Dataset) for v in eval_datasets.values()):
     eval_datasets = {
-        k: iterator.TFDatasetIterator(v) for k, v in eval_datasets.items()
+        k: iterator.TFDatasetIterator(v) for k, v in eval_datasets.items()  # pyrefly: ignore[bad-argument-type]
     }
 
   if not all(isinstance(v, iterator.Iterator) for v in eval_datasets.values()):

@@ -230,7 +230,7 @@ class DlrmHSTU(nn.Module):
     action_encoder = ActionEncoder(
         action_embedding_dim=hstu_config.hstu_transducer_embedding_dim,
         action_feature_name=hstu_config.uih_weight_feature_name,
-        action_weights=hstu_config.action_weights,
+        action_weights=hstu_config.action_weights,  # pyrefly: ignore[bad-argument-type]
         watchtime_feature_name=hstu_config.watchtime_feature_name,
         watchtime_to_action_thresholds_and_weights=hstu_config.watchtime_to_action_thresholds_and_weights,
     )
@@ -321,7 +321,7 @@ class DlrmHSTU(nn.Module):
     self._hstu_transducer = HSTUTransducer(
         stu_module=stu_module,
         input_preprocessor=preprocessor,
-        output_postprocessor_cls=postproc_cls,
+        output_postprocessor_cls=postproc_cls,  # pyrefly: ignore[bad-argument-type]
         input_dropout_ratio=hstu_config.hstu_input_dropout_ratio,
         positional_encoder=positional_encoder,
         return_full_embeddings=False,

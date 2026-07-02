@@ -215,7 +215,7 @@ class CriteoFactory(recml.Factory[tf.data.Dataset]):
 
     label = np.random.randint(0, 2, size=(batch_size,))
 
-    dataset = tf.data.Dataset.from_tensors((data, label))
+    dataset = tf.data.Dataset.from_tensors((data, label))  # pyrefly: ignore[bad-argument-type]
     dataset = dataset.take(1).repeat()
     dataset = dataset.prefetch(buffer_size=2048)
     options = tf.data.Options()
@@ -234,7 +234,7 @@ class PredictionTask(recml.JaxTask):
   model: DLRMModel
   optimizer: recml.Factory[optax.GradientTransformation]
 
-  def create_datasets(self) -> tuple[recml.data.Iterator, recml.data.Iterator]:
+  def create_datasets(self) -> tuple[recml.data.Iterator, recml.data.Iterator]:  # pyrefly: ignore[bad-override]
     global_batch_size = self.train_data.global_batch_size
     train_iter = recml.data.TFDatasetIterator(
         dataset=self.train_data.make(),
@@ -263,8 +263,8 @@ class PredictionTask(recml.JaxTask):
 
     def _loss_fn(params: jt.PyTree) -> tuple[jt.Scalar, jt.Array]:
       logits = self.model.apply(params, inputs, training=True)
-      loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, label), axis=0)
-      return loss, logits
+      loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, label), axis=0)  # pyrefly: ignore[bad-argument-type]
+      return loss, logits  # pyrefly: ignore[bad-return]
 
     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True, allow_int=True)
     (loss, logits), grads = grad_fn(state.params)
@@ -285,15 +285,15 @@ class PredictionTask(recml.JaxTask):
   ) -> Mapping[str, recml.Metric]:
     inputs, label = batch
     logits = self.model.apply(state.params, inputs, training=False)
-    loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, label), axis=0)
+    loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, label), axis=0)  # pyrefly: ignore[bad-argument-type]
 
     metrics = {
         'loss': recml.metrics.mean(loss),
-        'accuracy': recml.metrics.binary_accuracy(label, logits, threshold=0.0),
-        'auc': recml.metrics.aucpr(label, logits, from_logits=True),
-        'aucroc': recml.metrics.aucroc(label, logits, from_logits=True),
+        'accuracy': recml.metrics.binary_accuracy(label, logits, threshold=0.0),  # pyrefly: ignore[bad-argument-type]
+        'auc': recml.metrics.aucpr(label, logits, from_logits=True),  # pyrefly: ignore[bad-argument-type]
+        'aucroc': recml.metrics.aucroc(label, logits, from_logits=True),  # pyrefly: ignore[bad-argument-type]
         'label/mean': recml.metrics.mean(label),
-        'prediction/mean': recml.metrics.mean(jax.nn.sigmoid(logits)),
+        'prediction/mean': recml.metrics.mean(jax.nn.sigmoid(logits)),  # pyrefly: ignore[bad-argument-type]
     }
     return metrics
 

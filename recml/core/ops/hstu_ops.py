@@ -139,7 +139,7 @@ def _apply_mask(
     # need to keep into account the current shard along Q sequence.
 
     if k_in_lanes:
-      assert q_sequence_ref.shape == (bq, NUM_LANES)
+      assert q_sequence_ref.shape == (bq, NUM_LANES)  # pyrefly: ignore[missing-attribute]
 
       k_sequence = k_offset + jax.lax.broadcasted_iota(
           jnp.int32, (bq, k_slice.size), 1
@@ -148,15 +148,15 @@ def _apply_mask(
       repeats, rem = divmod(k_slice.size, NUM_LANES)
       assert rem == 0
       q_sequence = jnp.tile(
-          q_sequence_ref[...], (1, repeats)
+          q_sequence_ref[...], (1, repeats)  # pyrefly: ignore[unsupported-operation]
       )  # [bq, k_slice.size]
     else:
-      assert q_sequence_ref.shape == (NUM_SUBLANES, bq)
+      assert q_sequence_ref.shape == (NUM_SUBLANES, bq)  # pyrefly: ignore[missing-attribute]
 
       k_sequence = k_offset + jax.lax.broadcasted_iota(
           jnp.int32, (k_slice.size, bq), 0
       )
-      q_sequence = q_sequence_ref[:1, :]  # [1, bq]
+      q_sequence = q_sequence_ref[:1, :]  # [1, bq]  # pyrefly: ignore[unsupported-operation]
       q_sequence = jnp.broadcast_to(q_sequence, (k_slice.size, bq))
 
     assert q_sequence.shape == k_sequence.shape
@@ -244,7 +244,7 @@ def _pointwise_splash_attention_fwd_kernel_impl(
         q_sequence_ref=q_sequence_ref,
         q_segment_ids_ref=q_segment_ids_ref,
         kv_segment_ids_ref=kv_segment_ids_ref,
-        k_slice=slice_k,
+        k_slice=slice_k,  # pyrefly: ignore[bad-argument-type]
         # When the iteration space is shrunk (for local attention for example),
         # the kv_index program_id does not correspond to the actual coordinates
         # of the KV data. Make sure to use the 'unshrunk' index (coming from the
@@ -479,7 +479,7 @@ def _pointwise_splash_attention_bwd_kernel_impl(
         q_sequence_ref,
         q_segment_ids_ref,
         kv_segment_ids_ref,
-        k_slice=slice_k,
+        k_slice=slice_k,  # pyrefly: ignore[bad-argument-type]
         k_offset=j * bkv + i * bkv_compute,
         bq=bq,
         k_in_lanes=False,

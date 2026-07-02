@@ -551,7 +551,7 @@ def cpu_lookup(
       activation = tf.nn.embedding_lookup(tables[name], feature)
 
       if spec.max_sequence_length is None:
-        activation = _reduce(activation, weight, spec.combiner)
+        activation = _reduce(activation, weight, spec.combiner)  # pyrefly: ignore[bad-argument-type]
 
       activations[name] = activation
     else:
@@ -591,7 +591,7 @@ def _reduce(
     weight_sum = tf.reduce_sum(weights, axis=-2)
     out = tf.math.divide_no_nan(out, weight_sum)
   elif combiner == 'sqrtn':
-    weight_sum = tf.math.sqrt(tf.reduce_sum(weights**2, axis=-2))
+    weight_sum = tf.math.sqrt(tf.reduce_sum(weights**2, axis=-2))  # pyrefly: ignore[unsupported-operation]
     out = tf.math.divide_no_nan(out, weight_sum)
   else:
     raise ValueError("`combiner` must be one of ['mean', 'sqrtn', 'sum'].")

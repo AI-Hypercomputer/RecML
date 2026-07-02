@@ -140,7 +140,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
     # Prepend contextual embeddings
     if self._max_contextual_seq_len > 0:
       output_seq_embeddings = jnp.concatenate(
-          [contextual_embeddings, output_seq_embeddings], axis=1
+          [contextual_embeddings, output_seq_embeddings], axis=1  # pyrefly: ignore[bad-argument-type]
       )
       contextual_mask = jnp.ones(
           (batch_size, self._max_contextual_seq_len), dtype=jnp.bool_

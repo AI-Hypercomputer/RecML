@@ -262,22 +262,22 @@ class STULayer(nn.Module):
             self.config.max_decode_length,
             self.hidden_dim,
         )
-        self.cached_key.value = jnp.zeros(k_cache_shape, k.dtype)
-        self.cached_value.value = jnp.zeros(v_cache_shape, v.dtype)
+        self.cached_key.value = jnp.zeros(k_cache_shape, k.dtype)  # pyrefly: ignore[bad-argument-type]
+        self.cached_value.value = jnp.zeros(v_cache_shape, v.dtype)  # pyrefly: ignore[bad-argument-type]
 
       if self.is_mutable_collection('cache'):
         k_cache = jax.lax.dynamic_update_slice(
-            self.cached_key.value,
-            k.astype(self.cached_key.value.dtype),
+            self.cached_key.value,  # pyrefly: ignore[bad-argument-type]
+            k.astype(self.cached_key.value.dtype),  # pyrefly: ignore[missing-attribute]
             (0, 0, cache_index, 0),
         )
         v_cache = jax.lax.dynamic_update_slice(
-            self.cached_value.value,
-            v.astype(self.cached_value.value.dtype),
+            self.cached_value.value,  # pyrefly: ignore[bad-argument-type]
+            v.astype(self.cached_value.value.dtype),  # pyrefly: ignore[missing-attribute]
             (0, 0, cache_index, 0),
         )
-        self.cached_key.value = k_cache
-        self.cached_value.value = v_cache
+        self.cached_key.value = k_cache  # pyrefly: ignore[bad-argument-type]
+        self.cached_value.value = v_cache  # pyrefly: ignore[bad-argument-type]
         self.cache_index.value = cache_index + seq_len
         k = k_cache
         v = v_cache

@@ -248,7 +248,7 @@ class ModelParallelPartitioner(Partitioner):
       specs = nn.get_partition_spec(abstract_state)
 
       if self.rules is not None:
-        specs = nn.logical_to_mesh(specs, self.rules)
+        specs = nn.logical_to_mesh(specs, self.rules)  # pyrefly: ignore[bad-argument-type]
 
       state_sharding = jax.tree.map(
           lambda x: jax.sharding.NamedSharding(self.mesh, x), specs

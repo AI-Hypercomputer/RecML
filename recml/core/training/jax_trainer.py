@@ -265,7 +265,7 @@ class KerasState(struct.PyTreeNode):
     tvars_ = dict(zip(self.tvars_paths, self.tvars))
     updates, new_opt_state = self.tx.update(grads_, self.opt_state, tvars_)
     new_tvars_ = optax.apply_updates(tvars_, updates)
-    new_tvars = [new_tvars_[path] for path in self.tvars_paths]
+    new_tvars = [new_tvars_[path] for path in self.tvars_paths]  # pyrefly: ignore[bad-index]
     return self.replace(
         step=self.step + 1,
         tvars=new_tvars,
@@ -881,7 +881,7 @@ def _state_metrics(state: State) -> Mapping[str, base_metrics.Metric]:
   def _add_optimizer_metrics(opt_state: optax.OptState, prefix: str):
     if isinstance(opt_state, optax.MultiTransformState):
       for name, inner_state in opt_state.inner_states.items():
-        _add_optimizer_metrics(inner_state, _name(prefix, name))
+        _add_optimizer_metrics(inner_state, _name(prefix, name))  # pyrefly: ignore[bad-argument-type]
     elif isinstance(
         opt_state,
         (optax.InjectStatefulHyperparamsState, optax.InjectHyperparamsState),
@@ -892,7 +892,7 @@ def _state_metrics(state: State) -> Mapping[str, base_metrics.Metric]:
             and np.prod(hparam.shape) == 1
         ):
           metrics[f"optimizer/{_name(prefix, key)}"] = base_metrics.scalar(
-              hparam
+              hparam  # pyrefly: ignore[bad-argument-type]
           )
     elif isinstance(opt_state, (list, tuple)):
       for opt_state in opt_state:
