@@ -52,6 +52,27 @@ class _KerasTask(keras_trainer.KerasTask):
     return model
 
 
+class _MarkerCallback(keras_utils.MetricsCallback):
+  """Reports a fixed metric at the end of each training epoch and eval pass."""
+
+  def on_epoch_end(self, epoch, logs=None):
+    self._record(logs, "custom/marker", 7.0)
+
+  def on_test_end(self, logs=None):
+    self._record(logs, "custom/marker", 7.0)
+
+
+class _KerasTaskWithCallbacks(_KerasTask):
+
+  def __init__(self):
+    self.created_callbacks = []
+
+  def create_callbacks(self, training: bool):
+    callback = _MarkerCallback()
+    self.created_callbacks.append((training, callback))
+    return [callback]
+
+
 class KerasTrainerTest(parameterized.TestCase):
 
   def setUp(self):
@@ -128,6 +149,67 @@ class KerasTrainerTest(parameterized.TestCase):
         and keras.backend.backend() == "jax"
     ):
       self.assertEqual(history.history["num_params/trainable"][0], 2)
+
+  def test_task_callbacks_run_in_training(self):
+    trainer = keras_trainer.KerasTrainer(
+        distribution=(
+            keras.distribution.DataParallel()
+            if keras.backend.backend() == "jax"
+            else None
+        ),
+        train_steps=4,
+        steps_per_loop=2,
+        model_dir=self.create_tempdir().full_path,
+    )
+    task = _KerasTaskWithCallbacks()
+
+    history = core.run_experiment(
+        core.Experiment(task, trainer), core.Trainer.Mode.TRAIN
+    )
+
+    self.assertEqual([t for t, _ in task.created_callbacks], [True])
+    self.assertEqual(history.history["custom/marker"], [7.0, 7.0])
+
+  @parameterized.named_parameters(
+      {"testcase_name": "eval", "mode": core.Trainer.Mode.EVAL},
+      {
+          "testcase_name": "continuous_eval",
+          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
+      },
+  )
+  def test_task_metrics_callbacks_are_written_in_eval(self, mode):
+    if keras.backend.backend() != "jax":
+      self.skipTest("`EpochSummaryCallback` is only used on the Jax backend.")
+    model_dir = self.create_tempdir().full_path
+
+    def _trainer():
+      return keras_trainer.KerasTrainer(
+          distribution=keras.distribution.DataParallel(),
+          train_steps=2,
+          steps_per_eval=1,
+          steps_per_loop=2,
+          model_dir=model_dir,
+          continuous_eval_timeout=1,
+      )
+
+    if mode == core.Trainer.Mode.CONTINUOUS_EVAL:
+      # Produce one checkpoint so there is something to evaluate.
+      core.run_experiment(
+          core.Experiment(_KerasTask(), _trainer()), core.Trainer.Mode.TRAIN
+      )
+      keras.backend.clear_session()
+    task = _KerasTaskWithCallbacks()
+
+    with mock.patch.object(
+        keras_utils.EpochSummaryCallback, "on_epoch_end", autospec=True
+    ) as on_epoch_end:
+      core.run_experiment(core.Experiment(task, _trainer()), mode)
+
+    self.assertEqual([t for t, _ in task.created_callbacks], [False])
+    val_logs = on_epoch_end.call_args.args[2]
+    self.assertEqual(val_logs["val_custom/marker"], 7.0)
+    self.assertIn("val_loss", val_logs)
+    self.assertIn("val_steps_per_second", val_logs)
 
   def test_eval_name(self):
     if keras.backend.backend() != "jax":

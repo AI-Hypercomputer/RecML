@@ -2401,5 +2401,292 @@ class KerasOrbaxCheckpointUtilsTest(absltest.TestCase):
     )
 
 
+_SEQ_LEN_KEY = "labels/count_seq_len"
+# With 4 devices, a global batch of 8 and 2 steps/sec, each device processes 4
+# examples/sec. This keeps the expected values exact.
+_GLOBAL_BATCH_SIZE = 8
+_PADDED_SEQ_LEN = 1024
+_DEVICE_COUNT = 4
+
+
+def _throughput_callback(
+    callback_cls,
+    *,
+    global_batch_size: int = _GLOBAL_BATCH_SIZE,
+    padded_seq_len: int = _PADDED_SEQ_LEN,
+    device_count: int | None = _DEVICE_COUNT,
+):
+  return callback_cls(
+      global_batch_size=global_batch_size,
+      padded_seq_len=padded_seq_len,
+      valid_seq_len_key=_SEQ_LEN_KEY,
+      device_count=device_count,
+  )
+
+
+def _run_train_epoch(callback, logs, *, steps=10, seconds=5.0):
+  """Runs the hooks of one training epoch that takes `seconds`."""
+  with mock.patch.object(keras_utils.time, "time", side_effect=[0.0]):
+    callback.on_epoch_begin(0)
+  for batch in range(steps):
+    callback.on_train_batch_end(batch)
+  with mock.patch.object(keras_utils.time, "time", side_effect=[seconds]):
+    callback.on_epoch_end(0, logs)
+
+
+def _run_eval_pass(callback, logs, *, steps=10, seconds=5.0):
+  """Runs the hooks of one evaluation pass that takes `seconds`."""
+  with mock.patch.object(keras_utils.time, "time", side_effect=[0.0]):
+    callback.on_test_begin()
+  for batch in range(steps):
+    callback.on_test_batch_end(batch)
+  with mock.patch.object(keras_utils.time, "time", side_effect=[seconds]):
+    callback.on_test_end(logs)
+
+
+class EpochSummaryCallbackBatchHooksTest(absltest.TestCase):
+
+  def test_batch_hooks_are_keras_defaults(self):
+    # Default hooks let Keras skip per-step work for this callback.
+    callback = keras_utils.EpochSummaryCallback(
+        log_dir=self.create_tempdir().full_path, steps_per_epoch=10
+    )
+
+    for name in (
+        "on_train_batch_begin",
+        "on_train_batch_end",
+        "on_test_batch_begin",
+    ):
+      self.assertIs(
+          getattr(type(callback), name),
+          getattr(keras.callbacks.Callback, name),
+          name,
+      )
+    self.assertTrue(callback.async_safe)
+
+
+class TrainThroughputCallbackTest(absltest.TestCase):
+
+  def test_reports_expected_values(self):
+    # 10 steps in 5s = 2 steps/sec. 8 examples/step / 4 devices = 4 examples
+    # per second per device. 4 * 512 valid tokens = 2048, i.e. 2.048k.
+    logs = {_SEQ_LEN_KEY: 512.0}
+    callback = _throughput_callback(keras_utils.TrainThroughputCallback)
+
+    _run_train_epoch(callback, logs)
+
+    self.assertAlmostEqual(
+        logs["throughput/k_valid_tokens_per_sec_per_device"], 2.048
+    )
+    self.assertAlmostEqual(
+        logs["throughput/k_tokens_per_sec_per_device"], 4.096
+    )
+    self.assertAlmostEqual(logs["throughput/packing_efficiency_pct"], 50.0)
+    self.assertEqual(
+        callback.latest_metrics,
+        {k: v for k, v in logs.items() if k.startswith("throughput/")},
+    )
+
+  def test_is_async_safe(self):
+    # Otherwise Keras runs all batch callbacks synchronously on the main thread
+    # and converts the step logs to Python floats on every step.
+    callback = _throughput_callback(keras_utils.TrainThroughputCallback)
+
+    self.assertTrue(callback.async_safe)
+
+  def test_step_count_comes_from_keras_end_step(self):
+    # One batch end with end step 99 means that 100 steps completed. This is
+    # what happens when `steps_per_execution` is more than one.
+    logs = {_SEQ_LEN_KEY: 512.0}
+    callback = _throughput_callback(keras_utils.TrainThroughputCallback)
+
+    with mock.patch.object(keras_utils.time, "time", side_effect=[0.0]):
+      callback.on_epoch_begin(0)
+    callback.on_train_batch_end(99)
+    with mock.patch.object(keras_utils.time, "time", side_effect=[10.0]):
+      callback.on_epoch_end(0, logs)
+
+    # 10 steps/sec => 20 examples/sec/device * 512 tokens.
+    self.assertAlmostEqual(
+        logs["throughput/k_valid_tokens_per_sec_per_device"], 10.24
+    )
+
+  def test_uses_params_steps_when_no_batch_hook_fires(self):
+    logs = {_SEQ_LEN_KEY: 512.0}
+    callback = _throughput_callback(keras_utils.TrainThroughputCallback)
+    callback.set_params({"steps": 10})
+
+    _run_train_epoch(callback, logs, steps=0)
+
+    self.assertAlmostEqual(
+        logs["throughput/k_valid_tokens_per_sec_per_device"], 2.048
+    )
+
+  def test_windows_do_not_leak_between_epochs(self):
+    callback = _throughput_callback(keras_utils.TrainThroughputCallback)
+    first, second = {_SEQ_LEN_KEY: 512.0}, {_SEQ_LEN_KEY: 512.0}
+
+    _run_train_epoch(callback, first, steps=10, seconds=5.0)
+    _run_train_epoch(callback, second, steps=20, seconds=5.0)
+
+    self.assertAlmostEqual(
+        second["throughput/k_valid_tokens_per_sec_per_device"],
+        2 * first["throughput/k_valid_tokens_per_sec_per_device"],
+    )
+
+  def test_ignores_val_prefixed_keys(self):
+    logs = {"val_" + _SEQ_LEN_KEY: 512.0}
+
+    _run_train_epoch(
+        _throughput_callback(keras_utils.TrainThroughputCallback), logs
+    )
+
+    self.assertEqual(logs, {"val_" + _SEQ_LEN_KEY: 512.0})
+
+
+class EvalThroughputCallbackTest(absltest.TestCase):
+
+  def test_reports_unprefixed_keys_in_latest_metrics(self):
+    # `KerasTrainer` adds the `val_` prefix, so the names are the same as in
+    # training.
+    callback = _throughput_callback(keras_utils.EvalThroughputCallback)
+
+    _run_eval_pass(callback, {_SEQ_LEN_KEY: 256.0})
+
+    self.assertIsInstance(callback, keras_utils.MetricsCallback)
+    self.assertEqual(
+        set(callback.latest_metrics),
+        {
+            "throughput/k_valid_tokens_per_sec_per_device",
+            "throughput/k_tokens_per_sec_per_device",
+            "throughput/packing_efficiency_pct",
+        },
+    )
+    self.assertAlmostEqual(
+        callback.latest_metrics["throughput/k_valid_tokens_per_sec_per_device"],
+        1.024,
+    )
+    self.assertAlmostEqual(
+        callback.latest_metrics["throughput/packing_efficiency_pct"], 25.0
+    )
+
+  def test_ignores_training_hooks(self):
+    logs = {_SEQ_LEN_KEY: 256.0}
+    callback = _throughput_callback(keras_utils.EvalThroughputCallback)
+
+    callback.on_epoch_begin(0)
+    callback.on_epoch_end(0, logs)
+
+    self.assertEqual(logs, {_SEQ_LEN_KEY: 256.0})
+    self.assertEmpty(callback.latest_metrics)
+
+  def test_uses_its_own_batch_size(self):
+    small = _throughput_callback(keras_utils.EvalThroughputCallback)
+    large = _throughput_callback(
+        keras_utils.EvalThroughputCallback,
+        global_batch_size=2 * _GLOBAL_BATCH_SIZE,
+    )
+
+    _run_eval_pass(small, {_SEQ_LEN_KEY: 256.0})
+    _run_eval_pass(large, {_SEQ_LEN_KEY: 256.0})
+
+    key = "throughput/k_valid_tokens_per_sec_per_device"
+    self.assertAlmostEqual(
+        large.latest_metrics[key], 2 * small.latest_metrics[key]
+    )
+
+
+class ThroughputCallbackEdgeCaseTest(absltest.TestCase):
+
+  def test_missing_seq_len_leaves_logs_untouched(self):
+    logs = {"loss": 1.0}
+    callback = _throughput_callback(keras_utils.TrainThroughputCallback)
+
+    _run_train_epoch(callback, logs)
+
+    self.assertEqual(logs, {"loss": 1.0})
+    self.assertEmpty(callback.latest_metrics)
+
+  def test_none_logs_is_tolerated(self):
+    _run_train_epoch(
+        _throughput_callback(keras_utils.TrainThroughputCallback), None
+    )
+
+  def test_packing_efficiency_without_a_step_rate(self):
+    logs = {_SEQ_LEN_KEY: 512.0}
+
+    _run_train_epoch(
+        _throughput_callback(keras_utils.TrainThroughputCallback),
+        logs,
+        steps=0,
+    )
+
+    self.assertAlmostEqual(logs["throughput/packing_efficiency_pct"], 50.0)
+    self.assertNotIn("throughput/k_valid_tokens_per_sec_per_device", logs)
+    self.assertNotIn("throughput/k_tokens_per_sec_per_device", logs)
+
+  def test_zero_elapsed_time_skips_tokens_per_sec(self):
+    logs = {_SEQ_LEN_KEY: 512.0}
+
+    _run_train_epoch(
+        _throughput_callback(keras_utils.TrainThroughputCallback),
+        logs,
+        seconds=0.0,
+    )
+
+    self.assertIn("throughput/packing_efficiency_pct", logs)
+    self.assertNotIn("throughput/k_valid_tokens_per_sec_per_device", logs)
+
+  def test_out_of_range_seq_len_is_skipped_not_raised(self):
+    # A per-batch sum instead of a per-example mean. The job must not stop.
+    logs = {_SEQ_LEN_KEY: _PADDED_SEQ_LEN * 8.0}
+
+    with self.assertLogs(level="ERROR") as log:
+      _run_train_epoch(
+          _throughput_callback(keras_utils.TrainThroughputCallback), logs
+      )
+
+    self.assertEqual(logs, {_SEQ_LEN_KEY: _PADDED_SEQ_LEN * 8.0})
+    self.assertIn("per-batch sum", log.output[0])
+
+  def test_rejects_non_positive_arguments(self):
+    with self.assertRaisesRegex(ValueError, "device_count"):
+      _throughput_callback(keras_utils.TrainThroughputCallback, device_count=0)
+    with self.assertRaisesRegex(ValueError, "global_batch_size"):
+      _throughput_callback(
+          keras_utils.TrainThroughputCallback, global_batch_size=0
+      )
+    with self.assertRaisesRegex(ValueError, "padded_seq_len"):
+      _throughput_callback(
+          keras_utils.TrainThroughputCallback, padded_seq_len=0
+      )
+
+  def test_reads_device_count_from_jax(self):
+    logs = {_SEQ_LEN_KEY: 512.0}
+    callback = _throughput_callback(
+        keras_utils.TrainThroughputCallback, device_count=None
+    )
+
+    with mock.patch.object(keras_utils.jax, "device_count", return_value=2):
+      _run_train_epoch(callback, logs)
+
+    # Half the devices of the default, so twice the per-device rate.
+    self.assertAlmostEqual(
+        logs["throughput/k_valid_tokens_per_sec_per_device"], 4.096
+    )
+
+  def test_casts_scalar_values_to_float(self):
+    logs = {_SEQ_LEN_KEY: np.float32(512.0)}
+
+    _run_train_epoch(
+        _throughput_callback(keras_utils.TrainThroughputCallback), logs
+    )
+
+    self.assertIsInstance(logs["throughput/packing_efficiency_pct"], float)
+    self.assertAlmostEqual(
+        logs["throughput/k_valid_tokens_per_sec_per_device"], 2.048
+    )
+
+
 if __name__ == "__main__":
   absltest.main()
