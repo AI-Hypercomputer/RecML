@@ -75,6 +75,10 @@ class KerasTask(abc.ABC):
       A Keras model instance.
     """
 
+  def get_custom_callbacks(self) -> list[keras.callbacks.Callback]:
+    """Returns the custom callbacks."""
+    return []
+
   def create_model_for_eval(self, **kwargs) -> keras.Model:
     """Creates a Keras model for evaluation.
 
@@ -273,11 +277,13 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, dataset, val=False)
     )
 
+    callbacks = task.get_custom_callbacks() + self.train_callbacks
+
     history = model.fit(
         dataset,
         epochs=self._train_epochs + 1,
         steps_per_epoch=self._steps_per_loop,
-        callbacks=self.train_callbacks,
+        callbacks=callbacks,
         initial_epoch=1,
     )
     model.summary(print_fn=logging.info)
@@ -296,6 +302,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, dataset, val=True)
     )
 
+    callbacks = task.get_custom_callbacks() + self.eval_callbacks
+
     if keras.backend.backend() == "jax":
       [tb_cbk] = [
           cbk
@@ -306,7 +314,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       history = model.evaluate(
           dataset,
           steps=self._steps_per_eval,
-          callbacks=self.eval_callbacks,
+          callbacks=callbacks,
           return_dict=True,
       )
       epoch_dt = time.time() - epoch_start_time
@@ -319,7 +327,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     return model.evaluate(
         dataset,
         steps=self._steps_per_eval,
-        callbacks=self.eval_callbacks,
+        callbacks=callbacks,
     )
 
   def train_and_evaluate(self, task: KerasTask) -> core.Logs:
@@ -338,6 +346,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, train_dataset, val=False)
     )
 
+    callbacks = task.get_custom_callbacks() + self.train_callbacks
+
     history = model.fit(
         train_dataset,
         validation_data=eval_dataset,
@@ -345,7 +355,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         steps_per_epoch=self._steps_per_loop,
         # Explicitly set to None for deterministic evaluation.
         validation_steps=None,
-        callbacks=self.train_callbacks,
+        callbacks=callbacks,
         initial_epoch=1,
     )
     model.summary(print_fn=logging.info)
@@ -370,6 +380,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
     model = task.create_model_for_eval(
         **self._maybe_get_model_kws(task, eval_dataset, val=True),
     )
+
+    callbacks = task.get_custom_callbacks() + self.eval_callbacks
 
     def timeout_fn() -> bool:
       return tf.io.gfile.exists(self._marker_path)
@@ -425,7 +437,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         history = model.evaluate(
             eval_dataset,
             steps=self._steps_per_eval,
-            callbacks=[restore_callback] + self.eval_callbacks,
+            callbacks=[restore_callback] + callbacks,
             return_dict=True,
         )
 
