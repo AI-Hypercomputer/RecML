@@ -37,6 +37,7 @@ CONFIG_CHECKPOINT_KEY = "config"
 FORMAT_VERSION_KEY = "format_version"
 NON_TRAINABLE_PATHS_KEY = "non_trainable_paths"
 OPTIMIZER_PATHS_KEY = "optimizer_paths"
+VARIABLE_ALIASES_KEY = "variable_aliases"
 ORBAX_CHECKPOINT_DEFAULT_KEY = "default"
 
 
@@ -85,6 +86,46 @@ def _variables_to_path_dict(
         f"model). Duplicates: {duplicates}"
     )
   return var_dict
+
+
+def extract_variable_aliases(model: keras.Model) -> dict[str, str]:
+  """Extracts alias paths for shared variables across the model layer tree.
+
+  When multiple layers in a model reference the same `keras.Variable` instance,
+  Keras's `model.trainable_variables` assigns the variable a single canonical
+  `.path` corresponding to the first layer that tracked it.
+
+  This function traverses the full layer hierarchy to discover any alternative
+  (alias) paths by which those shared variables are referenced in other layers.
+
+  Args:
+    model: The Keras model instance.
+
+  Returns:
+    A dictionary mapping alias_path -> canonical_path (e.g.
+    `{"model/search_surface/text_emb/embeddings":
+    "model/chrome_surface/text_emb/embeddings"}`).
+  """
+  aliases = {}
+
+  def _traverse(layer: keras.layers.Layer, prefix: str):
+    # Walk tracked child layers
+    for child in getattr(layer, "_layers", []):
+      child_prefix = f"{prefix}/{child.name}" if prefix else child.name
+      _traverse(child, child_prefix)
+
+    # Check variables directly attached to this layer
+    own_vars = getattr(layer, "_trainable_variables", []) + getattr(
+        layer, "_non_trainable_variables", []
+    )
+    for var in own_vars:
+      if hasattr(var, "path") and hasattr(var, "name"):
+        logical_path = f"{prefix}/{var.name}" if prefix else var.name
+        if logical_path != var.path:
+          aliases[logical_path] = var.path
+
+  _traverse(model, model.name or "")
+  return aliases
 
 
 def _to_shape_dtype_struct(x: keras.Variable) -> jax.ShapeDtypeStruct:
@@ -253,6 +294,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
             FORMAT_VERSION_KEY,
             NON_TRAINABLE_PATHS_KEY,
             OPTIMIZER_PATHS_KEY,
+            VARIABLE_ALIASES_KEY,
         ),
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=save_interval_epochs,
@@ -305,8 +347,11 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
         "paths": [v.path for v in model.non_trainable_variables]
     }
     optimizer_paths = {"paths": [v.path for v in model.optimizer.variables]}
+    aliases = extract_variable_aliases(model)
+    variable_aliases = {"aliases": aliases}
     logging.info("SAVED non_trainable_paths: %s", non_trainable_paths)
     logging.info("SAVED optimizer_paths: %s", optimizer_paths)
+    logging.info("SAVED variable_aliases: %s", variable_aliases)
 
     logging.info("Saving checkpoint for epoch %s...", epoch)
     self.save(
@@ -317,6 +362,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
             FORMAT_VERSION_KEY: ocp.args.JsonSave({"version": 3}),
             NON_TRAINABLE_PATHS_KEY: ocp.args.JsonSave(non_trainable_paths),
             OPTIMIZER_PATHS_KEY: ocp.args.JsonSave(optimizer_paths),
+            VARIABLE_ALIASES_KEY: ocp.args.JsonSave(variable_aliases),
         }),
         metrics=logs,
     )
@@ -480,8 +526,15 @@ def _detect_checkpoint_version(checkpoint_path: str) -> CheckpointVersion:
 
   Detection order and discriminator criteria:
   - V1 checkpoints use the legacy item directory layout ('default/').
-  - V3 checkpoints contain an explicit 'format_version' item with {"version": 3}.
+  - V3 checkpoints contain an explicit 'format_version' item with
+    {"version": 3}.
   - V2 checkpoints contain 'state/' without the V3 'format_version' marker.
+
+  Args:
+    checkpoint_path: Path to the checkpoint directory.
+
+  Returns:
+    The detected CheckpointVersion enum value.
   """
   # V1 uses the legacy 'default' directory layout.
   if _is_v1_checkpoint_path(checkpoint_path):
@@ -489,7 +542,8 @@ def _detect_checkpoint_version(checkpoint_path: str) -> CheckpointVersion:
   # V3 checkpoints are explicitly tagged with format_version.
   if _is_v3_checkpoint_path(checkpoint_path):
     return CheckpointVersion.V3
-  # V2 checkpoints have a 'state' directory without the V3 format_version marker.
+  # V2 checkpoints have a 'state' directory without the V3 format_version
+  # marker.
   if gfile.Exists(os.path.join(checkpoint_path, STATE_CHECKPOINT_KEY)):
     return CheckpointVersion.V2
   raise ValueError(f"Unknown checkpoint format at {checkpoint_path}")
@@ -589,7 +643,22 @@ def _prepare_v3_restore(
   # Validate that underlying checkpoint is healthy and retrieve state metadata.
   saved_state_metadata = _validate_v3_checkpoint(checkpoint_path)
 
-  # Load index path metadata for non-trainable and optimizer variables if needed.
+  has_saved_aliases = (
+      epath.Path(checkpoint_path) / VARIABLE_ALIASES_KEY
+  ).exists()
+  aliases = {}
+  if has_saved_aliases:
+    alias_path = epath.Path(checkpoint_path) / VARIABLE_ALIASES_KEY
+    checkpointer = ocp.Checkpointer(ocp.handlers.JsonCheckpointHandler())
+    try:
+      aliases = checkpointer.restore(
+          os.fspath(alias_path), args=ocp.args.JsonRestore()
+      ).get("aliases", {})
+    finally:
+      checkpointer.close()
+
+  # Load index path metadata for non-trainable and optimizer variables if
+  # needed.
   non_trainable_paths = None
   if model is not None and abstract_state.get(NON_TRAINABLE_VARIABLES_KEY):
     nt_path = epath.Path(checkpoint_path) / NON_TRAINABLE_PATHS_KEY
@@ -673,7 +742,8 @@ def _prepare_v3_restore(
               i,
           )
     else:
-      # Strict matching for trainable variables unless explicit transforms provided
+      # Strict matching for trainable variables with alias resolution and
+      # optional transforms.
       missing_paths = []
       key_transforms = {}
       if transforms:
@@ -683,11 +753,27 @@ def _prepare_v3_restore(
             else transforms
         )
       for target_path, struct in abstract_state[key].items():
-        if target_path in saved_state_metadata[key]:
-          filtered_abstract_state[key][target_path] = struct
-        elif target_path in key_transforms:
+        if target_path in key_transforms:
           filtered_abstract_state[key][target_path] = struct
           state_transforms[key][target_path] = key_transforms[target_path]
+        elif target_path in saved_state_metadata[key]:
+          filtered_abstract_state[key][target_path] = struct
+        elif (
+            target_path in aliases
+            and aliases[target_path] in saved_state_metadata[key]
+        ):
+          source_path = aliases[target_path]
+          filtered_abstract_state[key][target_path] = struct
+          state_transforms[key][target_path] = (
+              ocp.transform_utils.Transform(
+                  original_key=f"{key}/{source_path}"
+              )
+          )
+          logging.info(
+              "Resolved target path %s to source path %s via alias graph",
+              target_path,
+              source_path,
+          )
         else:
           missing_paths.append(target_path)
 
