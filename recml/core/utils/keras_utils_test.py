@@ -1371,6 +1371,697 @@ class KerasOrbaxCheckpointUtilsTest(absltest.TestCase):
     ):
       keras_utils._validate_v3_checkpoint(step_dir, incomplete_metadata)
 
+  def test_extract_shared_variable_map(self):
+    shared_dense = keras.layers.Dense(2, name="shared_dense")
+
+    class SurfaceLayer(keras.layers.Layer):
+
+      def __init__(self, inner, **kwargs):
+        super().__init__(**kwargs)
+        self.inner = inner
+
+      def call(self, x):
+        return self.inner(x)
+
+    model = keras.Sequential(
+        [
+            SurfaceLayer(shared_dense, name="chrome_surface"),
+            SurfaceLayer(shared_dense, name="search_surface"),
+        ],
+        name="my_model",
+    )
+    model.build((1, 2))
+
+    shared_var_map = keras_utils.extract_shared_variable_map(model)
+    expected_map = {
+        "my_model/search_surface/shared_dense/kernel": (
+            "my_model/chrome_surface/shared_dense/kernel"
+        ),
+        "my_model/search_surface/shared_dense/bias": (
+            "my_model/chrome_surface/shared_dense/bias"
+        ),
+    }
+    self.assertEqual(shared_var_map, expected_map)
+
+  def test_extract_shared_variable_map_no_shared_variables(self):
+    model = keras.Sequential(
+        [
+            keras.layers.Dense(4, name="dense_1"),
+            keras.layers.Dense(2, name="dense_2"),
+        ],
+        name="sequential_model",
+    )
+    model.build((1, 8))
+    shared_var_map = keras_utils.extract_shared_variable_map(model)
+    self.assertEmpty(shared_var_map)
+
+  def test_extract_shared_variable_map_multi_surface(self):
+    shared_dense = keras.layers.Dense(2, name="shared_dense")
+
+    class SurfaceLayer(keras.layers.Layer):
+
+      def __init__(self, inner, **kwargs):
+        super().__init__(**kwargs)
+        self.inner = inner
+
+      def call(self, x):
+        return self.inner(x)
+
+    model = keras.Sequential(
+        [
+            SurfaceLayer(shared_dense, name="surface_a"),
+            SurfaceLayer(shared_dense, name="surface_b"),
+            SurfaceLayer(shared_dense, name="surface_c"),
+        ],
+        name="my_model",
+    )
+    model.build((1, 2))
+
+    shared_var_map = keras_utils.extract_shared_variable_map(model)
+    expected_map = {
+        "my_model/surface_b/shared_dense/kernel": (
+            "my_model/surface_a/shared_dense/kernel"
+        ),
+        "my_model/surface_b/shared_dense/bias": (
+            "my_model/surface_a/shared_dense/bias"
+        ),
+        "my_model/surface_c/shared_dense/kernel": (
+            "my_model/surface_a/shared_dense/kernel"
+        ),
+        "my_model/surface_c/shared_dense/bias": (
+            "my_model/surface_a/shared_dense/bias"
+        ),
+    }
+    self.assertEqual(shared_var_map, expected_map)
+
+  def test_extract_shared_variable_map_deeply_nested(self):
+    shared_dense = keras.layers.Dense(2, name="shared_dense")
+
+    class TowerLayer(keras.layers.Layer):
+
+      def __init__(self, inner, **kwargs):
+        super().__init__(**kwargs)
+        self.inner = inner
+
+      def call(self, x):
+        return self.inner(x)
+
+    class SurfaceLayer(keras.layers.Layer):
+
+      def __init__(self, tower, **kwargs):
+        super().__init__(**kwargs)
+        self.tower = tower
+
+      def call(self, x):
+        return self.tower(x)
+
+    model = keras.Sequential(
+        [
+            SurfaceLayer(
+                TowerLayer(shared_dense, name="tower"), name="surface_a"
+            ),
+            SurfaceLayer(
+                TowerLayer(shared_dense, name="tower"), name="surface_b"
+            ),
+        ],
+        name="nested_model",
+    )
+    model.build((1, 2))
+
+    shared_var_map = keras_utils.extract_shared_variable_map(model)
+    expected_map = {
+        "nested_model/surface_b/tower/shared_dense/kernel": (
+            "nested_model/surface_a/tower/shared_dense/kernel"
+        ),
+        "nested_model/surface_b/tower/shared_dense/bias": (
+            "nested_model/surface_a/tower/shared_dense/bias"
+        ),
+    }
+    self.assertEqual(shared_var_map, expected_map)
+
+  def test_restore_partial_checkpoint_with_shared_variable_map(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+
+    class MultiSurfaceModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.shared_emb = keras.layers.Embedding(10, 4, name="text_emb")
+        self.chrome_surface = keras.Sequential(
+            [self.shared_emb], name="chrome_surface"
+        )
+        self.search_surface = keras.Sequential(
+            [self.shared_emb], name="search_surface"
+        )
+
+      def build(self, input_shape):
+        self.shared_emb.build(input_shape)
+        self.chrome_surface.build(input_shape)
+        self.search_surface.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return self.chrome_surface(x) + self.search_surface(x)
+
+    model_source = MultiSurfaceModel(name="model")
+    model_source.compile(optimizer="adam")
+    model_source.build((1, 1))
+    model_source.optimizer.build(model_source.trainable_variables)
+    test_weights = np.ones((10, 4), dtype=np.float32) * 7.5
+    model_source.shared_emb.embeddings.assign(test_weights)
+
+    manager.save_model_variables(model_source, epoch=1)
+    manager.wait_until_finished()
+
+    # Target model only has search_surface with its own independent embedding
+    # layer.
+    class SearchOnlyModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.target_emb = keras.layers.Embedding(10, 4, name="text_emb")
+        self.search_surface = keras.Sequential(
+            [self.target_emb], name="search_surface"
+        )
+
+      def build(self, input_shape):
+        self.target_emb.build(input_shape)
+        self.search_surface.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return self.search_surface(x)
+
+    model_target = SearchOnlyModel(name="model")
+    model_target.build((1, 1))
+    model_target.target_emb.embeddings.assign(
+        np.zeros((10, 4), dtype=np.float32)
+    )
+
+    # Partial restore targeting only search_surface's embeddings
+    partial_vars = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            model_target.target_emb.embeddings.path: (
+                model_target.target_emb.embeddings
+            )
+        }
+    }
+
+    # Restores successfully using the shared variable map automatically
+    restored_state = keras_utils.restore_partial_checkpoint(
+        self.checkpoint_dir, partial_vars, epoch=1
+    )
+
+    for key, var_dict in partial_vars.items():
+      for path, var in var_dict.items():
+        var.assign(restored_state[key][path])
+
+    np.testing.assert_allclose(
+        model_target.target_emb.embeddings.value, test_weights
+    )
+    manager.close()
+
+  def test_restore_partial_checkpoint_explicit_transforms_precedence(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+
+    class MultiSurfaceModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.shared_emb = keras.layers.Embedding(10, 4, name="text_emb")
+        self.chrome_surface = keras.Sequential(
+            [self.shared_emb], name="chrome_surface"
+        )
+        self.search_surface = keras.Sequential(
+            [self.shared_emb], name="search_surface"
+        )
+        self.custom_emb = keras.layers.Embedding(10, 4, name="custom_emb")
+
+      def build(self, input_shape):
+        self.shared_emb.build(input_shape)
+        self.chrome_surface.build(input_shape)
+        self.search_surface.build(input_shape)
+        self.custom_emb.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return (
+            self.chrome_surface(x)
+            + self.search_surface(x)
+            + self.custom_emb(x)
+        )
+
+    model_source = MultiSurfaceModel(name="model")
+    model_source.compile(optimizer="adam")
+    model_source.build((1, 1))
+    model_source.optimizer.build(model_source.trainable_variables)
+    shared_weights = np.ones((10, 4), dtype=np.float32) * 7.5
+    custom_weights = np.ones((10, 4), dtype=np.float32) * 3.0
+    model_source.shared_emb.embeddings.assign(shared_weights)
+    model_source.custom_emb.embeddings.assign(custom_weights)
+
+    manager.save_model_variables(model_source, epoch=1)
+    manager.wait_until_finished()
+
+    class SearchOnlyModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.target_emb = keras.layers.Embedding(10, 4, name="text_emb")
+        self.search_surface = keras.Sequential(
+            [self.target_emb], name="search_surface"
+        )
+
+      def build(self, input_shape):
+        self.target_emb.build(input_shape)
+        self.search_surface.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return self.search_surface(x)
+
+    model_target = SearchOnlyModel(name="model")
+    model_target.build((1, 1))
+    model_target.target_emb.embeddings.assign(
+        np.zeros((10, 4), dtype=np.float32)
+    )
+
+    partial_vars = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            model_target.target_emb.embeddings.path: (
+                model_target.target_emb.embeddings
+            )
+        }
+    }
+
+    # Explicit transform mapping target to custom_emb instead of
+    # shared_variable_map default (chrome_surface).
+    explicit_transforms = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            model_target.target_emb.embeddings.path: (
+                ocp.transform_utils.Transform(
+                    original_key=(
+                        f"{keras_utils.TRAINABLE_VARIABLES_KEY}"
+                        "/model/custom_emb/embeddings"
+                    )
+                )
+            )
+        }
+    }
+
+    restored_state = keras_utils.restore_partial_checkpoint(
+        self.checkpoint_dir,
+        partial_vars,
+        epoch=1,
+        transforms=explicit_transforms,
+    )
+
+    for key, var_dict in partial_vars.items():
+      for path, var in var_dict.items():
+        var.assign(restored_state[key][path])
+
+    np.testing.assert_allclose(
+        model_target.target_emb.embeddings.value, custom_weights
+    )
+    manager.close()
+
+  def test_restore_partial_checkpoint_suffixed_target_path_fails_without_transform(
+      self,
+  ):
+    """Verifies suffixed paths fail without transform and resolve via shared_var_map."""
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+
+    class MultiSurfaceModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.shared_dense = keras.layers.Dense(2, name="dense")
+        self.surface_b = keras.Sequential(
+            [self.shared_dense], name="surface_b"
+        )
+        self.surface_a = keras.Sequential(
+            [self.shared_dense], name="surface_a"
+        )
+
+      def build(self, input_shape):
+        # Building surface_b first ensures shared_dense gets its canonical
+        # path under surface_b ("model/surface_b/dense/kernel").
+        self.surface_b.build(input_shape)
+        self.surface_a.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return self.surface_b(x) + self.surface_a(x)
+
+    model_source = MultiSurfaceModel(name="model")
+    model_source.compile(optimizer="adam")
+    model_source.build((1, 2))
+    model_source.optimizer.build(model_source.trainable_variables)
+    test_weights = np.ones((2, 2), dtype=np.float32) * 4.2
+    model_source.shared_dense.kernel.assign(test_weights)
+
+    manager.save_model_variables(model_source, epoch=1)
+    manager.wait_until_finished()
+
+    # Target model has a suffixed surface name (surface_a_1 due to
+    # auto-naming or naming drift) instead of surface_a.
+    class SuffixedModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.surface_a = keras.Sequential(
+            [keras.layers.Dense(2, name="dense")],
+            name="surface_a_1",
+        )
+
+      def build(self, input_shape):
+        self.surface_a.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return self.surface_a(x)
+
+    model_target = SuffixedModel(name="model")
+    model_target.build((1, 2))
+    target_dense = model_target.surface_a.layers[0]
+    target_dense.kernel.assign(np.zeros((2, 2), dtype=np.float32))
+
+    suffixed_target_path = target_dense.kernel.path
+    self.assertEqual(
+        suffixed_target_path, "model/surface_a_1/dense/kernel"
+    )
+
+    partial_vars = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            suffixed_target_path: target_dense.kernel
+        }
+    }
+
+    # 1. Proves that V3 strict matching fails fast when target path has suffix
+    # drift (surface_a_1) because checkpoint only contains surface_b and alias
+    # surface_a.
+    with self.assertRaisesRegex(
+        ValueError,
+        (
+            r"(?i)missing paths in checkpoint:"
+            r" \['model/surface_a_1/dense/kernel'\]"
+        ),
+    ):
+      keras_utils.restore_partial_checkpoint(
+          self.checkpoint_dir, partial_vars, epoch=1
+      )
+
+    # 2. Proves that providing an explicit transform (surface_a_1 -> surface_a)
+    # succeeds, resolving surface_a through shared_variable_map to surface_b.
+    model_target_2 = SuffixedModel(name="model")
+    model_target_2.build((1, 2))
+    target_dense_2 = model_target_2.surface_a.layers[0]
+    target_dense_2.kernel.assign(np.zeros((2, 2), dtype=np.float32))
+
+    partial_vars_2 = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            suffixed_target_path: target_dense_2.kernel
+        }
+    }
+    explicit_transform = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            suffixed_target_path: ocp.transform_utils.Transform(
+                original_key=(
+                    f"{keras_utils.TRAINABLE_VARIABLES_KEY}"
+                    "/model/surface_a/dense/kernel"
+                )
+            )
+        }
+    }
+    restored_state = keras_utils.restore_partial_checkpoint(
+        self.checkpoint_dir,
+        partial_vars_2,
+        epoch=1,
+        transforms=explicit_transform,
+    )
+    for key, var_dict in partial_vars_2.items():
+      for path, var in var_dict.items():
+        var.assign(restored_state[key][path])
+
+    np.testing.assert_allclose(
+        target_dense_2.kernel.value, test_weights
+    )
+    manager.close()
+
+  def test_restore_keras_checkpoint_v3_with_shared_variable_map(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+
+    class MultiSurfaceModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.shared_emb = keras.layers.Embedding(10, 4, name="text_emb")
+        self.chrome_surface = keras.Sequential(
+            [self.shared_emb], name="chrome_surface"
+        )
+        self.search_surface = keras.Sequential(
+            [self.shared_emb], name="search_surface"
+        )
+
+      def build(self, input_shape):
+        self.shared_emb.build(input_shape)
+        self.chrome_surface.build(input_shape)
+        self.search_surface.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return self.chrome_surface(x) + self.search_surface(x)
+
+    model_source = MultiSurfaceModel(name="model")
+    model_source.compile(optimizer="adam")
+    model_source.build((1, 1))
+    model_source.optimizer.build(model_source.trainable_variables)
+    test_weights = np.ones((10, 4), dtype=np.float32) * 6.0
+    model_source.shared_emb.embeddings.assign(test_weights)
+
+    manager.save_model_variables(model_source, epoch=1)
+    manager.wait_until_finished()
+
+    class SearchOnlyModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.target_emb = keras.layers.Embedding(10, 4, name="text_emb")
+        self.search_surface = keras.Sequential(
+            [self.target_emb], name="search_surface"
+        )
+
+      def build(self, input_shape):
+        self.target_emb.build(input_shape)
+        self.search_surface.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return self.search_surface(x)
+
+    model_target = SearchOnlyModel(name="model")
+    model_target.build((1, 1))
+    model_target.target_emb.embeddings.assign(
+        np.zeros((10, 4), dtype=np.float32)
+    )
+
+    keras_utils.restore_keras_checkpoint(
+        self.checkpoint_dir,
+        model=model_target,
+        epoch=1,
+        restore_optimizer_vars=False,
+    )
+
+    np.testing.assert_allclose(
+        model_target.target_emb.embeddings.value, test_weights
+    )
+    manager.close()
+
+  def test_restore_v3_checkpoint_missing_shared_variable_map_metadata_succeeds(
+      self,
+  ):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    model = keras.Sequential(
+        [keras.layers.Dense(1, name="dense")], name="model"
+    )
+    model.compile(optimizer="sgd")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+    test_weights = np.array([[3.5]], dtype=np.float32)
+    model.layers[0].kernel.assign(test_weights)
+
+    manager.save_model_variables(model, epoch=1)
+    manager.wait_until_finished()
+
+    # Remove shared_variable_map metadata to simulate V3 checkpoint without it.
+    map_path = os.path.join(
+        self.checkpoint_dir, "1", keras_utils.SHARED_VARIABLE_MAP_KEY
+    )
+    self.assertTrue(os.path.exists(map_path))
+    shutil.rmtree(map_path)
+
+    target_model = keras.Sequential(
+        [keras.layers.Dense(1, name="dense")], name="model"
+    )
+    target_model.compile(optimizer="sgd")
+    target_model.build((1, 1))
+    target_model.optimizer.build(target_model.trainable_variables)
+    target_model.layers[0].kernel.assign(np.zeros((1, 1), dtype=np.float32))
+
+    keras_utils.restore_keras_checkpoint(
+        self.checkpoint_dir,
+        model=target_model,
+        epoch=1,
+        restore_optimizer_vars=False,
+    )
+
+    np.testing.assert_allclose(
+        target_model.layers[0].kernel.value, test_weights
+    )
+    manager.close()
+
+  def test_restore_partial_checkpoint_missing_variable_fails(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    model = keras.Sequential([keras.layers.Dense(1, name="dense")])
+    model.compile(optimizer="sgd")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+
+    manager.save_model_variables(model, epoch=1)
+    manager.wait_until_finished()
+
+    dummy_var = keras.Variable(
+        np.zeros((1, 1), dtype=np.float32), name="missing"
+    )
+    partial_vars = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            "non_existent_path/kernel": dummy_var
+        }
+    }
+
+    with self.assertRaisesRegex(
+        ValueError, "Failed to restore variables for key trainable_variables"
+    ):
+      keras_utils.restore_partial_checkpoint(
+          self.checkpoint_dir, partial_vars, epoch=1
+      )
+    manager.close()
+
+  def test_restore_partial_checkpoint_multi_variable_layer(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+
+    class MultiSurfaceDenseModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.shared_dense = keras.layers.Dense(2, name="shared_dense")
+        self.chrome_surface = keras.Sequential(
+            [self.shared_dense], name="chrome_surface"
+        )
+        self.search_surface = keras.Sequential(
+            [self.shared_dense], name="search_surface"
+        )
+
+      def build(self, input_shape):
+        self.shared_dense.build(input_shape)
+        self.chrome_surface.build(input_shape)
+        self.search_surface.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return self.chrome_surface(x) + self.search_surface(x)
+
+    model_source = MultiSurfaceDenseModel(name="model")
+    model_source.compile(optimizer="adam")
+    model_source.build((1, 2))
+    model_source.optimizer.build(model_source.trainable_variables)
+    test_kernel = np.ones((2, 2), dtype=np.float32) * 4.2
+    test_bias = np.ones((2,), dtype=np.float32) * 1.8
+    model_source.shared_dense.kernel.assign(test_kernel)
+    model_source.shared_dense.bias.assign(test_bias)
+
+    manager.save_model_variables(model_source, epoch=1)
+    manager.wait_until_finished()
+
+    class SearchOnlyDenseModel(keras.Model):
+
+      def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.target_dense = keras.layers.Dense(2, name="shared_dense")
+        self.search_surface = keras.Sequential(
+            [self.target_dense], name="search_surface"
+        )
+
+      def build(self, input_shape):
+        self.target_dense.build(input_shape)
+        self.search_surface.build(input_shape)
+        super().build(input_shape)
+
+      def call(self, x):
+        return self.search_surface(x)
+
+    model_target = SearchOnlyDenseModel(name="model")
+    model_target.build((1, 2))
+    model_target.target_dense.kernel.assign(
+        np.zeros((2, 2), dtype=np.float32)
+    )
+    model_target.target_dense.bias.assign(np.zeros((2,), dtype=np.float32))
+
+    partial_vars = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            model_target.target_dense.kernel.path: (
+                model_target.target_dense.kernel
+            ),
+            model_target.target_dense.bias.path: (
+                model_target.target_dense.bias
+            ),
+        }
+    }
+
+    restored_state = keras_utils.restore_partial_checkpoint(
+        self.checkpoint_dir, partial_vars, epoch=1
+    )
+
+    for key, var_dict in partial_vars.items():
+      for path, var in var_dict.items():
+        var.assign(restored_state[key][path])
+
+    np.testing.assert_allclose(
+        model_target.target_dense.kernel.value, test_kernel
+    )
+    np.testing.assert_allclose(
+        model_target.target_dense.bias.value, test_bias
+    )
+    manager.close()
+
 
 if __name__ == "__main__":
   absltest.main()
