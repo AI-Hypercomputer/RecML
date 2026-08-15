@@ -74,6 +74,7 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
       checkpoint_dir: str,
       max_to_keep: int = 5,
       save_interval_epochs: int = 1,
+      choose_store_cell: bool = True,
   ):
     """Initializes a KerasOrbaxCheckpointManager.
 
@@ -81,6 +82,7 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
       checkpoint_dir: The directory to save checkpoints to.
       max_to_keep: The maximum number of checkpoints to keep.
       save_interval_epochs: The interval (in epochs) to save checkpoints.
+      choose_store_cell: Whether to dynamically select the CNS2 store cell.
     """
     if keras.backend.backend() != "jax":
       raise ValueError(
@@ -92,6 +94,11 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=save_interval_epochs,
             max_to_keep=max_to_keep,
+            file_options=ocp.options.FileOptions(
+                cns2_storage_options=ocp.options.Cns2StorageOptions(
+                    choose_store_cell=choose_store_cell,
+                ),
+            ),
         ),
     )
 
@@ -430,6 +437,7 @@ class KerasOrbaxCheckpointManager(ocp.CheckpointManager):
       checkpoint_dir: str,
       max_to_keep: int = 5,
       save_interval_epochs: int = 1,
+      choose_store_cell: bool = True,
   ):
     """Initializes a KerasOrbaxCheckpointManager.
 
@@ -437,6 +445,7 @@ class KerasOrbaxCheckpointManager(ocp.CheckpointManager):
       checkpoint_dir: The directory to save checkpoints to.
       max_to_keep: The maximum number of checkpoints to keep.
       save_interval_epochs: The interval (in epochs) to save checkpoints.
+      choose_store_cell: Whether to dynamically select the CNS2 store cell.
     """
     super().__init__(
         directory=checkpoint_dir,
@@ -444,6 +453,11 @@ class KerasOrbaxCheckpointManager(ocp.CheckpointManager):
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=save_interval_epochs,
             max_to_keep=max_to_keep,
+            file_options=ocp.options.FileOptions(
+                cns2_storage_options=ocp.options.Cns2StorageOptions(
+                    choose_store_cell=choose_store_cell,
+                ),
+            ),
         ),
     )
 
