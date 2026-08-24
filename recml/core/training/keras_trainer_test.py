@@ -22,6 +22,7 @@ from absl.testing import parameterized
 import keras
 from recml.core.training import core
 from recml.core.training import keras_trainer
+from recml.core.utils import keras_utils
 import tensorflow as tf
 
 
@@ -55,6 +56,7 @@ class KerasTrainerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
+    keras.backend.clear_session()
     # Workaround to make `create_tempdir` work with pytest.
     if not flags.FLAGS.is_parsed():
       flags.FLAGS.mark_as_parsed()
@@ -63,26 +65,38 @@ class KerasTrainerTest(parameterized.TestCase):
       {"testcase_name": "train", "mode": core.Trainer.Mode.TRAIN},
       {"testcase_name": "eval", "mode": core.Trainer.Mode.EVAL},
       {
-          "testcase_name": "train_and_eval",
+          "testcase_name": "train_and_eval_v3",
           "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
+          "checkpoint_version": "v3",
       },
       {
-          "testcase_name": "continuous_eval_",
-          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
-      },
-      {
-          "testcase_name": "train_and_eval_legacy_checkpoint_format",
+          "testcase_name": "train_and_eval_v2",
           "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
-          "legacy_checkpoint_format": True,
+          "checkpoint_version": "v2",
       },
       {
-          "testcase_name": "continuous_eval_legacy_checkpoint_format",
+          "testcase_name": "train_and_eval_v1",
+          "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
+          "checkpoint_version": "v1",
+      },
+      {
+          "testcase_name": "continuous_eval_v3",
           "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
-          "legacy_checkpoint_format": True,
+          "checkpoint_version": "v3",
+      },
+      {
+          "testcase_name": "continuous_eval_v2",
+          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
+          "checkpoint_version": "v2",
+      },
+      {
+          "testcase_name": "continuous_eval_v1",
+          "mode": core.Trainer.Mode.CONTINUOUS_EVAL,
+          "checkpoint_version": "v1",
       },
   )
   def test_keras_task_and_trainer(
-      self, mode: str, legacy_checkpoint_format: bool = False
+      self, mode: str, checkpoint_version: str = "v3"
   ):
     if keras.backend.backend() == "jax":
       distribution = keras.distribution.DataParallel()
@@ -98,13 +112,14 @@ class KerasTrainerTest(parameterized.TestCase):
         steps_per_loop=2,
         model_dir=self.create_tempdir().full_path,
         continuous_eval_timeout=5,
-        legacy_checkpoint_format=legacy_checkpoint_format,
+        checkpoint_version=checkpoint_version,
     )
     experiment = core.Experiment(_KerasTask(), trainer)
 
     if mode == core.Trainer.Mode.CONTINUOUS_EVAL:
       # Produce one checkpoint so there is something to evaluate.
       core.run_experiment(experiment, core.Trainer.Mode.TRAIN)
+      keras.backend.clear_session()
 
     history = core.run_experiment(experiment, mode)
 
@@ -141,6 +156,35 @@ class KerasTrainerTest(parameterized.TestCase):
     expected_log_dir = os.path.join(model_dir, "logs", eval_name)
     self.assertTrue(os.path.exists(expected_log_dir))
     self.assertEqual(experiment.task.last_eval_name, eval_name)
+
+  def test_legacy_checkpoint_format_deprecated(self):
+    model_dir = self.create_tempdir().full_path
+
+    # Test legacy_checkpoint_format=True -> V1
+    with self.assertLogs(level="WARNING") as log:
+      trainer = keras_trainer.KerasTrainer(
+          model_dir=model_dir,
+          legacy_checkpoint_format=True,
+      )
+      self.assertEqual(
+          trainer._checkpoint_version, keras_utils.CheckpointVersion.V1
+      )
+      self.assertIn(
+          "legacy_checkpoint_format is deprecated", log.output[0]
+      )
+
+    # Test legacy_checkpoint_format=False -> V2
+    with self.assertLogs(level="WARNING") as log:
+      trainer = keras_trainer.KerasTrainer(
+          model_dir=model_dir,
+          legacy_checkpoint_format=False,
+      )
+      self.assertEqual(
+          trainer._checkpoint_version, keras_utils.CheckpointVersion.V2
+      )
+      self.assertIn(
+          "legacy_checkpoint_format is deprecated", log.output[0]
+      )
 
 
 if __name__ == "__main__":

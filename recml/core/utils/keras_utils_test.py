@@ -71,6 +71,45 @@ def _create_model(input_shapes: Sequence[int]) -> keras.Model:
   return model
 
 
+@keras.saving.register_keras_serializable(package="Recml")
+class MyNonTrainableLayer(keras.layers.Layer):
+
+  def __init__(self, **kwargs):
+    super().__init__(**kwargs)
+    self.non_trainable_weight = self.add_weight(
+        shape=(10,), initializer="ones", trainable=False, name="weight"
+    )
+
+  def call(self, x):
+    return x
+
+
+@keras.saving.register_keras_serializable(package="Recml")
+class MyTestModel(keras.Model):
+
+  def __init__(self, layer_name, **kwargs):
+    super().__init__(**kwargs)
+    self.layer_name = layer_name
+    self.my_layer = MyNonTrainableLayer(name=layer_name)
+    self.dense = keras.layers.Dense(5, name="my_trainable_dense")
+    self.direct_non_trainable = self.add_weight(
+        shape=(5,),
+        initializer="ones",
+        trainable=False,
+        name="direct_non_trainable",
+    )
+
+  def call(self, x):
+    x = self.my_layer(x)
+    x = self.dense(x)
+    return x
+
+  def get_config(self):
+    config = super().get_config()
+    config.update({"layer_name": self.layer_name})
+    return config
+
+
 class KerasUtilsTest(parameterized.TestCase):
 
   def setUp(self):
@@ -157,6 +196,85 @@ class KerasUtilsTest(parameterized.TestCase):
     # Ensures predictions are identical.
     np.testing.assert_allclose(preds, preds_after_restoration)
 
+  @parameterized.named_parameters(
+      {
+          "testcase_name": "single_core",
+          "data_parallel": False,
+          "restore_with_checkpointer": True,
+      },
+      {
+          "testcase_name": "data_parallel",
+          "data_parallel": True,
+          "restore_with_checkpointer": True,
+      },
+      {
+          "testcase_name": "restore_without_checkpointer_single_core",
+          "data_parallel": False,
+          "restore_with_checkpointer": False,
+      },
+      {
+          "testcase_name": "restore_without_checkpointer_data_parallel",
+          "data_parallel": True,
+          "restore_with_checkpointer": False,
+      },
+  )
+  def test_keras_orbax_checkpointer_v3(
+      self, data_parallel: bool, restore_with_checkpointer: bool
+  ):
+    if data_parallel:
+      keras.distribution.set_distribution(keras.distribution.DataParallel())
+    else:
+      keras.distribution.set_distribution(None)
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir, max_to_keep=5
+    )
+    dummy_inputs = _create_dummy_inputs()
+
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+
+    state = (
+        [v.value for v in bert_pretrainer.trainable_variables],
+        [v.value for v in bert_pretrainer.non_trainable_variables],
+        [v.value for v in bert_pretrainer.optimizer.variables],
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, 0)
+    checkpoint_manager.wait_until_finished()
+
+    preds = bert_pretrainer(dummy_inputs)
+
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    if restore_with_checkpointer:
+      checkpoint_manager.restore_model_variables(bert_pretrainer, 0)
+    else:
+      keras_utils.restore_keras_checkpoint(
+          checkpoint_dir, model=bert_pretrainer, restore_optimizer_vars=True
+      )
+
+    checkpoint_manager.close()
+
+    restored_state = (
+        [v.value for v in bert_pretrainer.trainable_variables],
+        [v.value for v in bert_pretrainer.non_trainable_variables],
+        [v.value for v in bert_pretrainer.optimizer.variables],
+    )
+    preds_after_restoration = bert_pretrainer(dummy_inputs)
+
+    keras.tree.assert_same_structure(state, restored_state)
+    for expected, observed in zip(
+        jax.tree.flatten(state)[0], jax.tree.flatten(restored_state)[0]
+    ):
+      # Ensures the objects are different but the values are the same.
+      self.assertNotEqual(id(expected), id(observed))
+      self.assertEqual(expected.shape, observed.shape)
+      self.assertEqual(expected.dtype, observed.dtype)
+      self.assertEqual(expected.sharding, observed.sharding)
+      np.testing.assert_allclose(observed, expected)
+
+    # Ensures predictions are identical.
+    np.testing.assert_allclose(preds, preds_after_restoration)
+
   def test_restore_keras_checkpoint(self):
     dummy_inputs = _create_dummy_inputs()
     bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
@@ -187,6 +305,119 @@ class KerasUtilsTest(parameterized.TestCase):
         bert_pretrainer.get_config(), restored_model.get_config()
     )
     np.testing.assert_allclose(preds, preds_after_restoration)
+
+  def test_restore_keras_checkpoint_v3(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    preds = bert_pretrainer(dummy_inputs)
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
+    checkpoint_manager.close()
+
+    restored_model = keras_utils.restore_keras_checkpoint(checkpoint_dir)
+    preds_after_restoration = restored_model(dummy_inputs)
+
+    for expected, observed in zip(
+        [v.value for v in bert_pretrainer.variables],
+        [v.value for v in restored_model.variables],
+    ):
+      self.assertNotEqual(id(expected), id(observed))
+      self.assertEqual(expected.shape, observed.shape)
+      self.assertEqual(expected.dtype, observed.dtype)
+      self.assertEqual(expected.sharding, observed.sharding)
+      np.testing.assert_allclose(observed, expected)
+
+    self.assertDictEqual(
+        bert_pretrainer.get_config(), restored_model.get_config()
+    )
+    np.testing.assert_allclose(preds, preds_after_restoration)
+
+  def test_restore_shape_mismatch_fails(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir, max_to_keep=5
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, 0)
+    checkpoint_manager.wait_until_finished()
+
+    # Create a model with a different intermediate_dim, causing shape mismatches
+    different_pretrainer = keras_hub.models.BertMaskedLM(
+        backbone=keras_hub.models.BertBackbone(
+            vocabulary_size=2048,
+            num_layers=4,
+            num_heads=8,
+            hidden_dim=32,
+            intermediate_dim=128,  # Different shape!
+            max_sequence_length=128,
+            num_segments=8,
+            dropout=0.1,
+        )
+    )
+    optimizer = keras.optimizers.Adam()
+    different_pretrainer.compile(optimizer=optimizer)
+    different_pretrainer.build(jax.tree.map(jnp.shape, dummy_inputs))
+    different_pretrainer.optimizer.build(
+        different_pretrainer.trainable_variables
+    )
+
+    with self.assertRaises(ValueError):
+      checkpoint_manager.restore_model_variables(different_pretrainer, 0)
+
+    checkpoint_manager.close()
+
+  def test_restore_renamed_non_trainable_and_optimizer_variables(self):
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir, max_to_keep=5
+    )
+
+    # Save side: model with my_layer, optimizer named adam_save
+    model_save = MyTestModel(layer_name="my_layer", name="my_test_model")
+    model_save(np.zeros((1, 10)))
+    optimizer_save = keras.optimizers.Adam(name="adam_save")
+    model_save.compile(optimizer=optimizer_save)
+    optimizer_save.build(model_save.trainable_variables)
+
+    # Initialize non-trainable and optimizer slot values to distinct values
+    for i, var in enumerate(model_save.non_trainable_variables):
+      var.assign(np.ones(var.shape) * (i + 7.0))
+    for i, var in enumerate(model_save.optimizer.variables):
+      var.assign(np.ones(var.shape) * (i + 9.0))
+
+    checkpoint_manager.save_model_variables(model_save, 0)
+    checkpoint_manager.wait_until_finished()
+
+    # Restore side: model with my_layer, optimizer named adam_restore
+    model_restore = MyTestModel(layer_name="my_layer", name="my_test_model")
+    model_restore(np.zeros((1, 10)))
+    optimizer_restore = keras.optimizers.Adam(name="adam_restore")
+    model_restore.compile(optimizer=optimizer_restore)
+    optimizer_restore.build(model_restore.trainable_variables)
+
+    # Initialize to zeros
+    for var in model_restore.non_trainable_variables:
+      var.assign(np.zeros(var.shape))
+    for var in model_restore.optimizer.variables:
+      var.assign(np.zeros(var.shape))
+
+    # Restore should succeed and map optimizer variables by index ordering
+    checkpoint_manager.restore_model_variables(model_restore, 0)
+    checkpoint_manager.close()
+
+    # Verify non-trainable variables were restored
+    for i, var in enumerate(model_restore.non_trainable_variables):
+      np.testing.assert_allclose(var.value, np.ones(var.shape) * (i + 7.0))
+
+    # Verify optimizer variables were restored
+    for i, var in enumerate(model_restore.optimizer.variables):
+      np.testing.assert_allclose(var.value, np.ones(var.shape) * (i + 9.0))
 
   def test_load_keras_model_config(self):
     dummy_inputs = _create_dummy_inputs()
@@ -275,7 +506,7 @@ class KerasUtilsTest(parameterized.TestCase):
     checkpoint_manager.close()
     test_path = os.path.join(checkpoint_dir, test_path_suffix)
 
-    resolved_path, resolved_epoch = keras_utils._resolve_orbax_checkpoint_path(
+    resolved_path, resolved_epoch = keras_utils.resolve_orbax_checkpoint_path(
         test_path, epoch=input_epoch
     )
 
@@ -291,13 +522,13 @@ class KerasUtilsTest(parameterized.TestCase):
     checkpoint_manager.close()
 
     with self.assertRaisesRegex(ValueError, "Step 99 not found"):
-      keras_utils._resolve_orbax_checkpoint_path(test_dir, epoch=99)
+      keras_utils.resolve_orbax_checkpoint_path(test_dir, epoch=99)
 
   def test_resolve_orbax_checkpoint_path_empty_dir(self):
     test_dir = self.create_tempdir().full_path
 
     with self.assertRaisesRegex(FileNotFoundError, "No checkpoints found"):
-      keras_utils._resolve_orbax_checkpoint_path(test_dir, epoch=None)
+      keras_utils.resolve_orbax_checkpoint_path(test_dir, epoch=None)
 
   @parameterized.named_parameters(
       {
@@ -383,6 +614,63 @@ class KerasUtilsTest(parameterized.TestCase):
 
     with self.assertRaises(FileNotFoundError):
       keras_utils.restore_keras_model(bert_pretrainer, "not_found_dir")
+
+  def test_restore_keras_model_fails_on_v3_checkpoint(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
+    checkpoint_manager.wait_until_finished()
+
+    with self.assertRaisesRegex(
+        ValueError, "is in V2/V3 format.*restore_keras_checkpoint"
+    ):
+      keras_utils.restore_keras_model(bert_pretrainer, checkpoint_dir, step=1)
+
+    checkpoint_manager.close()
+
+  def test_restore_keras_model_fails_on_v2_checkpoint(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+        checkpoint_dir
+    )
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
+    checkpoint_manager.wait_until_finished()
+
+    with self.assertRaisesRegex(
+        ValueError, "is in V2/V3 format.*restore_keras_checkpoint"
+    ):
+      keras_utils.restore_keras_model(bert_pretrainer, checkpoint_dir, step=1)
+
+    checkpoint_manager.close()
+
+  def test_restore_keras_checkpoint_fails_on_v1_checkpoint(self):
+    dummy_inputs = _create_dummy_inputs()
+    bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManager(checkpoint_dir)
+    checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
+    checkpoint_manager.wait_until_finished()
+
+    # We expect it to fail because restore_keras_checkpoint expects V2/V3
+    # structure. We want it to fail loudly and suggest using
+    # restore_keras_model.
+    with self.assertRaisesRegex(
+        ValueError, "is in V1 format.*restore_keras_model"
+    ):
+      keras_utils.restore_keras_checkpoint(
+          checkpoint_dir, model=bert_pretrainer
+      )
+
+    checkpoint_manager.close()
 
   @parameterized.named_parameters(
       {
@@ -600,6 +888,355 @@ class KerasUtilsTest(parameterized.TestCase):
     callback.on_train_begin()
     checkpoint_manager.wait_until_finished()
     self.assertTrue(os.path.exists(os.path.join(checkpoint_dir, "0")))
+
+
+class KerasOrbaxCheckpointUtilsTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.checkpoint_dir = self.create_tempdir().full_path
+
+  def test_is_v3_checkpoint_true(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    model = keras.Sequential([keras.layers.Dense(1)])
+    model.compile(optimizer="adam")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+
+    manager.save_model_variables(model, epoch=1)
+    manager.wait_until_finished()
+
+    self.assertTrue(keras_utils.is_v3_checkpoint(self.checkpoint_dir))
+    self.assertTrue(keras_utils.is_v3_checkpoint(self.checkpoint_dir, epoch=1))
+
+  def test_is_v3_checkpoint_false_for_v1(self):
+    manager = keras_utils.KerasOrbaxCheckpointManager(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    model = keras.Sequential([keras.layers.Dense(1)])
+    model.compile(optimizer="adam")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+
+    manager.save_model_variables(model, epoch=1)
+    manager.wait_until_finished()
+
+    self.assertFalse(keras_utils.is_v3_checkpoint(self.checkpoint_dir))
+
+  def test_is_v3_checkpoint_false_for_missing(self):
+    self.assertFalse(keras_utils.is_v3_checkpoint(self.checkpoint_dir))
+    self.assertFalse(keras_utils.is_v3_checkpoint(self.checkpoint_dir, epoch=1))
+
+  def test_restore_partial_checkpoint_success(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    model = keras.Sequential(
+        [
+            keras.layers.Dense(2, name="dense1"),
+            keras.layers.Dense(1, name="dense2"),
+        ],
+        name="my_model",
+    )
+    model.compile(optimizer="adam")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+
+    model.layers[0].kernel.assign([[1.0, 2.0]])
+    model.layers[1].kernel.assign([[3.0], [4.0]])
+
+    manager.save_model_variables(model, epoch=1)
+    manager.wait_until_finished()
+
+    new_model = keras.Sequential(
+        [
+            keras.layers.Dense(2, name="dense1"),
+            keras.layers.Dense(1, name="dense2"),
+        ],
+        name="my_model",
+    )
+    new_model.build((1, 1))
+
+    new_model.layers[0].kernel.assign([[0.0, 0.0]])
+    new_model.layers[1].kernel.assign([[0.0], [0.0]])
+
+    partial_vars = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            new_model.layers[0].kernel.path: new_model.layers[0].kernel,
+            new_model.layers[0].bias.path: new_model.layers[0].bias,
+        }
+    }
+
+    restored_state = keras_utils.restore_partial_checkpoint(
+        self.checkpoint_dir, partial_vars, epoch=1
+    )
+
+    for key, var_dict in partial_vars.items():
+      for path, var in var_dict.items():
+        var.assign(restored_state[key][path])
+
+    np.testing.assert_allclose(new_model.layers[0].kernel.value, [[1.0, 2.0]])
+    np.testing.assert_allclose(new_model.layers[1].kernel.value, [[0.0], [0.0]])
+
+  def test_restore_partial_checkpoint_non_overlapping_architectures(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    # Model in checkpoint has dense1 and dense2
+    model = keras.Sequential(
+        [
+            keras.layers.Dense(2, name="dense1"),
+            keras.layers.Dense(1, name="dense2"),
+        ],
+        name="my_model",
+    )
+    model.compile(optimizer="adam")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+
+    model.layers[0].kernel.assign([[1.0, 2.0]])
+    model.layers[1].kernel.assign([[3.0], [4.0]])
+
+    manager.save_model_variables(model, epoch=1)
+    manager.wait_until_finished()
+
+    # New model has dense1 and dense3 (dense2 is missing, dense3 is new)
+    new_model = keras.Sequential(
+        [
+            keras.layers.Dense(2, name="dense1"),
+            keras.layers.Dense(3, name="dense3"),
+        ],
+        name="my_model",
+    )
+    new_model.build((1, 1))
+
+    new_model.layers[0].kernel.assign([[0.0, 0.0]])
+    new_model.layers[1].kernel.assign([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+
+    # We only restore dense1 from the checkpoint
+    partial_vars = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            new_model.layers[0].kernel.path: new_model.layers[0].kernel,
+            new_model.layers[0].bias.path: new_model.layers[0].bias,
+        }
+    }
+
+    restored_state = keras_utils.restore_partial_checkpoint(
+        self.checkpoint_dir, partial_vars, epoch=1
+    )
+
+    for key, var_dict in partial_vars.items():
+      for path, var in var_dict.items():
+        var.assign(restored_state[key][path])
+
+    # dense1 should be restored
+    np.testing.assert_allclose(new_model.layers[0].kernel.value, [[1.0, 2.0]])
+    # dense3 should remain unchanged (zeros)
+    np.testing.assert_allclose(
+        new_model.layers[1].kernel.value, [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    )
+
+  def test_restore_partial_checkpoint_nested_layer_mismatch(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+
+    class ParentLayer(keras.layers.Layer):
+
+      def __init__(self, nested_name, **kwargs):
+        super().__init__(**kwargs)
+        self.nested = keras.layers.Dense(2, name=nested_name)
+
+      def call(self, x):
+        return self.nested(x)
+
+    # Model A has nested layer named "dense_a" under "parent"
+    model_a = keras.Sequential(
+        [ParentLayer(nested_name="dense_a", name="parent")], name="model"
+    )
+    model_a.compile(optimizer="adam")
+    model_a.build((1, 1))
+    model_a.optimizer.build(model_a.trainable_variables)
+    manager.save_model_variables(model_a, epoch=1)
+    manager.wait_until_finished()
+
+    # Model B has nested layer named "dense_b" under "parent"
+    model_b = keras.Sequential(
+        [ParentLayer(nested_name="dense_b", name="parent")], name="model"
+    )
+    model_b.build((1, 1))
+
+    # Try to restore model_b variables (which have paths like
+    # 'parent/dense_b/kernel')
+    partial_vars = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            model_b.layers[0].nested.kernel.path: (
+                model_b.layers[0].nested.kernel
+            ),
+        }
+    }
+
+    # This should fail because 'parent/dense_b/kernel' is not in the checkpoint
+    with self.assertRaisesRegex(ValueError, "Missing paths in checkpoint"):
+      keras_utils.restore_partial_checkpoint(
+          self.checkpoint_dir, partial_vars, epoch=1
+      )
+
+  def test_restore_partial_checkpoint_invalid_keys(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    model = keras.Sequential([keras.layers.Dense(1)])
+    model.compile(optimizer="adam")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+
+    manager.save_model_variables(model, epoch=1)
+    manager.wait_until_finished()
+
+    partial_vars = {
+        keras_utils.NON_TRAINABLE_VARIABLES_KEY: {
+            "some_path": model.trainable_variables[0]
+        }
+    }
+    with self.assertRaisesRegex(
+        ValueError,
+        "Partial restoration is only supported for trainable variables",
+    ):
+      keras_utils.restore_partial_checkpoint(
+          self.checkpoint_dir, partial_vars, epoch=1
+      )
+
+    partial_vars = {
+        keras_utils.OPTIMIZER_VARIABLES_KEY: {
+            "some_path": model.trainable_variables[0]
+        }
+    }
+    with self.assertRaisesRegex(
+        ValueError,
+        "Partial restoration is only supported for trainable variables",
+    ):
+      keras_utils.restore_partial_checkpoint(
+          self.checkpoint_dir, partial_vars, epoch=1
+      )
+
+  def test_restore_optimizer_mismatch_fails(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    # Save side: model with SGD optimizer
+    model_sgd = keras.Sequential(
+        [keras.layers.Dense(1, name="dense")], name="my_model"
+    )
+    model_sgd.compile(optimizer="sgd")
+    model_sgd.build((1, 1))
+    model_sgd.optimizer.build(model_sgd.trainable_variables)
+
+    manager.save_model_variables(model_sgd, epoch=1)
+    manager.wait_until_finished()
+
+    # Restore side: model with Adam optimizer
+    model_adam = keras.Sequential(
+        [keras.layers.Dense(1, name="dense")], name="my_model"
+    )
+    model_adam.compile(optimizer="adam")
+    model_adam.build((1, 1))
+    model_adam.optimizer.build(model_adam.trainable_variables)
+
+    # Attempting to restore should fail because Adam has more variables than SGD
+    # and they cannot be matched.
+    with self.assertRaisesRegex(
+        ValueError, "Failed to restore optimizer variables"
+    ):
+      keras_utils.restore_keras_checkpoint(
+          self.checkpoint_dir,
+          model=model_adam,
+          restore_optimizer_vars=True,
+          epoch=1,
+      )
+    manager.close()
+
+  def test_restore_partial_checkpoint_fails_on_v2(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV2(
+        checkpoint_dir=self.checkpoint_dir
+    )
+    model = keras.Sequential([keras.layers.Dense(1)])
+    model.compile(optimizer="adam")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+    manager.save_model_variables(model, epoch=1)
+    manager.wait_until_finished()
+
+    partial_vars = {
+        keras_utils.TRAINABLE_VARIABLES_KEY: {
+            model.layers[0].kernel.path: model.layers[0].kernel
+        }
+    }
+    with self.assertRaisesRegex(
+        ValueError, "restore_partial_checkpoint only supports V3"
+    ):
+      keras_utils.restore_partial_checkpoint(
+          self.checkpoint_dir, partial_vars, epoch=1
+      )
+    manager.close()
+
+  def test_restore_non_trainable_mismatch_warns(self):
+    manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=self.checkpoint_dir,
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    # Save side: model WITHOUT non-trainable variables (Dense only)
+    model_a = keras.Sequential(
+        [keras.layers.Dense(1, name="dense")], name="my_model"
+    )
+    model_a.compile(optimizer="sgd")
+    model_a.build((1, 1))
+    model_a.optimizer.build(model_a.trainable_variables)
+
+    manager.save_model_variables(model_a, epoch=1)
+    manager.wait_until_finished()
+
+    # Restore side: model WITH non-trainable variables (BatchNormalization)
+    # BN adds moving_mean and moving_variance (non-trainable)
+    # scale=False, center=False to avoid adding trainable variables (gamma, beta)
+    model_b = keras.Sequential(
+        [
+            keras.layers.BatchNormalization(scale=False, center=False, name="bn"),
+            keras.layers.Dense(1, name="dense"),
+        ],
+        name="my_model",
+    )
+    model_b.compile(optimizer="sgd")
+    model_b.build((1, 1))
+    model_b.optimizer.build(model_b.trainable_variables)
+
+    # Initial values for BN vars (should remain unchanged after restore)
+    initial_mean = model_b.layers[0].moving_mean.numpy()
+
+    # Restore should succeed with warnings about missing non-trainable vars
+    keras_utils.restore_keras_checkpoint(
+        self.checkpoint_dir, model=model_b, restore_optimizer_vars=False, epoch=1
+    )
+
+    np.testing.assert_allclose(model_b.layers[0].moving_mean.numpy(), initial_mean)
+    manager.close()
 
 
 if __name__ == "__main__":
