@@ -42,7 +42,7 @@ libcst==1.7.0
 libtpu==0.0.32
 # libtpu-nightly is usually installed directly via URL, but pinning it helps tracking
 # libtpu-nightly==0.1.dev20240617+default 
-Markdown==3.8
+Markdown==3.8.1
 markdown-it-py==3.0.0
 MarkupSafe==3.0.2
 mccabe==0.7.0
