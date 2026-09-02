@@ -135,7 +135,7 @@ class DLRMDCNV2(nn.Module):
 
     sparse_embeddings = embed.SparseCoreEmbed(
         feature_specs=self.feature_specs,
-        mesh=self.mesh,
+        _mesh=self.mesh,
         sharding_axis=self.sharding_axis,
     )(embedding_lookups)
     sparse_embeddings = jax.tree.flatten(sparse_embeddings)
