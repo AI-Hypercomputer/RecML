@@ -594,7 +594,7 @@ def estimate_confusion_matrix(
     return jnp.sum(tp), jnp.sum(tn), jnp.sum(fp), jnp.sum(fn)
 
   thresholds = jnp.asarray(thresholds, dtype=jnp.float32)  # pyrefly: ignore[bad-assignment]
-  return jax.vmap(_estimate_confusion_matrix)(thresholds)
+  return jax.vmap(_estimate_confusion_matrix)(thresholds)  # pyrefly: ignore[bad-argument-type]
 
 
 def default_thresholds(num_thresholds: int) -> np.ndarray:
