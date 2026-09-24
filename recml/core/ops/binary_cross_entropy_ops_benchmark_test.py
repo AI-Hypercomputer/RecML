@@ -50,18 +50,18 @@ def _make_inputs() -> tuple[jax.Array, jax.Array, jax.Array]:
   return activations, embeddings, targets
 
 
-def _benchmark(name: str, fwd, activations, embeddings) -> float:
-  """Compiles `fwd` and returns its average step time in seconds."""
+def _benchmark(name: str, grad_fn, activations, embeddings) -> float:
+  """Compiles `grad_fn` and returns its average step time in seconds."""
   logging.info('Compiling %s...', name)
   t0 = time.time()
-  fwd(activations, embeddings).block_until_ready()
+  grad_fn(activations, embeddings)[0].block_until_ready()
   logging.info('%s compiled in %.2f s', name, time.time() - t0)
 
   logging.info('Benchmarking %s (%d steps)...', name, _NUM_STEPS)
   t0 = time.time()
   for _ in range(_NUM_STEPS):
-    loss = fwd(activations, embeddings)
-    loss.block_until_ready()
+    g_act, _ = grad_fn(activations, embeddings)
+    g_act.block_until_ready()
   step_time = (time.time() - t0) / _NUM_STEPS
   logging.info('%s step time: %.4f ms', name, step_time * 1000)
   return step_time
@@ -88,19 +88,21 @@ class BinaryCrossEntropyOpsBenchmarkTest(absltest.TestCase):
       )
       return jnp.mean(loss_per_token)
 
-    _benchmark('Keras', jax.jit(run_keras), activations, embeddings)
+    grad_keras = jax.jit(jax.grad(run_keras, argnums=(0, 1)))
+    _benchmark('Keras', grad_keras, activations, embeddings)
 
   def test_mini_benchmark_cut_bce(self):
     activations, embeddings, targets = _make_inputs()
 
-    def run_cut(act, emb):
+    def run_cut(act, emb, bv=_BLOCK_V):
       return binary_cross_entropy_ops.cut_binary_cross_entropy(
-          act, emb, targets, block_v=_BLOCK_V
+          act, emb, targets, block_v=bv
       )
 
+    grad_cut = jax.jit(jax.grad(run_cut, argnums=(0, 1)))
     _benchmark(
         f'Cut (block_v={_BLOCK_V})',
-        jax.jit(run_cut),
+        grad_cut,
         activations,
         embeddings,
     )
