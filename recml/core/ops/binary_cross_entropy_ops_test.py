@@ -385,6 +385,18 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
     # Only the hidden dim is gathered; the token axes keep their sharding.
     self.assertEqual(replicated.sharding.spec, P('data', None, None))
 
+    # A short PartitionSpec that omits trailing Nones (e.g. P('data') for 3D
+    # [B, N, D]) must preserve the leading batch sharding rather than zeroing
+    # out its only explicit entry.
+    short_spec_activations = jax.device_put(
+        jnp.ones((8, 64, 128)),
+        jax.sharding.NamedSharding(mesh, P('data')),
+    )
+    replicated_short = binary_cross_entropy_ops._replicate_hidden_dim(
+        short_spec_activations
+    )
+    self.assertEqual(replicated_short.sharding.spec, P('data', None, None))
+
   def test_replicate_hidden_dim_is_a_no_op_without_named_sharding(self):
     activations = jnp.ones((8, 64, 128))
     self.assertIs(
@@ -478,19 +490,37 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
         key_tgt, (batch, seq_len, num_labels), 0, vocab_size
     )
 
-    loss_keras, _ = _keras_bce(activations, embeddings, targets)
-    loss_cut = binary_cross_entropy_ops.cut_binary_cross_entropy(
-        activations, embeddings, targets, block_v=block_v
-    )
+    # Keras BCE
+    def run_keras(act, emb):
+      loss, _ = _keras_bce(act, emb, targets)
+      return loss
+
+    grad_keras_fn = jax.jit(jax.grad(run_keras, argnums=(0, 1)))
+    loss_keras = run_keras(activations, embeddings)
+    g_act_keras, g_emb_keras = grad_keras_fn(activations, embeddings)
+
+    # cut BCE
+    def run_cut(act, emb):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, targets, block_v=block_v
+      )
+
+    grad_cut_fn = jax.jit(jax.grad(run_cut, argnums=(0, 1)))
+    loss_cut = run_cut(activations, embeddings)
+    g_act_cut, g_emb_cut = grad_cut_fn(activations, embeddings)
 
     # Compare
     np.testing.assert_allclose(loss_cut, loss_keras, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_act_cut, g_act_keras, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(g_emb_cut, g_emb_keras, atol=1e-4, rtol=1e-4)
 
   @parameterized.named_parameters(
-      ('4d_act_4d_tgt', (2, 2, 128, 64), (2, 2, 128, 4)),
-      ('4d_act_3d_tgt', (3, 2, 128, 64), (2, 128, 4)),
+      ('4d_act_4d_tgt_pallas', (2, 2, 128, 64), (2, 2, 128, 4), True),
+      ('4d_act_3d_tgt_pallas', (3, 2, 128, 64), (2, 128, 4), True),
+      ('4d_act_4d_tgt_pure_jax', (2, 2, 128, 64), (2, 2, 128, 4), False),
+      ('4d_act_3d_tgt_pure_jax', (3, 2, 128, 64), (2, 128, 4), False),
   )
-  def test_cut_bce_4d_correctness(self, act_shape, tgt_shape):
+  def test_cut_bce_4d_correctness(self, act_shape, tgt_shape, use_pallas):
     vocab_size, block_v = 512, 256
     hidden_dim = act_shape[-1]
 
@@ -501,11 +531,28 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
     embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
     targets = jax.random.randint(key_tgt, tgt_shape, 0, vocab_size)
 
-    loss_keras, _ = _keras_bce(activations, embeddings, targets)
-    loss_cut = binary_cross_entropy_ops.cut_binary_cross_entropy(
-        activations, embeddings, targets, block_v=block_v
-    )
+    def run_keras(act, emb):
+      loss, _ = _keras_bce(act, emb, targets)
+      return loss
+
+    def run_cut(act, emb):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, targets, block_v=block_v, use_pallas=use_pallas
+      )
+
+    loss_keras = run_keras(activations, embeddings)
+    loss_cut = run_cut(activations, embeddings)
     np.testing.assert_allclose(loss_cut, loss_keras, rtol=1e-3, atol=1e-3)
+
+    # Test backward grad in 4D (exercises _bce_bwd_loop_fallback when
+    # use_pallas=True and _bce_bwd_pure_jax's 4D scan branch when False).
+    grad_keras_fn = jax.jit(jax.grad(run_keras, argnums=(0, 1)))
+    grad_cut_fn = jax.jit(jax.grad(run_cut, argnums=(0, 1)))
+
+    g_act_keras, g_emb_keras = grad_keras_fn(activations, embeddings)
+    g_act_cut, g_emb_cut = grad_cut_fn(activations, embeddings)
+    np.testing.assert_allclose(g_act_cut, g_act_keras, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(g_emb_cut, g_emb_keras, atol=1e-4, rtol=1e-4)
 
   def test_cut_bce_with_sharded_embeddings(self):
     if jax.devices()[0].platform != 'tpu':
@@ -556,13 +603,154 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
     loss_keras, _ = _keras_bce(activations, embeddings, targets)
     np.testing.assert_allclose(loss_cut, loss_keras, atol=1e-5, rtol=1e-5)
 
-  def test_cut_bce_correctness_large_sequence(self):
+    def run_cut(act, emb):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, targets, block_v=256
+      )
+
+    # Same for the backward pass: assert the gradients, not that a sharding
+    # constraint was called. Here the shardings are inferred from the input
+    # arrays; the explicit mesh / act_spec / emb_spec path is covered by
+    # `test_cut_bce_sharded_backward`.
+    grad_fn = jax.jit(jax.grad(run_cut, argnums=(0, 1)))
+    g_act, g_emb = grad_fn(activations_sharded, embeddings_sharded)
+    g_act_ref, g_emb_ref = grad_fn(activations, embeddings)
+
+    np.testing.assert_allclose(g_act, g_act_ref, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_emb, g_emb_ref, atol=1e-5, rtol=1e-5)
+
+  @parameterized.named_parameters(
+      ('pure_jax', False),
+      ('pallas', True),
+  )
+  def test_cut_bce_sharded_backward(self, use_pallas):
+    """Covers the backward pass when embeddings are vocab-sharded.
+
+    `block_v` is chosen against the *global* vocab, but under
+    `_bce_bwd_sharded`'s shard_map each shard only holds `vocab_size /
+    num_devices` rows, so the local `block_v` must be clamped and the loss
+    normalization must still use the global vocab size.
+    """
     if jax.devices()[0].platform != 'tpu':
       self.skipTest('Skipping TPU test.')
+    if jax.device_count() < 2:
+      self.skipTest(
+          'Needs >= 2 devices to make the local vocab smaller than block_v; '
+          f'got {jax.device_count()}.'
+      )
 
-    # Test with sequence length larger than chunk_n to trigger scan loop
-    batch, seq_len, hidden_dim, vocab_size, num_labels = 2, 2048, 128, 512, 4
-    block_v = 256
+    batch, seq_len, hidden_dim, vocab_size, num_labels = 2, 128, 128, 512, 4
+    # Equal to the global vocab, so every shard is strictly smaller.
+    block_v = vocab_size
+
+    key_act, key_emb, key_tgt = jax.random.split(jax.random.PRNGKey(0), 3)
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), 0, vocab_size
+    )
+
+    # Separate mesh axes: reusing one axis for both batch and vocab sharding
+    # makes `_bce_bwd_sharded`'s dp_axes/psum bookkeeping incoherent.
+    num_vocab_shards = jax.device_count()
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()).reshape(1, num_vocab_shards),
+        ('data', 'model'),
+    )
+    act_spec = P('data', None, None)
+    emb_spec = P('model', None)
+
+    def run_cut(act, emb, **kwargs):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, targets, block_v=block_v, use_pallas=use_pallas, **kwargs
+      )
+
+    # Passing mesh/act_spec/emb_spec is what forces `_bce_bwd_sharded` down the
+    # shard_map branch, where each shard sees only `vocab_size / num_devices`
+    # embedding rows.
+    grad_sharded_fn = jax.jit(
+        jax.grad(
+            lambda a, e: run_cut(
+                a, e, mesh=mesh, act_spec=act_spec, emb_spec=emb_spec
+            ),
+            argnums=(0, 1),
+        )
+    )
+    grad_ref_fn = jax.jit(jax.grad(run_cut, argnums=(0, 1)))
+
+    g_act_sharded, g_emb_sharded = grad_sharded_fn(
+        jax.device_put(activations, jax.sharding.NamedSharding(mesh, act_spec)),
+        jax.device_put(embeddings, jax.sharding.NamedSharding(mesh, emb_spec)),
+    )
+    g_act_ref, g_emb_ref = grad_ref_fn(activations, embeddings)
+
+    # Catches two vocab-sharding regressions: without the `block_v` clamp the
+    # chunk slice asks for more rows than a shard holds, and without the
+    # `global_vocab` normalization the gradients come back scaled by the number
+    # of vocab shards.
+    np.testing.assert_allclose(g_act_sharded, g_act_ref, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_emb_sharded, g_emb_ref, atol=1e-5, rtol=1e-5)
+
+  @parameterized.named_parameters(
+      ('hidden_sharded_empty_emb_spec', P('data', None, 'model'), P()),
+      ('short_act_spec_none_emb_spec', P('data'), None),
+  )
+  def test_cut_bce_sharded_backward_hidden_dim_and_short_specs(
+      self, act_spec, emb_spec
+  ):
+    """Covers hidden-dim activation sharding, short act_spec, and None/P() emb_spec."""
+    batch, seq_len, hidden_dim, vocab_size, num_labels = 2, 64, 128, 256, 4
+    block_v = 128
+
+    key_act, key_emb, key_tgt = jax.random.split(jax.random.PRNGKey(7), 3)
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), 0, vocab_size
+    )
+
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()).reshape(jax.device_count(), 1),
+        ('data', 'model'),
+    )
+
+    def run_cut(act, emb, **kwargs):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, targets, block_v=block_v, use_pallas=False, **kwargs
+      )
+
+    grad_sharded_fn = jax.jit(
+        jax.grad(
+            lambda a, e: run_cut(
+                a, e, mesh=mesh, act_spec=act_spec, emb_spec=emb_spec
+            ),
+            argnums=(0, 1),
+        )
+    )
+    grad_ref_fn = jax.jit(jax.grad(run_cut, argnums=(0, 1)))
+
+    emb_put_spec = emb_spec if emb_spec is not None else P()
+    g_act_sharded, g_emb_sharded = grad_sharded_fn(
+        jax.device_put(activations, jax.sharding.NamedSharding(mesh, act_spec)),
+        jax.device_put(
+            embeddings, jax.sharding.NamedSharding(mesh, emb_put_spec)
+        ),
+    )
+    g_act_ref, g_emb_ref = grad_ref_fn(activations, embeddings)
+
+    np.testing.assert_allclose(g_act_sharded, g_act_ref, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_emb_sharded, g_emb_ref, atol=1e-5, rtol=1e-5)
+
+  @parameterized.named_parameters(
+      ('exact_multiple_of_chunk_n', 128),
+      ('unaligned_padded_to_chunk_n', 130),
+  )
+  def test_cut_bce_correctness_large_sequence(self, seq_len):
+    # Force chunk_n=128 so `n = batch * seq_len` (256 or 260) exceeds `chunk_n`
+    # on every platform and exercises both the exact-multiple (`padded_n == n`)
+    # and padded (`padded_n > n`) branches of `_bce_bwd_pallas_chunked_n`.
+    batch, hidden_dim, vocab_size, num_labels = 2, 128, 256, 4
+    block_v = 128
 
     key = jax.random.PRNGKey(42)
     key_act, key_emb, key_tgt = jax.random.split(key, 3)
@@ -573,13 +761,74 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
         key_tgt, (batch, seq_len, num_labels), 0, vocab_size
     )
 
-    loss_keras, _ = _keras_bce(activations, embeddings, targets)
-    loss_cut = binary_cross_entropy_ops.cut_binary_cross_entropy(
-        activations, embeddings, targets, block_v=block_v
-    )
+    # Keras BCE
+    def run_keras(act, emb):
+      loss, _ = _keras_bce(act, emb, targets)
+      return loss
+
+    grad_keras_fn = jax.jit(jax.grad(run_keras, argnums=(0, 1)))
+    loss_keras = run_keras(activations, embeddings)
+    g_act_keras, g_emb_keras = grad_keras_fn(activations, embeddings)
+
+    # cut BCE
+    def run_cut(act, emb):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, targets, block_v=block_v
+      )
+
+    with mock.patch.object(
+        binary_cross_entropy_ops, '_max_safe_chunk_n', return_value=128
+    ):
+      grad_cut_fn = jax.jit(jax.grad(run_cut, argnums=(0, 1)))
+      loss_cut = run_cut(activations, embeddings)
+      g_act_cut, g_emb_cut = grad_cut_fn(activations, embeddings)
 
     # Compare
     np.testing.assert_allclose(loss_cut, loss_keras, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_act_cut, g_act_keras, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(g_emb_cut, g_emb_keras, atol=1e-4, rtol=1e-4)
+
+  def test_cut_bce_use_pallas_vs_pure_jax_equivalence(self):
+    """Verifies that pure JAX and Pallas branches yield identical forward and backward results."""
+    if jax.devices()[0].platform != 'tpu':
+      self.skipTest('Skipping TPU test.')
+
+    batch, seq_len, hidden_dim, vocab_size, num_labels = 2, 128, 128, 1024, 4
+    block_v = 256
+
+    key = jax.random.PRNGKey(123)
+    key_act, key_emb, key_tgt = jax.random.split(key, 3)
+
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    # Mix valid target indices with negative padding tokens (-1)
+    targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), -1, vocab_size
+    )
+
+    def run_cut(act, emb, use_pallas):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, targets, block_v=block_v, use_pallas=use_pallas
+      )
+
+    # Forward comparison
+    loss_pure_jax = run_cut(activations, embeddings, use_pallas=False)
+    loss_pallas = run_cut(activations, embeddings, use_pallas=True)
+    np.testing.assert_allclose(loss_pure_jax, loss_pallas, atol=1e-6, rtol=1e-6)
+
+    # Backward comparison
+    grad_pure_fn = jax.jit(
+        jax.grad(lambda a, e: run_cut(a, e, False), argnums=(0, 1))
+    )
+    grad_pallas_fn = jax.jit(
+        jax.grad(lambda a, e: run_cut(a, e, True), argnums=(0, 1))
+    )
+
+    g_act_pure, g_emb_pure = grad_pure_fn(activations, embeddings)
+    g_act_pallas, g_emb_pallas = grad_pallas_fn(activations, embeddings)
+
+    np.testing.assert_allclose(g_act_pure, g_act_pallas, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_emb_pure, g_emb_pallas, atol=1e-5, rtol=1e-5)
 
   def test_cut_bce_metrics(self):
     if jax.devices()[0].platform != 'tpu':
@@ -621,18 +870,159 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
       config = mock_fn.call_args[0][0]
       self.assertEqual(config.block_v, 200)
 
-  def test_cut_bce_backward_not_implemented(self):
-    activations = jnp.ones((2, 64, 32))
-    embeddings = jnp.ones((128, 32))
-    targets = jnp.zeros((2, 64, 2), dtype=jnp.int32)
-
-    def run_cut(act, emb):
-      return binary_cross_entropy_ops.cut_binary_cross_entropy(
-          act, emb, targets, block_v=128
+  def test_pallas_vmem_budget(self):
+    budget = binary_cross_entropy_ops._pallas_vmem_budget()
+    if any(d.platform == 'tpu' for d in jax.devices()):
+      expected = max(
+          16 * _BYTES_IN_MB,
+          pltpu.get_tpu_info().vmem_capacity_bytes - 16 * _BYTES_IN_MB,
       )
+      self.assertEqual(budget, expected)
+    else:
+      self.assertEqual(budget, 16 * _BYTES_IN_MB)
 
+  def test_pallas_sublane(self):
+    sublane = binary_cross_entropy_ops._pallas_sublane()
+    if any(d.platform == 'tpu' for d in jax.devices()):
+      self.assertEqual(sublane, pltpu.get_tpu_info().num_sublanes)
+    else:
+      self.assertEqual(sublane, 8)
+
+  def test_vocab_bytes_per_block_v_grows_with_hidden(self):
+    small = binary_cross_entropy_ops._vocab_bytes_per_block_v(128, 128)
+    large = binary_cross_entropy_ops._vocab_bytes_per_block_v(512, 128)
+    self.assertGreater(large, small)
+
+  def test_max_safe_block_v_is_mxu_aligned(self):
+    mxu = binary_cross_entropy_ops._get_mxu_size()
+    for vmem_mb in (16, 48, 112):
+      val = binary_cross_entropy_ops._max_safe_block_v(
+          vmem_mb * _BYTES_IN_MB, 256
+      )
+      self.assertEqual(val % mxu, 0)
+
+  def test_max_safe_block_v_scales_with_vmem(self):
+    small_vmem = binary_cross_entropy_ops._max_safe_block_v(
+        32 * _BYTES_IN_MB, 256
+    )
+    medium_vmem = binary_cross_entropy_ops._max_safe_block_v(
+        48 * _BYTES_IN_MB, 256
+    )
+    large_vmem = binary_cross_entropy_ops._max_safe_block_v(
+        64 * _BYTES_IN_MB, 256
+    )
+    xlarge_vmem = binary_cross_entropy_ops._max_safe_block_v(
+        128 * _BYTES_IN_MB, 256
+    )
+    # Crossing 32 MB steps the share up from _SMALL_VMEM_SHARE (0.3) to
+    # _VOCAB_VMEM_SHARE (0.5), so a 1.5x VMEM increase (32 -> 48 MB) more than
+    # doubles the safe block_v.
+    self.assertGreater(medium_vmem, 2 * small_vmem)
+    self.assertGreater(large_vmem, medium_vmem)
+    self.assertGreater(xlarge_vmem, large_vmem)
+
+  def test_max_safe_block_v_shrinks_as_hidden_grows(self):
+    narrow = binary_cross_entropy_ops._max_safe_block_v(112 * _BYTES_IN_MB, 256)
+    wide = binary_cross_entropy_ops._max_safe_block_v(112 * _BYTES_IN_MB, 2048)
+    self.assertGreater(narrow, wide)
+
+  def test_max_safe_block_v_floors_at_one_mxu_tile(self):
+    mxu = binary_cross_entropy_ops._get_mxu_size()
+    val = binary_cross_entropy_ops._max_safe_block_v(_BYTES_IN_MB, 8192)
+    self.assertEqual(val, mxu)
+
+  def test_max_safe_chunk_n_is_lane_aligned(self):
+    lane = binary_cross_entropy_ops._pallas_lane()
+    val = binary_cross_entropy_ops._max_safe_chunk_n(
+        112 * _BYTES_IN_MB, 128, 4096
+    )
+    self.assertEqual(val % lane, 0)
+
+  def test_max_safe_chunk_n_scales_with_vmem(self):
+    small_vmem = binary_cross_entropy_ops._max_safe_chunk_n(
+        32 * _BYTES_IN_MB, 128, 1024
+    )
+    medium_vmem = binary_cross_entropy_ops._max_safe_chunk_n(
+        48 * _BYTES_IN_MB, 128, 1024
+    )
+    large_vmem = binary_cross_entropy_ops._max_safe_chunk_n(
+        64 * _BYTES_IN_MB, 128, 1024
+    )
+    xlarge_vmem = binary_cross_entropy_ops._max_safe_chunk_n(
+        128 * _BYTES_IN_MB, 128, 1024
+    )
+    # Crossing 32 MB steps the share up from _SMALL_VMEM_SHARE (0.3) to
+    # _TARGET_RATIO (0.8), so a 1.5x VMEM increase (32 -> 48 MB) more than
+    # doubles the safe chunk_n.
+    self.assertGreater(medium_vmem, 2 * small_vmem)
+    self.assertGreater(large_vmem, medium_vmem)
+    self.assertGreater(xlarge_vmem, large_vmem)
+
+  def test_max_safe_chunk_n_shrinks_as_block_v_grows(self):
+    small_vocab = binary_cross_entropy_ops._max_safe_chunk_n(
+        112 * _BYTES_IN_MB, 128, 1024
+    )
+    large_vocab = binary_cross_entropy_ops._max_safe_chunk_n(
+        112 * _BYTES_IN_MB, 128, 8192
+    )
+    self.assertGreater(small_vocab, large_vocab)
+
+  def test_max_safe_chunk_n_floors_at_min_chunk_tiles(self):
+    lane = binary_cross_entropy_ops._pallas_lane()
+    # A vocabulary block large enough to exhaust the budget on its own.
+    val = binary_cross_entropy_ops._max_safe_chunk_n(_BYTES_IN_MB, 1024, 65536)
+    self.assertEqual(val, binary_cross_entropy_ops._MIN_CHUNK_TILES * lane)
+
+  def test_balanced_chunk_n_avoids_padding_waste(self):
+    # The regression case: running at the 48768 ceiling would process 97536
+    # rows for 65536 tokens. Balancing splits it into two exact halves.
+    self.assertEqual(
+        binary_cross_entropy_ops._balanced_chunk_n(65536, 48768), 32768
+    )
+
+  def test_balanced_chunk_n_never_exceeds_ceiling(self):
+    for n in (1000, 65536, 100000, 524288):
+      for ceiling in (4096, 32768, 48768):
+        chunk = binary_cross_entropy_ops._balanced_chunk_n(n, ceiling)
+        self.assertLessEqual(chunk, ceiling)
+
+  def test_balanced_chunk_n_still_covers_all_tokens(self):
+    for n in (1000, 65536, 100000, 524288):
+      for ceiling in (4096, 32768, 48768):
+        chunk = binary_cross_entropy_ops._balanced_chunk_n(n, ceiling)
+        n_chunks = (n + chunk - 1) // chunk
+        self.assertGreaterEqual(n_chunks * chunk, n)
+
+  def test_balanced_chunk_n_uses_no_more_chunks_than_ceiling(self):
+    # Balancing must not increase the number of kernel invocations.
+    for n in (65536, 100000, 524288):
+      for ceiling in (4096, 32768, 48768):
+        chunk = binary_cross_entropy_ops._balanced_chunk_n(n, ceiling)
+        self.assertEqual((n + chunk - 1) // chunk, (n + ceiling - 1) // ceiling)
+
+  def test_balanced_chunk_n_is_lane_aligned(self):
+    lane = binary_cross_entropy_ops._pallas_lane()
+    chunk = binary_cross_entropy_ops._balanced_chunk_n(100000, 48768)
+    self.assertEqual(chunk % lane, 0)
+
+  def test_pallas_interpret(self):
+    is_interpret = binary_cross_entropy_ops._pallas_interpret()
+    has_tpu = any(d.platform == 'tpu' for d in jax.devices())
+    self.assertEqual(is_interpret, not has_tpu)
+
+  def test_pallas_lane(self):
+    lane = binary_cross_entropy_ops._pallas_lane()
+    if any(d.platform == 'tpu' for d in jax.devices()):
+      self.assertEqual(lane, pltpu.get_tpu_info().num_lanes)
+    else:
+      self.assertEqual(lane, 128)
+
+  def test_check_vocab_replicated_in_d(self):
     with self.assertRaises(NotImplementedError):
-      jax.grad(run_cut, argnums=(0, 1))(activations, embeddings)
+      binary_cross_entropy_ops._check_vocab_replicated_in_d(
+          P('devices', 'devices')
+      )
+    binary_cross_entropy_ops._check_vocab_replicated_in_d(P('devices'))
 
 
 if __name__ == '__main__':
