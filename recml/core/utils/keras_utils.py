@@ -13,7 +13,7 @@
 # limitations under the License.
 """Utilities for training Keras models on Jax backend."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Container, Mapping, Sequence
 import dataclasses
 import datetime
 import enum
@@ -37,6 +37,7 @@ CONFIG_CHECKPOINT_KEY = "config"
 FORMAT_VERSION_KEY = "format_version"
 NON_TRAINABLE_PATHS_KEY = "non_trainable_paths"
 OPTIMIZER_PATHS_KEY = "optimizer_paths"
+SHARED_VARIABLE_MAP_KEY = "shared_variable_map"
 ORBAX_CHECKPOINT_DEFAULT_KEY = "default"
 
 
@@ -85,6 +86,86 @@ def _variables_to_path_dict(
         f"model). Duplicates: {duplicates}"
     )
   return var_dict
+
+
+def extract_shared_variable_map(model: keras.Model) -> dict[str, str]:
+  """Extracts mapping of shared variables across the model layer tree.
+
+  When multiple layers in a model reference the same `keras.Variable` instance,
+  Keras's `model.trainable_variables` assigns the variable a single canonical
+  `.path` corresponding to the first layer that tracked it.
+
+  This function traverses the full layer hierarchy to discover alternative
+  logical paths referencing those shared variables and maps them to their
+  canonical path.
+
+  An alias path is built as `{sharing_layer_path}/{var.name}`. Layer names in
+  the path include Keras uniquifying suffixes (e.g. `dense_1`); variable names
+  are never uniquified by Keras, so `var.name` is the name the variable was
+  created with.
+
+  Supported scope:
+    Only layer-level sharing is supported: a layer instance is reused in
+    several places. The variable is created inside the shared layer, so its
+    name is the same under every parent, and the alias matches the path an
+    unshared model would use, e.g.
+      `{"model/surface_b/text_emb/embeddings":
+        "model/surface_a/text_emb/embeddings"}`.
+
+  Caveat:
+    Variable-level sharing is NOT supported. This is when a layer stores
+    another layer's variable as an attribute under its own name, e.g.
+    `self.token_table = other_layer.embeddings`. The variable is still
+    recorded here, but its alias uses the variable's own name
+    (`model/tower/embeddings`), not the attribute name (`token_table`). A
+    target model that owns the weight as `model/tower/token_table` will not
+    match the alias, and restore fails with a missing-path error. `prefix_map`
+    does not help, since it keeps variable names unchanged; such models need an
+    explicit per-variable transform.
+
+  Args:
+    model: The Keras model instance.
+
+  Returns:
+    A dictionary mapping shared_path -> canonical_path (e.g.
+    `{"model/search_surface/text_emb/embeddings":
+    "model/chrome_surface/text_emb/embeddings"}`).
+
+  Raises:
+    ValueError: If two different shared variables produce the same alias path,
+      e.g. a layer that stores the `kernel` of two other layers.
+  """
+  shared_var_map = {}
+
+  def _traverse(layer: keras.layers.Layer, prefix: str):
+    # Walk tracked child layers
+    for child in getattr(layer, "_layers", []):
+      # child.name includes any uniquifying suffix (e.g. 'dense_1') assigned
+      # during layer construction.
+      child_prefix = f"{prefix}/{child.name}" if prefix else child.name
+      _traverse(child, child_prefix)
+
+    # Check variables directly attached to this layer.
+    own_vars = getattr(layer, "_trainable_variables", []) + getattr(
+        layer, "_non_trainable_variables", []
+    )
+    for var in own_vars:
+      # var.name is identical across both paths since it is the same Variable.
+      logical_path = f"{prefix}/{var.name}" if prefix else var.name
+      if logical_path == var.path:
+        continue
+      existing = shared_var_map.get(logical_path)
+      if existing is not None and existing != var.path:
+        raise ValueError(
+            f"Shared variables {existing} and {var.path} both map to alias "
+            f"path {logical_path}. This happens when a layer stores several "
+            "shared variables with the same name as attributes; share whole "
+            "layers instead."
+        )
+      shared_var_map[logical_path] = var.path
+
+  _traverse(model, model.name or "")
+  return shared_var_map
 
 
 def _to_shape_dtype_struct(x: keras.Variable) -> jax.ShapeDtypeStruct:
@@ -253,6 +334,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
             FORMAT_VERSION_KEY,
             NON_TRAINABLE_PATHS_KEY,
             OPTIMIZER_PATHS_KEY,
+            SHARED_VARIABLE_MAP_KEY,
         ),
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=save_interval_epochs,
@@ -305,8 +387,11 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
         "paths": [v.path for v in model.non_trainable_variables]
     }
     optimizer_paths = {"paths": [v.path for v in model.optimizer.variables]}
+    shared_var_map = extract_shared_variable_map(model)
+    shared_variable_map = {SHARED_VARIABLE_MAP_KEY: shared_var_map}
     logging.info("SAVED non_trainable_paths: %s", non_trainable_paths)
     logging.info("SAVED optimizer_paths: %s", optimizer_paths)
+    logging.info("SAVED shared_variable_map: %s", shared_variable_map)
 
     logging.info("Saving checkpoint for epoch %s...", epoch)
     self.save(
@@ -317,6 +402,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
             FORMAT_VERSION_KEY: ocp.args.JsonSave({"version": 3}),
             NON_TRAINABLE_PATHS_KEY: ocp.args.JsonSave(non_trainable_paths),
             OPTIMIZER_PATHS_KEY: ocp.args.JsonSave(optimizer_paths),
+            SHARED_VARIABLE_MAP_KEY: ocp.args.JsonSave(shared_variable_map),
         }),
         metrics=logs,
     )
@@ -480,8 +566,15 @@ def _detect_checkpoint_version(checkpoint_path: str) -> CheckpointVersion:
 
   Detection order and discriminator criteria:
   - V1 checkpoints use the legacy item directory layout ('default/').
-  - V3 checkpoints contain an explicit 'format_version' item with {"version": 3}.
+  - V3 checkpoints contain an explicit 'format_version' item with
+    {"version": 3}.
   - V2 checkpoints contain 'state/' without the V3 'format_version' marker.
+
+  Args:
+    checkpoint_path: Path to the checkpoint directory.
+
+  Returns:
+    The detected CheckpointVersion enum value.
   """
   # V1 uses the legacy 'default' directory layout.
   if _is_v1_checkpoint_path(checkpoint_path):
@@ -489,7 +582,8 @@ def _detect_checkpoint_version(checkpoint_path: str) -> CheckpointVersion:
   # V3 checkpoints are explicitly tagged with format_version.
   if _is_v3_checkpoint_path(checkpoint_path):
     return CheckpointVersion.V3
-  # V2 checkpoints have a 'state' directory without the V3 format_version marker.
+  # V2 checkpoints have a 'state' directory without the V3 format_version
+  # marker.
   if gfile.Exists(os.path.join(checkpoint_path, STATE_CHECKPOINT_KEY)):
     return CheckpointVersion.V2
   raise ValueError(f"Unknown checkpoint format at {checkpoint_path}")
@@ -507,9 +601,16 @@ def _validate_v3_checkpoint(
 ) -> Any:
   """Validates that the V3 checkpoint is healthy and returns its state metadata.
 
-  A healthy V3 checkpoint must contain the state directory and companion path
-  metadata files on disk, and its state metadata must contain all three keys
+  A healthy V3 checkpoint must contain the state directory and its companion
+  metadata items on disk (non_trainable_paths, optimizer_paths, and
+  shared_variable_map), and its state metadata must contain all three keys
   (trainable_variables, non_trainable_variables, and optimizer_variables).
+
+  `shared_variable_map` is required even for models without shared variables,
+  where it is an empty map. Without it, a restore could not resolve shared
+  variables referenced by an alias path, so a checkpoint that lacks it is
+  treated as incomplete rather than silently restored without alias
+  resolution.
 
   Args:
     checkpoint_path: Path to the checkpoint directory.
@@ -527,6 +628,7 @@ def _validate_v3_checkpoint(
       STATE_CHECKPOINT_KEY,
       NON_TRAINABLE_PATHS_KEY,
       OPTIMIZER_PATHS_KEY,
+      SHARED_VARIABLE_MAP_KEY,
   )
   missing_items = [f for f in required_items if not (root / f).exists()]
   if missing_items:
@@ -556,12 +658,131 @@ def _validate_v3_checkpoint(
   return saved_state_metadata
 
 
+def _find_stored_path(
+    path: str,
+    stored_paths: Container[str],
+    shared_var_map: Mapping[str, str],
+) -> str | None:
+  """Returns the path under which `path`'s value is stored, or None.
+
+  A variable is stored under its own path, unless it is a shared variable
+  reached through an alias, in which case it is stored under the canonical path
+  recorded in `shared_var_map`. A direct match takes precedence, so a real
+  variable is never shadowed by an alias that happens to share its path.
+
+  Args:
+    path: A variable path, possibly an alias of a shared variable.
+    stored_paths: The paths stored in the checkpoint.
+    shared_var_map: Map from alias path to canonical path.
+
+  Returns:
+    The stored path holding the value, or None if there is none.
+  """
+  if path in stored_paths:
+    return path
+  canonical = shared_var_map.get(path)
+  if canonical is not None and canonical in stored_paths:
+    return canonical
+  return None
+
+
+def _resolve_transform_source(
+    transform: Any,
+    key: str,
+    stored_paths: Container[str],
+    shared_var_map: Mapping[str, str],
+) -> Any:
+  """Rewrites a transform's source key to its stored path if it names an alias.
+
+  In V3 checkpoints, shared weights are deduplicated so only the canonical path
+  is physically stored on disk (e.g. `surface_b`), while aliases are
+  recorded in `shared_var_map` (e.g. `surface_a -> surface_b`).
+
+  If a caller supplies a `Transform(original_key="surface_a")` to restore a
+  renamed variable (e.g. `surface_a_1`), Orbax cannot find `surface_a` on disk.
+  This function resolves `original_key` to its physical storage path
+  (`surface_b`) so Orbax can load the tensor.
+
+  Example:
+    If `surface_a` was deduplicated to `surface_b` in the checkpoint:
+      `shared_var_map`: `{"surface_a/kernel": "surface_b/kernel"}`
+      `stored_paths`: `{"surface_b/kernel"}`
+
+      # User maps renamed variable surface_a_1 -> surface_a:
+      resolved = _resolve_transform_source(
+          transform=Transform(
+              original_key="trainable_variables/surface_a/kernel"
+          ),
+          key="trainable_variables",
+          stored_paths=stored_paths,
+          shared_var_map=shared_var_map,
+      )
+      # rewritten to: original_key="trainable_variables/surface_b/kernel"
+
+  Args:
+    transform: A user-supplied transform for one target variable.
+    key: The state key, e.g. `trainable_variables`. `original_key` may or may
+      not carry it as a `{key}/` prefix.
+    stored_paths: The paths stored in the checkpoint under `key`.
+    shared_var_map: Map from alias path to canonical path.
+
+  Returns:
+    The transform, with `original_key` rewritten if it named an alias.
+  """
+  if not isinstance(transform, ocp.transform_utils.Transform) or not isinstance(
+      transform.original_key, str
+  ):
+    return transform
+  prefix = f"{key}/"
+  has_prefix = transform.original_key.startswith(prefix)
+  source = transform.original_key.removeprefix(prefix)
+  stored = _find_stored_path(source, stored_paths, shared_var_map)
+  if stored is None or stored == source:
+    # Not an alias. Leave it for Orbax to resolve, or to reject if missing.
+    return transform
+  logging.info(
+      "Resolved transform source %s to stored path %s via shared variable map",
+      source,
+      stored,
+  )
+  return dataclasses.replace(
+      transform, original_key=f"{prefix}{stored}" if has_prefix else stored
+  )
+
+
+def _map_prefix(
+    path: str, prefix_map: Mapping[str, str]
+) -> tuple[str, str] | None:
+  """Rewrites `path` using the longest matching prefix in `prefix_map`.
+
+  Prefixes match whole `/`-separated segments only, so `model/tower` matches
+  `model/tower/dense/kernel` but not `model/tower_2/dense/kernel`.
+
+  Args:
+    path: A target variable path.
+    prefix_map: Map from target path prefix to source path prefix.
+
+  Returns:
+    A tuple of (matched target prefix, source path), or None if no prefix
+    matches.
+  """
+  best = None
+  for target_prefix in prefix_map:
+    if path == target_prefix or path.startswith(f"{target_prefix}/"):
+      if best is None or len(target_prefix) > len(best):
+        best = target_prefix
+  if best is None:
+    return None
+  return best, prefix_map[best] + path[len(best) :]
+
+
 def _prepare_v3_restore(
     checkpoint_path: str,
     abstract_state: Mapping[str, Any],
     model: keras.Model | None = None,
     restore_optimizer_vars: bool = False,
     transforms: Mapping[str, Any] | None = None,
+    prefix_map: Mapping[str, str] | None = None,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
   """Prepares the abstract state and constructs transforms for V3 restore.
 
@@ -581,6 +802,8 @@ def _prepare_v3_restore(
       variables mapping.
     restore_optimizer_vars: Whether to prepare optimizer variables.
     transforms: An optional mapping of custom transforms for variable mapping.
+    prefix_map: An optional map from target path prefix to source path prefix
+      for trainable variables. See `restore_partial_checkpoint`.
 
   Returns:
     A tuple of (filtered_abstract_state, state_transforms) to be passed to
@@ -589,7 +812,18 @@ def _prepare_v3_restore(
   # Validate that underlying checkpoint is healthy and retrieve state metadata.
   saved_state_metadata = _validate_v3_checkpoint(checkpoint_path)
 
-  # Load index path metadata for non-trainable and optimizer variables if needed.
+  # The shared variable map is a required V3 item, checked above.
+  map_path = epath.Path(checkpoint_path) / SHARED_VARIABLE_MAP_KEY
+  checkpointer = ocp.Checkpointer(ocp.handlers.JsonCheckpointHandler())
+  try:
+    shared_var_map = checkpointer.restore(
+        os.fspath(map_path), args=ocp.args.JsonRestore()
+    )[SHARED_VARIABLE_MAP_KEY]
+  finally:
+    checkpointer.close()
+
+  # Load index path metadata for non-trainable and optimizer variables if
+  # needed.
   non_trainable_paths = None
   if model is not None and abstract_state.get(NON_TRAINABLE_VARIABLES_KEY):
     nt_path = epath.Path(checkpoint_path) / NON_TRAINABLE_PATHS_KEY
@@ -673,7 +907,10 @@ def _prepare_v3_restore(
               i,
           )
     else:
-      # Strict matching for trainable variables unless explicit transforms provided
+      # Trainable variables are matched by path. Each target is restored from
+      # the source a user transform names, else from its prefix-mapped path,
+      # else from its own path; any of these may be an alias of a shared
+      # variable, resolved by _find_stored_path.
       missing_paths = []
       key_transforms = {}
       if transforms:
@@ -682,15 +919,65 @@ def _prepare_v3_restore(
             if key in transforms and isinstance(transforms[key], Mapping)
             else transforms
         )
+      stored_paths = saved_state_metadata[key]
+      normalized_prefix_map = {
+          t.rstrip("/"): s.rstrip("/") for t, s in (prefix_map or {}).items()
+      }
+      if "" in normalized_prefix_map:
+        raise ValueError("prefix_map keys must be non-empty path prefixes.")
+      unused_prefixes = set(normalized_prefix_map)
       for target_path, struct in abstract_state[key].items():
-        if target_path in saved_state_metadata[key]:
-          filtered_abstract_state[key][target_path] = struct
-        elif target_path in key_transforms:
-          filtered_abstract_state[key][target_path] = struct
-          state_transforms[key][target_path] = key_transforms[target_path]
+        mapped_source = None
+        prefix_match = _map_prefix(target_path, normalized_prefix_map)
+        if prefix_match is not None:
+          matched_prefix, mapped_source = prefix_match
+          unused_prefixes.discard(matched_prefix)
+        # Branch 1: Explicit user transform (remapping/surgery).
+        # Target and source paths must match exact model variable paths
+        # (including suffixes like `dense_1`). If `original_key` is an alias,
+        # it is resolved to its physical storage path.
+        if target_path in key_transforms:
+          transform = _resolve_transform_source(
+              key_transforms[target_path], key, stored_paths, shared_var_map
+          )
+        # Branch 2: Prefix mapping. The target is restored from the source path
+        # obtained by swapping its longest matching prefix; the source may be
+        # an alias of a shared variable.
+        elif mapped_source is not None:
+          stored = _find_stored_path(
+              mapped_source, stored_paths, shared_var_map
+          )
+          if stored is None:
+            missing_paths.append(f"{target_path} (from {mapped_source})")
+            continue
+          transform = (
+              None
+              if stored == target_path
+              else ocp.transform_utils.Transform(original_key=f"{key}/{stored}")
+          )
+        # Branch 3: Default 1-to-1 match.
+        # Resolves target_path if it is an alias, synthesizing a Transform to
+        # its canonical storage path.
         else:
-          missing_paths.append(target_path)
+          stored = _find_stored_path(target_path, stored_paths, shared_var_map)
+          if stored is None:
+            missing_paths.append(target_path)
+            continue
+          transform = (
+              None
+              if stored == target_path
+              else ocp.transform_utils.Transform(original_key=f"{key}/{stored}")
+          )
+        filtered_abstract_state[key][target_path] = struct
+        if transform is not None:
+          state_transforms[key][target_path] = transform
 
+      if unused_prefixes:
+        logging.warning(
+            "prefix_map entries matched no target variables for key %s: %s",
+            key,
+            sorted(unused_prefixes),
+        )
       if missing_paths:
         raise ValueError(
             f"Failed to restore variables for key {key}. "
@@ -965,8 +1252,20 @@ def restore_partial_checkpoint(
     partial_variables: Mapping[str, Any],
     epoch: int | None = None,
     transforms: Mapping[str, Any] | None = None,
+    prefix_map: Mapping[str, str] | None = None,
 ) -> Mapping[str, Any]:
   """Restores partial variables from an Orbax checkpoint.
+
+  Each target variable is restored from, in order of precedence:
+    1. The source named by its entry in `transforms`, if any.
+    2. The source obtained by rewriting its path with `prefix_map`, if a prefix
+       matches.
+    3. Its own path (default 1-to-1 match).
+  User-specified remappings (1 and 2) take precedence even if the target path
+  already exists in the checkpoint (e.g. initializing one surface from another
+  within the same model). Sources in all three cases may be aliases of shared
+  variables; they are resolved to their stored paths through the checkpoint's
+  shared variable map.
 
   Args:
       checkpoint_dir: The directory containing the Orbax checkpoint(s).
@@ -976,7 +1275,23 @@ def restore_partial_checkpoint(
       epoch: The epoch to restore. If None, latest is used.
       transforms: An optional mapping of custom transforms (e.g. mapping target
         variable paths to `ocp.transform_utils.Transform` objects) for explicit
-        variable re-mapping.
+        variable re-mapping. Keys and `original_key` values must be exact
+        variable paths, including Keras layer name suffixes (e.g. `dense_1`).
+        Prefer `prefix_map` or the default resolution unless you need
+        per-variable control.
+      prefix_map: An optional map from target path prefix to source path prefix
+        for subtree remapping, e.g. `{"model/target_tower": "model/src_tower"}`.
+        Paths omit the state key (e.g. `trainable_variables/`).
+        Rules:
+        - Depth matching: A prefix matches all variables at any depth beneath
+          it on whole path segments (`layer_a` matches `layer_a/var_a` and
+          `layer_a/layer_b/var_b`, but not `layer_a_2`).
+        - Overlapping prefixes: The longest (most specific) prefix wins,
+          allowing subtree overrides (`model/new/tower` overrides `model/new`).
+        - Subtree structure: The path remainder below the prefix is preserved,
+          so source and target subtrees must share identical structure.
+        Logs a warning if a prefix matches no target variables; raises if a
+        mapped source is missing; shape mismatches fail at restore.
 
   Returns:
       The restored state dictionary (containing Jax Arrays).
@@ -1019,6 +1334,7 @@ def restore_partial_checkpoint(
       model=None,
       restore_optimizer_vars=False,
       transforms=transforms,
+      prefix_map=prefix_map,
   )
 
   restored_state = _restore_state_pytree(
