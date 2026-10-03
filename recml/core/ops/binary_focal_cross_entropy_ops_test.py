@@ -962,6 +962,80 @@ class BinaryFocalCrossEntropyOpsTest(parameterized.TestCase):
     np.testing.assert_allclose(g_act_pure, g_act_pallas, atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(g_emb_pure, g_emb_pallas, atol=1e-5, rtol=1e-5)
 
+  @parameterized.named_parameters(
+      ('l8_pallas_gamma2', 8, True, 2.0, True),
+      ('l16_pallas_gamma2', 16, True, 2.0, True),
+      ('l32_pallas_gamma2', 32, True, 2.0, True),
+      ('l32_pure_jax_gamma2', 32, False, 2.0, True),
+      ('l32_pallas_gamma05', 32, True, 0.5, False),
+      ('l64_pallas_gamma2', 64, True, 2.0, True),
+      ('l64_pure_jax_gamma2', 64, False, 2.0, True),
+  )
+  def test_optimize_large_l_forward_backward_and_metrics(
+      self, num_labels, use_pallas, gamma, apply_class_balancing
+  ):
+    batch, seq_len, hidden_dim, vocab_size = 2, 32, 64, 512
+    block_v = 128
+    key_act, key_emb, key_tgt, key_pad = jax.random.split(
+        jax.random.PRNGKey(42 + num_labels), 4
+    )
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    raw_targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), 0, 64
+    )
+    pad_mask = jax.random.bernoulli(key_pad, 0.2, raw_targets.shape)
+    targets = jnp.where(pad_mask, -1, raw_targets)
+
+    res_ref = binary_focal_cross_entropy_ops.cut_binary_focal_cross_entropy(
+        activations,
+        embeddings,
+        targets,
+        block_v=block_v,
+        gamma=gamma,
+        alpha=0.25,
+        apply_class_balancing=apply_class_balancing,
+        return_metrics=True,
+        use_pallas=use_pallas,
+        optimize_large_l=False,
+    )
+    res_opt = binary_focal_cross_entropy_ops.cut_binary_focal_cross_entropy(
+        activations,
+        embeddings,
+        targets,
+        block_v=block_v,
+        gamma=gamma,
+        alpha=0.25,
+        apply_class_balancing=apply_class_balancing,
+        return_metrics=True,
+        use_pallas=use_pallas,
+        optimize_large_l=True,
+    )
+    for val_opt, val_ref in zip(res_opt, res_ref):
+      np.testing.assert_allclose(val_opt, val_ref, atol=1e-5, rtol=1e-5)
+
+    def loss_fn(act, emb, opt):
+      return binary_focal_cross_entropy_ops.cut_binary_focal_cross_entropy(
+          act,
+          emb,
+          targets,
+          block_v=block_v,
+          gamma=gamma,
+          alpha=0.25,
+          apply_class_balancing=apply_class_balancing,
+          use_pallas=use_pallas,
+          optimize_large_l=opt,
+      )
+
+    g_act_ref, g_emb_ref = jax.jit(
+        jax.grad(lambda a, e: loss_fn(a, e, False), argnums=(0, 1))
+    )(activations, embeddings)
+    g_act_opt, g_emb_opt = jax.jit(
+        jax.grad(lambda a, e: loss_fn(a, e, True), argnums=(0, 1))
+    )(activations, embeddings)
+    np.testing.assert_allclose(g_act_opt, g_act_ref, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(g_emb_opt, g_emb_ref, atol=1e-4, rtol=1e-4)
+
 
 if __name__ == '__main__':
   absltest.main()

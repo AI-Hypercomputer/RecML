@@ -54,6 +54,12 @@ _pallas_vmem_budget = (
 _replicate_hidden_dim = (
     bce_ops._replicate_hidden_dim  # pylint: disable=protected-access
 )
+_apply_bwd_pos_correction = (
+    bce_ops._apply_bwd_pos_correction  # pylint: disable=protected-access
+)
+_fwd_pos_correction = (
+    bce_ops._fwd_pos_correction  # pylint: disable=protected-access
+)
 _BLOCK_N = bce_ops._BLOCK_N  # pylint: disable=protected-access
 
 
@@ -77,6 +83,20 @@ class FocalBCEConfig(bce_ops.BCEConfig):
   gamma: float = 2.0
   alpha: float = 0.25
   apply_class_balancing: bool = False
+
+
+def _focal_bce_loss_diff(
+    config: FocalBCEConfig, logits: jt.Float[jt.Array, "N L"]
+) -> jt.Float[jt.Array, "N L"]:
+  """Computes FocalBCE(logits, y=1) - FocalBCE(logits, y=0)."""
+  probs = jax.nn.sigmoid(logits)
+  loss_zero = jnp.maximum(logits, 0.0) + jnp.log1p(jnp.exp(-jnp.abs(logits)))
+  loss_pos = jnp.power(1.0 - probs, config.gamma) * (loss_zero - logits)
+  loss_neg = jnp.power(probs, config.gamma) * loss_zero
+  if config.apply_class_balancing:
+    loss_pos = config.alpha * loss_pos
+    loss_neg = (1.0 - config.alpha) * loss_neg
+  return loss_pos - loss_neg
 
 
 def _focal_bce_fwd_chunk(
@@ -166,6 +186,7 @@ def _focal_bce_fwd_local(
 
   activations_2d = jnp.reshape(activations, (n, hidden))
   targets_2d = jnp.reshape(targets, (n, -1))
+  scan_targets = targets_2d[:, :0] if config.optimize_large_l else targets_2d
 
   if config.compute_metrics:
 
@@ -175,7 +196,7 @@ def _focal_bce_fwd_local(
     ) -> tuple[tuple[jt.Float[jt.Array, "N"], ...], None]:
       loss_acc, tp_acc, fp_acc, fn_acc, tn_acc = carry
       loss_sum, logits, targets_chunk, valid_mask = _focal_bce_fwd_chunk(
-          config, activations_2d, embeddings, targets_2d, j, block_v, vocab
+          config, activations_2d, embeddings, scan_targets, j, block_v, vocab
       )
 
       predictions_chunk = (logits > 0.0) & valid_mask[None, :]
@@ -209,6 +230,17 @@ def _focal_bce_fwd_local(
     (loss_final, tp_final, fp_final, fn_final, tn_final), _ = jax.lax.scan(
         v_body, init, jnp.arange(v_blocks)
     )
+    if config.optimize_large_l:
+      delta_loss, tp_final, num_pos = _fwd_pos_correction(
+          activations_2d,
+          embeddings,
+          targets_2d,
+          functools.partial(_focal_bce_loss_diff, config),
+      )
+      loss_final = loss_final + delta_loss
+      fp_final = fp_final - tp_final
+      fn_final = num_pos - tp_final
+      tn_final = tn_final - fn_final
     return (
         jnp.reshape(loss_final, (batch, seq_len)),
         jnp.reshape(tp_final, (batch, seq_len)),
@@ -223,12 +255,22 @@ def _focal_bce_fwd_local(
         j: jt.Int[jt.Array, ""],
     ) -> tuple[jt.Float[jt.Array, "N"], None]:
       loss_sum, _, _, _ = _focal_bce_fwd_chunk(
-          config, activations_2d, embeddings, targets_2d, j, block_v, vocab
+          config, activations_2d, embeddings, scan_targets, j, block_v, vocab
       )
       return loss_acc + loss_sum, None
 
     init = jnp.zeros((n,), dtype=jnp.float32)
     loss_final, _ = jax.lax.scan(v_body_no_metrics, init, jnp.arange(v_blocks))
+    if config.optimize_large_l:
+      loss_final = (
+          loss_final
+          + _fwd_pos_correction(
+              activations_2d,
+              embeddings,
+              targets_2d,
+              functools.partial(_focal_bce_loss_diff, config),
+          )[0]
+      )
     return jnp.reshape(loss_final, (batch, seq_len))
 
 
@@ -376,6 +418,7 @@ def cut_binary_focal_cross_entropy(
     act_spec: jax.sharding.PartitionSpec | None = None,
     emb_spec: jax.sharding.PartitionSpec | None = None,
     use_pallas: bool = True,
+    optimize_large_l: bool = False,
 ) -> (
     jt.Float[jt.Array, ""]
     | tuple[jt.Float[jt.Array, ""], jt.Float[jt.Array, "... B N"]]
@@ -406,8 +449,8 @@ def cut_binary_focal_cross_entropy(
       D]`` with a single extra leading axis.
     embeddings: Output embedding / unembedding weights of shape ``[V, D]``.
     targets: Target token ids of shape ``[B, N, L]``, i.e. the ``L`` positive
-      labels of each sequence position. For 4D activations, either a matching
-      4D ``[X, B, N, L]`` array or a 3D ``[B, N, L]`` array shared across the
+      labels of each sequence position. For 4D activations, either a matching 4D
+      ``[X, B, N, L]`` array or a 3D ``[B, N, L]`` array shared across the
       leading axis.
     weights: Per-sequence-position loss weights, typically a padding/validity
       mask. Must have exactly the shape of the per-position losses, i.e.
@@ -427,6 +470,8 @@ def cut_binary_focal_cross_entropy(
     emb_spec: Optional partition spec for embeddings.
     use_pallas: If True, use Pallas kernels; if False, use pure JAX
       implementation.
+    optimize_large_l: If True, use the target-free vocabulary pass + sparse
+      positive-target correction. Defaults to False.
 
   Returns:
     Scalar loss, optionally paired with per-target losses and/or metrics.
@@ -491,6 +536,7 @@ def cut_binary_focal_cross_entropy(
       emb_spec=emb_spec,
       use_pallas=use_pallas,
       global_vocab=vocab_size,
+      optimize_large_l=optimize_large_l,
   )
 
   res = _cut_binary_focal_cross_entropy(
@@ -585,8 +631,6 @@ def _focal_bce_bwd_kernel(
 
   def loop_body(n_idx, _):
     act = act_ref[pl.ds(n_idx * block_n, block_n), :]
-    tgt_val = tgt_ref[:labels, pl.ds(n_idx * block_n, block_n)]
-    # (labels, block_n)
     dloss_val = dloss_ref[0, pl.ds(n_idx * block_n, block_n)]  # (block_n,)
 
     # Compute logits: (block_n, block_v)
@@ -600,14 +644,18 @@ def _focal_bce_bwd_kernel(
     probs = jax.nn.sigmoid(logits)
 
     # Target matching across labels: (block_n, block_v)
-    y_true_chunk = jnp.any(tgt_val[:, :, None] == chunk_indices_local, axis=0)
+    if labels > 0:
+      tgt_val = tgt_ref[:labels, pl.ds(n_idx * block_n, block_n)]
+      y_true_chunk = jnp.any(tgt_val[:, :, None] == chunk_indices_local, axis=0)
+      y_true_float = y_true_chunk.astype(probs.dtype)
+    else:
+      y_true_float = 0.0
 
     # Valid batch mask for this loop step: (block_n, 1)
     batch_indices_local = n_idx * block_n + local_n_iota
     valid_batch_mask = batch_indices_local < n_real
 
     # Gradients w.r.t logits, masked
-    y_true_float = y_true_chunk.astype(probs.dtype)
     g_bce = probs - y_true_float
     abs_g = jnp.abs(g_bce)
     p_t = 1.0 - abs_g
@@ -671,6 +719,36 @@ def _focal_bce_bwd_kernel(
 
   # Store accumulated results to HBM
   d_emb_ref[...] = d_emb_scratch[...]
+
+
+def _focal_bce_grad_diff(
+    config: FocalBCEConfig, logits: jt.Float[jt.Array, "N L"]
+) -> jt.Float[jt.Array, "N L"]:
+  """Computes g_focal(logits, y=1) - g_focal(logits, y=0)."""
+  probs = jax.nn.sigmoid(logits)
+  loss_zero = jnp.maximum(logits, 0.0) + jnp.log1p(jnp.exp(-jnp.abs(logits)))
+  grads = []
+  for y in (1.0, 0.0):
+    g_bce = probs - y
+    abs_g = jnp.abs(g_bce)
+    focal_factor = jnp.power(abs_g, config.gamma)
+    bce_loss = loss_zero - y * logits
+    if config.gamma >= 1.0:
+      g = g_bce * (
+          focal_factor
+          + config.gamma
+          * jnp.power(abs_g, config.gamma - 1.0)
+          * (1.0 - abs_g)
+          * bce_loss
+      )
+    elif config.gamma == 0.0:
+      g = g_bce
+    else:
+      g = focal_factor * (g_bce + config.gamma * (1.0 - y - probs) * bce_loss)
+    if config.apply_class_balancing:
+      g = (y * (2.0 * config.alpha - 1.0) + (1.0 - config.alpha)) * g
+    grads.append(g)
+  return grads[0] - grads[1]
 
 
 def _focal_bce_bwd_pallas_chunked_n(
@@ -765,7 +843,7 @@ def _focal_bce_bwd_pallas(
   n_blocks = (n + block_n - 1) // block_n
   v_blocks = (vocab + block_v - 1) // block_v
   vocab_padded = v_blocks * block_v
-  labels = targets.shape[-1]
+  labels = 0 if config.optimize_large_l else targets.shape[-1]
 
   # Rebase global target ids onto this shard's local rows here rather than
   # inside the kernel: under vocab sharding `vocab_offset` is a tracer, and a
@@ -782,14 +860,14 @@ def _focal_bce_bwd_pallas(
     )
     dloss_2d = jnp.pad(jnp.reshape(d_loss, (n, 1)), ((0, pad_len), (0, 0)))
     targets_2d = jnp.pad(
-        jnp.reshape(targets, (n, labels)),
+        jnp.reshape(targets[..., :labels], (n, labels)),
         ((0, pad_len), (0, 0)),
         constant_values=-1,
     )
   else:
     activations_2d = jnp.reshape(activations, (n, hidden))
     dloss_2d = jnp.reshape(d_loss, (n, 1))
-    targets_2d = jnp.reshape(targets, (n, labels))
+    targets_2d = jnp.reshape(targets[..., :labels], (n, labels))
   # Pad activations and embeddings to padded_d columns
   if padded_d > hidden:
     activations_padded = jnp.pad(
@@ -886,6 +964,19 @@ def _focal_bce_bwd_pallas(
 
   if padded_n > n:
     d_act_2d = d_act_2d[:n, :]
+
+  if config.optimize_large_l:
+    d_act_2d, d_emb = _apply_bwd_pos_correction(
+        d_act_2d,
+        d_emb,
+        activations_2d[:n],
+        embeddings,
+        jnp.reshape(targets, (n, -1)),
+        dloss_2d[:n],
+        1.0 / global_vocab,
+        functools.partial(_focal_bce_grad_diff, config),
+    )
+
   d_activations = jnp.reshape(d_act_2d, (batch, seq_len, hidden))
   return d_activations, d_emb
 
@@ -927,6 +1018,7 @@ def _focal_bce_bwd_pure_jax(
 
   # Chunked scan backward pass without tensor padding
   v_blocks = int(np.ceil(vocab / block_v))
+  scan_targets = targets_2d[:, :0] if config.optimize_large_l else targets_2d
 
   def scan_body(carry, j):
     d_act_acc, d_emb_acc = carry
@@ -946,9 +1038,9 @@ def _focal_bce_bwd_pure_jax(
     valid_mask = chunk_indices >= j * block_v
 
     targets_chunk = jnp.zeros((n, block_v), dtype=jnp.bool_)
-    rel_targets = targets_2d - (actual_start + vocab_offset)
+    rel_targets = scan_targets - (actual_start + vocab_offset)
     chunk_cols = jnp.arange(block_v)[None, :]
-    for l_idx in range(targets_2d.shape[-1]):
+    for l_idx in range(scan_targets.shape[-1]):
       targets_chunk = targets_chunk | (
           rel_targets[:, l_idx : l_idx + 1] == chunk_cols
       )
@@ -1009,6 +1101,18 @@ def _focal_bce_bwd_pure_jax(
   (d_act_final, d_embeddings), _ = jax.lax.scan(
       scan_body, init, jnp.arange(v_blocks)
   )
+
+  if config.optimize_large_l:
+    d_act_final, d_embeddings = _apply_bwd_pos_correction(
+        d_act_final,
+        d_embeddings,
+        activations_2d,
+        embeddings,
+        targets_2d - vocab_offset,
+        dloss_2d,
+        inv_vocab,
+        functools.partial(_focal_bce_grad_diff, config),
+    )
 
   d_activations = jnp.reshape(d_act_final, (batch, seq_len, hidden))
   return d_activations, d_embeddings
