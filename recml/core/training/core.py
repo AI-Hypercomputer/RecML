@@ -205,7 +205,7 @@ def get_iterators(
         f" but got {eval_datasets}. You cannot mix both."
     )
 
-  return train_dataset, eval_datasets  # pytype: disable=bad-return-type
+  return train_dataset, eval_datasets  # pyrefly: ignore[bad-return]
 
 
 def get_shape(

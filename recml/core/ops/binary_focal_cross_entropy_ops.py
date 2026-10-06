@@ -1187,7 +1187,7 @@ def _focal_bce_bwd_sharded(
   vocab_axis_name = emb_spec[0] if emb_spec else None
 
   dp_axes = []
-  for axis in local_act_spec:  # pyrefly: ignore[not-iterable]
+  for axis in local_act_spec:
     if axis is not None and axis != vocab_axis_name:
       dp_axes.append(axis)
 
@@ -1223,13 +1223,13 @@ def _focal_bce_bwd_sharded(
   if targets.ndim == replicated_activations.ndim:
     local_tgt_spec = local_act_spec
   else:
-    local_tgt_spec = jax.sharding.PartitionSpec(*local_act_spec[1:])  # pyrefly: ignore[unsupported-operation]
+    local_tgt_spec = jax.sharding.PartitionSpec(*local_act_spec[1:])
 
   d_act_replicated, d_emb = jax.shard_map(
       _bwd_local_with_reduction,
       mesh=mesh,
       in_specs=(
-          jax.sharding.PartitionSpec(*local_act_spec[:-1]),  # pyrefly: ignore[unsupported-operation]
+          jax.sharding.PartitionSpec(*local_act_spec[:-1]),
           local_act_spec,
           emb_spec,
           local_tgt_spec,

@@ -215,7 +215,7 @@ class CriteoFactory(recml.Factory[tf.data.Dataset]):
 
     label = np.random.randint(0, 2, size=(batch_size,))
 
-    dataset = tf.data.Dataset.from_tensors((data, label))  # pyrefly: ignore[bad-argument-type]
+    dataset = tf.data.Dataset.from_tensors((data, label))
     dataset = dataset.take(1).repeat()
     dataset = dataset.prefetch(buffer_size=2048)
     options = tf.data.Options()

@@ -160,7 +160,7 @@ def _apply_mask(
       q_sequence = jnp.broadcast_to(q_sequence, (k_slice.size, bq))
 
     assert q_sequence.shape == k_sequence.shape
-    computed_mask = mask_function(q_sequence, k_sequence)  # pytype: disable=wrong-arg-count
+    computed_mask = mask_function(q_sequence, k_sequence)
     if computed_mask.dtype != jnp.dtype(jnp.bool_):
       raise ValueError(
           "Mask function must return a boolean-valued array, but got:"
@@ -244,7 +244,7 @@ def _pointwise_splash_attention_fwd_kernel_impl(
         q_sequence_ref=q_sequence_ref,
         q_segment_ids_ref=q_segment_ids_ref,
         kv_segment_ids_ref=kv_segment_ids_ref,
-        k_slice=slice_k,  # pyrefly: ignore[bad-argument-type]
+        k_slice=slice_k,
         # When the iteration space is shrunk (for local attention for example),
         # the kv_index program_id does not correspond to the actual coordinates
         # of the KV data. Make sure to use the 'unshrunk' index (coming from the
@@ -479,7 +479,7 @@ def _pointwise_splash_attention_bwd_kernel_impl(
         q_sequence_ref,
         q_segment_ids_ref,
         kv_segment_ids_ref,
-        k_slice=slice_k,  # pyrefly: ignore[bad-argument-type]
+        k_slice=slice_k,
         k_offset=j * bkv + i * bkv_compute,
         bq=bq,
         k_in_lanes=False,

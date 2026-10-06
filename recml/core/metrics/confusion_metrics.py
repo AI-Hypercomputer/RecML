@@ -67,8 +67,8 @@ class ConfusionMetric(base_metrics.Metric):
         false_negatives=fn,
     )
 
-  def merge(self, other: Self) -> Self:  # pytype: disable=signature-mismatch
-    return type(self)(  # pytype: disable=not-instantiable
+  def merge(self, other: Self) -> Self:
+    return type(self)(
         true_positives=self.true_positives + other.true_positives,
         true_negatives=self.true_negatives + other.true_negatives,
         false_positives=self.false_positives + other.false_positives,
@@ -237,7 +237,7 @@ class AUCROC(AUCPR):
         self.false_positives, self.false_positives + self.true_negatives
     )
     # We negate the integral because the thresholds are in ascending order.
-    return -np.trapezoid(tp_rate, fp_rate)  # pyrefly: ignore[bad-return]
+    return -np.trapezoid(tp_rate, fp_rate)
 
 
 class PrecisionAtRecall(ConfusionMetric):

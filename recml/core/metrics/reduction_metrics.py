@@ -75,7 +75,7 @@ class Sum(ReductionMetric):
 
     return cls(total=total)
 
-  def merge(self, other: Self) -> Self:  # pytype: disable=signature-mismatch
+  def merge(self, other: Self) -> Self:
     return type(self)(total=self.total + other.total)
 
   def compute(self) -> base_metrics.Scalar:
@@ -111,7 +111,7 @@ class Mean(ReductionMetric):
 
     return cls(total=total, count=count)
 
-  def merge(self, other: Self) -> Self:  # pytype: disable=signature-mismatch
+  def merge(self, other: Self) -> Self:
     return type(self)(
         total=self.total + other.total,
         count=self.count + other.count,

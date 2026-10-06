@@ -31,7 +31,7 @@ Scalar = float | Sequence[float] | Mapping[str, float] | jax.Array | np.ndarray
 
 # TODO(b/387463777): Consider removing the dependency on CLU metrics longer term
 # since it's just an interface.
-@dataclass_transform(field_specifiers=(struct.field,))  # pytype: disable=not-supported-yet
+@dataclass_transform(field_specifiers=(struct.field,))
 class Metric(abc.ABC, clu_metrics.Metric, struct.PyTreeNode):
   """PyTree node representing the state of a metric.
 
@@ -63,7 +63,7 @@ class Metric(abc.ABC, clu_metrics.Metric, struct.PyTreeNode):
     raise NotImplementedError()
 
   @abc.abstractmethod
-  def merge(self, other: Self) -> Self:  # pytype: disable=signature-mismatch
+  def merge(self, other: Self) -> Self:
     """Merges two metrics.
 
     Args:
@@ -79,7 +79,7 @@ class Metric(abc.ABC, clu_metrics.Metric, struct.PyTreeNode):
     """
 
   @abc.abstractmethod
-  def compute(self) -> Scalar:  # pytype: disable=signature-mismatch
+  def compute(self) -> Scalar:  # pyrefly: ignore[bad-override]
     """Computes the value of the metric.
 
     NOTE: This method is almost always called on the host which means that it
