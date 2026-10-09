@@ -1210,6 +1210,30 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
         g_emb_forced, g_emb_clamped, atol=1e-5, rtol=1e-5
     )
 
+  def test_ghostfish_64mb_vmem_and_focal_tiles(self):
+    gf_budget = 48 * 1024 * 1024  # 64 MiB VMEM - 16 MiB reserve
+    bce_v = binary_cross_entropy_ops._max_safe_block_v(
+        gf_budget, padded_d=256, block_n=128
+    )
+    focal_v = binary_cross_entropy_ops._max_safe_block_v(
+        gf_budget,
+        padded_d=256,
+        block_n=128,
+        logit_vmem_tiles=binary_cross_entropy_ops._FOCAL_LOGIT_VMEM_TILES,
+    )
+    self.assertGreater(bce_v, focal_v)
+    bce_n = binary_cross_entropy_ops._max_safe_chunk_n(
+        gf_budget, padded_d=256, block_v=2048, block_n=128
+    )
+    focal_n = binary_cross_entropy_ops._max_safe_chunk_n(
+        gf_budget,
+        padded_d=256,
+        block_v=2048,
+        block_n=128,
+        logit_vmem_tiles=binary_cross_entropy_ops._FOCAL_LOGIT_VMEM_TILES,
+    )
+    self.assertGreater(bce_n, focal_n)
+
 
 if __name__ == '__main__':
   absltest.main()
