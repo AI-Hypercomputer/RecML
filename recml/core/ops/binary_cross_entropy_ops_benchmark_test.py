@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import keras
 from recml.core.ops import binary_cross_entropy_ops
+from recml.core.ops import binary_focal_cross_entropy_ops
 
 _BATCH = 32
 _SEQ_LEN = 32
@@ -54,8 +55,16 @@ def _benchmark(name: str, grad_fn, activations, embeddings) -> float:
   """Compiles `grad_fn` and returns its average step time in seconds."""
   logging.info('Compiling %s...', name)
   t0 = time.time()
+  compiled = grad_fn.lower(activations, embeddings).compile()
+  mem = compiled.memory_analysis()
   grad_fn(activations, embeddings)[0].block_until_ready()
-  logging.info('%s compiled in %.2f s', name, time.time() - t0)
+  temp_mb = (mem.temp_size_in_bytes / (1024 * 1024)) if mem else -1.0
+  logging.info(
+      '%s compiled in %.2f s (temp HBM: %.2f MiB)',
+      name,
+      time.time() - t0,
+      temp_mb,
+  )
 
   logging.info('Benchmarking %s (%d steps)...', name, _NUM_STEPS)
   t0 = time.time()
@@ -63,7 +72,12 @@ def _benchmark(name: str, grad_fn, activations, embeddings) -> float:
     g_act, _ = grad_fn(activations, embeddings)
     g_act.block_until_ready()
   step_time = (time.time() - t0) / _NUM_STEPS
-  logging.info('%s step time: %.4f ms', name, step_time * 1000)
+  logging.info(
+      '%s step time: %.4f ms (temp HBM: %.2f MiB)',
+      name,
+      step_time * 1000,
+      temp_mb,
+  )
   return step_time
 
 
@@ -106,6 +120,111 @@ class BinaryCrossEntropyOpsBenchmarkTest(absltest.TestCase):
         activations,
         embeddings,
     )
+
+  def test_mini_benchmark_unified_balanced_block_v_and_focal(self):
+    activations, embeddings, targets = _make_inputs()
+    lane = binary_cross_entropy_ops._pallas_lane()
+    padded_d = binary_cross_entropy_ops.pl.align_to(_HIDDEN_DIM, lane)
+    vmem_budget = binary_cross_entropy_ops._pallas_vmem_budget()
+    raw_max_bv = binary_cross_entropy_ops._max_safe_block_v(
+        vmem_budget, padded_d, lane, embeddings.dtype
+    )
+    resolved_bv = binary_cross_entropy_ops._resolve_block_v(
+        vocab=_VOCAB_SIZE,
+        hidden=_HIDDEN_DIM,
+        local_n=_BATCH * _SEQ_LEN,
+        block_n=lane,
+        dtype=embeddings.dtype,
+        user_block_v=None,
+        use_pallas=True,
+        force_bwd_block_v=False,
+    )
+    logging.info(
+        'Device=%s, VMEM budget=%.1f MiB, raw max_safe_block_v=%d, '
+        'unified balanced block_v=%d',
+        jax.devices()[0].device_kind,
+        vmem_budget / (1024 * 1024),
+        raw_max_bv,
+        resolved_bv,
+    )
+
+    # 1. Unified balanced block_v on V=100,000 vs legacy raw max_safe_block_v
+    def run_cut_balanced(act, emb):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, targets, block_v=None
+      )
+
+    def run_cut_legacy_raw(act, emb):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, targets, block_v=raw_max_bv, force_bwd_block_v=True
+      )
+
+    grad_balanced = jax.jit(jax.grad(run_cut_balanced, argnums=(0, 1)))
+    grad_legacy = jax.jit(jax.grad(run_cut_legacy_raw, argnums=(0, 1)))
+    t_bal = _benchmark(
+        f'CutBCE unified balanced (V=100k, block_v={resolved_bv})',
+        grad_balanced,
+        activations,
+        embeddings,
+    )
+    t_leg = _benchmark(
+        f'CutBCE legacy raw ceiling (V=100k, block_v={raw_max_bv})',
+        grad_legacy,
+        activations,
+        embeddings,
+    )
+
+    # 2. 128-aligned vocab V=64,000 where _balanced_block_v finds exact divisor
+    v_aligned = 64_000
+    emb_64k = embeddings[:v_aligned]
+    tgt_64k = jnp.mod(targets, v_aligned)
+    bal_64k = binary_cross_entropy_ops._resolve_block_v(
+        vocab=v_aligned,
+        hidden=_HIDDEN_DIM,
+        local_n=_BATCH * _SEQ_LEN,
+        block_n=lane,
+        dtype=embeddings.dtype,
+    )
+
+    def run_64k_balanced(act, emb):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, tgt_64k, block_v=None
+      )
+
+    def run_64k_legacy_raw(act, emb):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act, emb, tgt_64k, block_v=raw_max_bv, force_bwd_block_v=True
+      )
+
+    t_64k_bal = _benchmark(
+        f'CutBCE 64k exact-divisor balanced (block_v={bal_64k}, 0 pad)',
+        jax.jit(jax.grad(run_64k_balanced, argnums=(0, 1))),
+        activations,
+        emb_64k,
+    )
+    t_64k_leg = _benchmark(
+        f'CutBCE 64k legacy raw ceiling (block_v={raw_max_bv}, padded)',
+        jax.jit(jax.grad(run_64k_legacy_raw, argnums=(0, 1))),
+        activations,
+        emb_64k,
+    )
+    logging.info(
+        'Summary: V=100k balanced=%.4f ms vs raw=%.4f ms; '
+        'V=64k balanced=%.4f ms vs raw=%.4f ms',
+        t_bal * 1000,
+        t_leg * 1000,
+        t_64k_bal * 1000,
+        t_64k_leg * 1000,
+    )
+
+    # 3. Focal BCE with unified balanced block_v and 2D target loop
+    def run_focal_auto(act, emb):
+      return binary_focal_cross_entropy_ops.cut_binary_focal_cross_entropy(
+          act, emb, targets, block_v=None
+      )
+
+    grad_focal = jax.jit(jax.grad(run_focal_auto, argnums=(0, 1)))
+    _benchmark('CutFocalBCE auto unified', grad_focal, activations, embeddings)
 
 
 if __name__ == '__main__':

@@ -1160,6 +1160,81 @@ class BinaryFocalCrossEntropyOpsTest(parameterized.TestCase):
         g_emb_forced, g_emb_clamped, atol=1e-4, rtol=1e-4
     )
 
+  def test_focal_resolve_block_v_unifies_fwd_and_bwd(self):
+    resolved_v = binary_focal_cross_entropy_ops._resolve_block_v(
+        vocab=49152,
+        hidden=256,
+        local_n=1024,
+        block_n=128,
+        dtype=jnp.float32,
+        user_block_v=None,
+        use_pallas=True,
+        force_bwd_block_v=False,
+        logit_vmem_tiles=binary_focal_cross_entropy_ops._FOCAL_LOGIT_VMEM_TILES,
+    )
+    config = binary_focal_cross_entropy_ops.FocalBCEConfig(
+        block_v=resolved_v, block_n=128
+    )
+    _, bwd_v = binary_focal_cross_entropy_ops._effective_block_v(
+        config,
+        hidden=256,
+        vocab=49152,
+        logit_vmem_tiles=binary_focal_cross_entropy_ops._FOCAL_LOGIT_VMEM_TILES,
+    )
+    self.assertEqual(resolved_v, bwd_v)
+    self.assertEqual(
+        resolved_v % binary_focal_cross_entropy_ops._pallas_lane(), 0
+    )
+
+  def test_focal_balanced_block_v_avoids_hbm_padding(self):
+    batch, seq_len, hidden_dim, vocab_size, num_labels = 2, 64, 128, 3200, 4
+    key_act, key_emb, key_tgt = jax.random.split(
+        jax.random.PRNGKey(vocab_size), 3
+    )
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), -1, vocab_size
+    )
+
+    def run_naive(act, emb):
+      loss, _ = _naive_focal_bce(
+          act, emb, targets, gamma=2.0, alpha=0.25, apply_class_balancing=True
+      )
+      return loss
+
+    with mock.patch.object(
+        binary_focal_cross_entropy_ops.bce_ops,
+        '_max_safe_block_v',
+        return_value=768,
+    ):
+      def run_cut(act, emb):
+        return binary_focal_cross_entropy_ops.cut_binary_focal_cross_entropy(
+            act,
+            emb,
+            targets,
+            block_v=None,
+            gamma=2.0,
+            alpha=0.25,
+            apply_class_balancing=True,
+            use_pallas=True,
+        )
+
+      loss_ref = run_naive(activations, embeddings)
+      loss_cut = run_cut(activations, embeddings)
+      np.testing.assert_allclose(loss_cut, loss_ref, atol=1e-5, rtol=1e-5)
+
+      grad_fn = jax.jit(jax.grad(run_cut, argnums=(0, 1)))
+      g_act_ref, g_emb_ref = jax.jit(jax.grad(run_naive, argnums=(0, 1)))(
+          activations, embeddings
+      )
+      g_act_cut, g_emb_cut = grad_fn(activations, embeddings)
+      np.testing.assert_allclose(g_act_cut, g_act_ref, atol=1e-4, rtol=1e-4)
+      np.testing.assert_allclose(g_emb_cut, g_emb_ref, atol=1e-4, rtol=1e-4)
+
+      hlo_text = grad_fn.lower(activations, embeddings).as_text('hlo')
+      self.assertNotIn(f'f32[3840,{hidden_dim}]', hlo_text)
+
 
 if __name__ == '__main__':
   absltest.main()
