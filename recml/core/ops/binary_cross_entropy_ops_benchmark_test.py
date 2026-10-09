@@ -96,7 +96,7 @@ class BinaryCrossEntropyOpsBenchmarkTest(absltest.TestCase):
 
     def run_cut(act, emb, bv=_BLOCK_V):
       return binary_cross_entropy_ops.cut_binary_cross_entropy(
-          act, emb, targets, block_v=bv
+          act, emb, targets, block_v=bv, optimize_large_l=True
       )
 
     grad_cut = jax.jit(jax.grad(run_cut, argnums=(0, 1)))

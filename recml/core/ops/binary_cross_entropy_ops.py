@@ -249,6 +249,9 @@ class BCEConfig:
       ``embeddings.shape[0]``.
     optimize_large_l: Whether to use the target-free vocabulary pass + sparse
       positive-target correction. Defaults to False.
+    force_bwd_block_v: Whether to force the backward pass to use `block_v`
+      directly (aligned to lane width and capped by vocabulary size) instead of
+      clamping to `_max_safe_block_v`. Defaults to False.
   """
 
   block_v: int
@@ -257,6 +260,7 @@ class BCEConfig:
   use_pallas: bool = True
   global_vocab: int | None = None
   optimize_large_l: bool = False
+  force_bwd_block_v: bool = False
 
   # Sharding specs for VJP backward pass optimization
   mesh: jax.sharding.Mesh | None = None
@@ -595,6 +599,7 @@ def cut_binary_cross_entropy(
     *,
     return_per_target_losses: bool = False,
     return_metrics: bool = False,
+    return_per_target_metrics: bool = False,
     block_v: int | None = None,
     block_n: int | None = None,
     mesh: jax.sharding.Mesh | None = None,
@@ -602,23 +607,24 @@ def cut_binary_cross_entropy(
     emb_spec: jax.sharding.PartitionSpec | None = None,
     use_pallas: bool = True,
     optimize_large_l: bool = False,
+    force_bwd_block_v: bool = False,
 ) -> (
     jt.Float[jt.Array, ""]
     | tuple[jt.Float[jt.Array, ""], jt.Float[jt.Array, "... B N"]]
     | tuple[
         jt.Float[jt.Array, ""],
-        jt.Float[jt.Array, ""],
-        jt.Float[jt.Array, ""],
-        jt.Float[jt.Array, ""],
-        jt.Float[jt.Array, ""],
+        jt.Float[jt.Array, "... B N"] | jt.Float[jt.Array, ""],
+        jt.Float[jt.Array, "... B N"] | jt.Float[jt.Array, ""],
+        jt.Float[jt.Array, "... B N"] | jt.Float[jt.Array, ""],
+        jt.Float[jt.Array, "... B N"] | jt.Float[jt.Array, ""],
     ]
     | tuple[
         jt.Float[jt.Array, ""],
         jt.Float[jt.Array, "... B N"],
-        jt.Float[jt.Array, ""],
-        jt.Float[jt.Array, ""],
-        jt.Float[jt.Array, ""],
-        jt.Float[jt.Array, ""],
+        jt.Float[jt.Array, "... B N"] | jt.Float[jt.Array, ""],
+        jt.Float[jt.Array, "... B N"] | jt.Float[jt.Array, ""],
+        jt.Float[jt.Array, "... B N"] | jt.Float[jt.Array, ""],
+        jt.Float[jt.Array, "... B N"] | jt.Float[jt.Array, ""],
     ]
 ):
   """Computes binary cross entropy loss over unmaterialized logits.
@@ -643,6 +649,8 @@ def cut_binary_cross_entropy(
       position's weight.
     return_per_target_losses: If True, also return the per-target loss tensor.
     return_metrics: If True, also return TP, FP, FN, TN metric counts.
+    return_per_target_metrics: If True (with ``return_metrics=True``), return
+      per-position TP, FP, FN, TN tensors instead of summing them to scalars.
     block_v: Vocab-axis block size. Auto-picked if omitted.
     block_n: Sequence-axis block size for backward kernel.
     mesh: Optional mesh to use for sharding.
@@ -652,9 +660,21 @@ def cut_binary_cross_entropy(
       implementation.
     optimize_large_l: If True, use the target-free vocabulary pass + sparse
       positive-target correction. Defaults to False.
+    force_bwd_block_v: If True, force the backward pass to use `block_v`
+      directly instead of clamping to `_max_safe_block_v`. Defaults to False.
 
   Returns:
-    Scalar loss, optionally paired with per-target losses and/or metrics.
+    - ``loss`` if ``return_per_target_losses=False`` and
+      ``return_metrics=False``.
+    - ``(loss, losses)`` if ``return_per_target_losses=True`` and
+      ``return_metrics=False``.
+    - ``(loss, tp, fp, fn, tn)`` if ``return_per_target_losses=False`` and
+      ``return_metrics=True``.
+    - ``(loss, losses, tp, fp, fn, tn)`` if ``return_per_target_losses=True``
+      and ``return_metrics=True``.
+    Here ``loss`` is a scalar ``[]``, ``losses`` has shape ``[..., B, N]``, and
+    ``(tp, fp, fn, tn)`` each have shape ``[..., B, N]`` when
+    ``return_per_target_metrics=True`` or scalar shape ``[]`` when ``False``.
 
   Raises:
     ValueError: If ``activations`` has rank 5 or above, or if ``weights`` does
@@ -715,6 +735,7 @@ def cut_binary_cross_entropy(
       use_pallas=use_pallas,
       global_vocab=vocab_size,
       optimize_large_l=optimize_large_l,
+      force_bwd_block_v=force_bwd_block_v,
   )
 
   res = _cut_binary_cross_entropy(
@@ -730,22 +751,24 @@ def cut_binary_cross_entropy(
     if weights is not None:
       losses = losses * weights
       weight_sum = jnp.sum(weights)
-      tp_sum = jnp.sum(tp * weights)
-      fp_sum = jnp.sum(fp * weights)
-      fn_sum = jnp.sum(fn * weights)
-      tn_sum = jnp.sum(tn * weights)
+      tp = tp * weights
+      fp = fp * weights
+      fn = fn * weights
+      tn = tn * weights
     else:
       weight_sum = np.prod(losses_shape)
-      tp_sum = jnp.sum(tp)
-      fp_sum = jnp.sum(fp)
-      fn_sum = jnp.sum(fn)
-      tn_sum = jnp.sum(tn)
 
     loss = jnp.sum(losses) / (weight_sum + EPS)
 
+    if not return_per_target_metrics:
+      tp = jnp.sum(tp)
+      fp = jnp.sum(fp)
+      fn = jnp.sum(fn)
+      tn = jnp.sum(tn)
+
     if return_per_target_losses:
-      return loss, losses, tp_sum, fp_sum, fn_sum, tn_sum
-    return loss, tp_sum, fp_sum, fn_sum, tn_sum
+      return loss, losses, tp, fp, fn, tn
+    return loss, tp, fp, fn, tn
   else:
     losses = res
 
@@ -871,6 +894,9 @@ def _effective_block_v(
   """
   lane = _pallas_lane()
   padded_d = pl.align_to(hidden, lane)
+  if config.force_bwd_block_v:
+    block_v = pl.align_to(min(config.block_v, vocab), lane)
+    return padded_d, min(block_v, pl.align_to(vocab, lane))
   max_safe = _max_safe_block_v(_pallas_vmem_budget(), padded_d, config.block_n)
   block_v = pl.align_to(min(config.block_v, vocab, max_safe), lane)
   return padded_d, min(block_v, pl.align_to(vocab, lane), max_safe)

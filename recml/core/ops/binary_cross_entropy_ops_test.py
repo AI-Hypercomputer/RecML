@@ -854,6 +854,72 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
     self.assertIsNotNone(fn)
     self.assertIsNotNone(tn)
 
+  @parameterized.named_parameters(
+      ('unweighted_no_per_target_losses', False, False),
+      ('weighted_no_per_target_losses', True, False),
+      ('weighted_with_per_target_losses', True, True),
+  )
+  def test_cut_bce_per_target_metrics(
+      self, use_weights: bool, return_per_target_losses: bool
+  ):
+    batch, seq_len, hidden_dim, vocab_size, num_labels = 2, 16, 32, 128, 2
+    block_v = 64
+    key_act, key_emb, key_tgt, key_w = jax.random.split(
+        jax.random.PRNGKey(17), 4
+    )
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), 0, vocab_size
+    )
+    weights = None
+    if use_weights:
+      weights = jax.random.bernoulli(key_w, 0.7, (batch, seq_len)).astype(
+          jnp.float32
+      )
+
+    res = binary_cross_entropy_ops.cut_binary_cross_entropy(
+        activations,
+        embeddings,
+        targets,
+        weights,
+        block_v=block_v,
+        return_metrics=True,
+        return_per_target_metrics=True,
+        return_per_target_losses=return_per_target_losses,
+        use_pallas=False,
+    )
+    if return_per_target_losses:
+      loss, losses, tp, fp, fn, tn = res
+    else:
+      loss, tp, fp, fn, tn = res
+      losses = None
+
+    loss_ref, losses_ref = _keras_bce(
+        activations, embeddings, targets, weights=weights
+    )
+    np.testing.assert_allclose(loss, loss_ref, atol=1e-5, rtol=1e-5)
+    if losses is not None:
+      np.testing.assert_allclose(losses, losses_ref, atol=1e-5, rtol=1e-5)
+
+    logits = jnp.matmul(activations, embeddings.T)
+    multi_hot = jnp.max(jax.nn.one_hot(targets, vocab_size), axis=-2) > 0
+    preds = logits > 0.0
+    tp_ref = jnp.sum(multi_hot & preds, axis=-1, dtype=jnp.float32)
+    fp_ref = jnp.sum(~multi_hot & preds, axis=-1, dtype=jnp.float32)
+    fn_ref = jnp.sum(multi_hot & ~preds, axis=-1, dtype=jnp.float32)
+    tn_ref = jnp.sum(~multi_hot & ~preds, axis=-1, dtype=jnp.float32)
+    if weights is not None:
+      tp_ref = tp_ref * weights
+      fp_ref = fp_ref * weights
+      fn_ref = fn_ref * weights
+      tn_ref = tn_ref * weights
+
+    np.testing.assert_allclose(tp, tp_ref, rtol=1e-6)
+    np.testing.assert_allclose(fp, fp_ref, rtol=1e-6)
+    np.testing.assert_allclose(fn, fn_ref, rtol=1e-6)
+    np.testing.assert_allclose(tn, tn_ref, rtol=1e-6)
+
   def test_cut_bce_block_v_capped_at_vocab(self):
     activations = jnp.ones((2, 64, 32))
     embeddings = jnp.ones((200, 32))
@@ -1087,6 +1153,62 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
     )(activations, embeddings)
     np.testing.assert_allclose(g_act_opt, g_act_ref, atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(g_emb_opt, g_emb_ref, atol=1e-5, rtol=1e-5)
+
+  def test_force_bwd_block_v(self):
+    config_clamped = binary_cross_entropy_ops.BCEConfig(
+        block_v=11008, block_n=256, force_bwd_block_v=False
+    )
+    config_forced = binary_cross_entropy_ops.BCEConfig(
+        block_v=11008, block_n=256, force_bwd_block_v=True
+    )
+    _, bwd_v_clamped = binary_cross_entropy_ops._effective_block_v(
+        config_clamped, hidden=256, vocab=16384
+    )
+    _, bwd_v_forced = binary_cross_entropy_ops._effective_block_v(
+        config_forced, hidden=256, vocab=16384
+    )
+    self.assertLess(bwd_v_clamped, 11008)
+    self.assertEqual(bwd_v_forced, 11008)
+
+    batch, seq_len, hidden_dim, vocab_size, num_labels = 2, 16, 128, 2048, 4
+    key_act, key_emb, key_tgt = jax.random.split(jax.random.PRNGKey(99), 3)
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), 0, vocab_size
+    )
+
+    def loss_fn(act, emb, force_bwd):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          act,
+          emb,
+          targets,
+          block_v=1024,
+          block_n=128,
+          force_bwd_block_v=force_bwd,
+      )
+
+    with mock.patch.object(
+        binary_cross_entropy_ops, '_max_safe_block_v', return_value=512
+    ):
+      loss_clamped = loss_fn(activations, embeddings, False)
+      loss_forced = loss_fn(activations, embeddings, True)
+      np.testing.assert_allclose(
+          loss_forced, loss_clamped, atol=1e-6, rtol=1e-6
+      )
+
+      g_act_clamped, g_emb_clamped = jax.jit(
+          jax.grad(lambda a, e: loss_fn(a, e, False), argnums=(0, 1))
+      )(activations, embeddings)
+      g_act_forced, g_emb_forced = jax.jit(
+          jax.grad(lambda a, e: loss_fn(a, e, True), argnums=(0, 1))
+      )(activations, embeddings)
+    np.testing.assert_allclose(
+        g_act_forced, g_act_clamped, atol=1e-5, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        g_emb_forced, g_emb_clamped, atol=1e-5, rtol=1e-5
+    )
 
 
 if __name__ == '__main__':
