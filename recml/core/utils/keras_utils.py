@@ -19,6 +19,7 @@ import datetime
 import enum
 import os
 import re
+import time
 from typing import Any
 
 from absl import logging
@@ -1793,3 +1794,233 @@ class EpochSummaryCallback(keras.callbacks.TensorBoard):
 
   def on_test_end(self, logs=None):
     self._pop_writer()
+
+  # This callback only writes summaries in `on_epoch_end`. The inherited
+  # `TensorBoard` batch hooks still call `summary.scalar` for every key in
+  # `logs` on every step, even though `update_freq="epoch"` means there is no
+  # default writer and nothing is recorded. Use the no-op `Callback` hooks
+  # instead. Keras treats them as unset, so they add no per-step host work.
+  on_train_batch_begin = keras.callbacks.Callback.on_train_batch_begin
+  on_train_batch_end = keras.callbacks.Callback.on_train_batch_end
+  on_test_batch_begin = keras.callbacks.Callback.on_test_batch_begin
+
+
+class MetricsCallback(keras.callbacks.Callback):
+  """Base class for callbacks that add scalar metrics to the epoch summary.
+
+  In training, a subclass can add metrics to `logs` in `on_epoch_end`. It must
+  run before `EpochSummaryCallback`, which writes `logs` to TensorBoard.
+
+  In evaluation, Keras passes `on_test_end` a copy of `logs`, so changes made
+  there do not reach the dict that `model.evaluate` returns. A subclass must
+  also save its metrics in `latest_metrics`. `KerasTrainer` reads that property
+  after `model.evaluate` and adds the values, with a `val_` prefix, to the
+  validation logs that it writes.
+  """
+
+  def __init__(self):
+    super().__init__()
+    self._latest_metrics: dict[str, float] = {}
+
+  @property
+  def latest_metrics(self) -> dict[str, float]:
+    """Returns a copy of the metrics from the most recent window."""
+    return dict(self._latest_metrics)
+
+  def _record(self, logs: dict[str, Any] | None, name: str, value: float):
+    """Saves a metric and adds it to `logs` if `logs` is not None."""
+    self._latest_metrics[name] = value
+    if logs is not None:
+      logs[name] = value
+
+
+def _require_positive(name: str, value: int) -> int:
+  """Returns `value`, or raises a `ValueError` if it is not positive.
+
+  A silent fallback to 1 would inflate the per-device metrics by up to the pod
+  size and nobody would notice on the dashboard.
+
+  Args:
+    name: Name of the value, for the error message.
+    value: The value to check.
+  """
+  if value < 1:
+    raise ValueError(f"{name} must be positive, got {value}.")
+  return value
+
+
+class _TokenThroughputCallback(MetricsCallback):
+  """Adds token throughput metrics for one timed window.
+
+  Metrics, all under `throughput/`:
+
+    * `k_valid_tokens_per_sec_per_device`: non-padding tokens per second per
+      accelerator, in thousands. It goes up when packing improves and does not
+      depend on the number of chips.
+    * `k_tokens_per_sec_per_device`: the same, but padding tokens are counted
+      too. This is the rate that the hardware sees.
+    * `packing_efficiency_pct`: `valid_seq_len / padded_seq_len * 100`.
+
+  `k_valid / k_tokens == packing_efficiency_pct / 100` by construction. So the
+  three metrics have only two degrees of freedom, and the fact that they agree
+  does not prove that they are correct.
+
+  The metric names are the same for training and evaluation. `KerasTrainer`
+  adds a `val_` prefix to evaluation metrics and `EpochSummaryCallback` removes
+  it again, so both series show in the same TensorBoard cards.
+
+  The callback never reads `logs` in its batch hooks and sets `async_safe`.
+  Thus Keras can keep dispatching batch callbacks asynchronously. Without
+  `async_safe`, one callback with a batch hook makes Keras convert all the
+  step logs to Python floats on the main thread on every step, which blocks
+  the accelerator.
+
+  Subclasses select the Keras hooks that open and close the window.
+  """
+
+  def __init__(
+      self,
+      *,
+      global_batch_size: int,
+      padded_seq_len: int,
+      valid_seq_len_key: str,
+      device_count: int | None = None,
+  ):
+    """Initializes the callback.
+
+    Args:
+      global_batch_size: Number of examples per step, across all devices.
+      padded_seq_len: Padded sequence length of one example.
+      valid_seq_len_key: Key of the model metric that holds the mean number of
+        non-padding tokens per example. A per-batch sum gives wrong values. If
+        the result is out of range, the token metrics are skipped and an error
+        is logged.
+      device_count: Global accelerator count. If None, it is read from
+        `jax.device_count()` when the first metrics are computed.
+    """
+    super().__init__()
+    self.async_safe = True
+    self._global_batch_size = _require_positive(
+        "global_batch_size", global_batch_size
+    )
+    self._padded_seq_len = _require_positive("padded_seq_len", padded_seq_len)
+    self._valid_seq_len_key = valid_seq_len_key
+    self._device_count = (
+        None
+        if device_count is None
+        else _require_positive("device_count", device_count)
+    )
+    self._window_start: float | None = None
+    self._steps = 0
+
+  def _open_window(self) -> None:
+    """Starts the timer and resets the step count."""
+    self._window_start = time.time()
+    # Fallback for when no batch hook fires in the window.
+    self._steps = (self.params or {}).get("steps") or 0
+
+  def _count_step(self, batch: int) -> None:
+    """Records progress from a batch-end hook.
+
+    Args:
+      batch: Index of the last step that completed. Keras gives the end step,
+        not a count, so this stays correct when `steps_per_execution > 1`.
+    """
+    self._steps = batch + 1
+
+  def _get_device_count(self) -> int:
+    if self._device_count is None:
+      self._device_count = _require_positive(
+          "jax.device_count()", jax.device_count()
+      )
+    return self._device_count
+
+  def _close_window(self, logs: dict[str, Any] | None) -> None:
+    """Computes the metrics for the window and adds them to `logs`."""
+    elapsed = (
+        time.time() - self._window_start
+        if self._window_start is not None
+        else 0.0
+    )
+    self._latest_metrics = {}
+    if not logs or self._valid_seq_len_key not in logs:
+      logging.warning(
+          "%s: %s is not in logs; throughput metrics are skipped.",
+          type(self).__name__,
+          self._valid_seq_len_key,
+      )
+      return
+    valid_seq_len = float(logs[self._valid_seq_len_key])
+    packing_efficiency_pct = valid_seq_len / self._padded_seq_len * 100.0
+    if not 0.0 <= packing_efficiency_pct <= 100.0:
+      # Do not stop a long training job because of a logging metric, and do
+      # not write values that are wrong by a factor of the batch size.
+      logging.error(
+          "%s: packing_efficiency_pct=%.1f is not in [0, 100]. %s is probably"
+          " a per-batch sum, not a per-example mean. Throughput metrics are"
+          " skipped.",
+          type(self).__name__,
+          packing_efficiency_pct,
+          self._valid_seq_len_key,
+      )
+      return
+    # This metric has no time term, so record it even without a step rate.
+    self._record(
+        logs, "throughput/packing_efficiency_pct", packing_efficiency_pct
+    )
+
+    if not self._steps or elapsed <= 0:
+      logging.warning(
+          "%s: no step rate is available; tokens/sec metrics are skipped.",
+          type(self).__name__,
+      )
+      return
+    examples_per_sec_per_device = (
+        self._global_batch_size * self._steps / elapsed
+    ) / self._get_device_count()
+    self._record(
+        logs,
+        "throughput/k_valid_tokens_per_sec_per_device",
+        examples_per_sec_per_device * valid_seq_len / 1000.0,
+    )
+    self._record(
+        logs,
+        "throughput/k_tokens_per_sec_per_device",
+        examples_per_sec_per_device * self._padded_seq_len / 1000.0,
+    )
+
+
+class TrainThroughputCallback(_TokenThroughputCallback):
+  """Adds token throughput metrics once per training epoch.
+
+  The window starts in `on_epoch_begin` and ends in `on_epoch_end`, i.e. it
+  covers `steps_per_loop` steps. With `KerasTrainer.train_and_evaluate`, Keras
+  runs validation inside the epoch, so the window also includes validation time.
+  """
+
+  def on_epoch_begin(self, epoch: int, logs: dict[str, Any] | None = None):
+    self._open_window()
+
+  def on_train_batch_end(self, batch: int, logs: dict[str, Any] | None = None):
+    self._count_step(batch)
+
+  def on_epoch_end(self, epoch: int, logs: dict[str, Any] | None = None):
+    self._close_window(logs)
+
+
+class EvalThroughputCallback(_TokenThroughputCallback):
+  """Adds token throughput metrics once per evaluation pass.
+
+  `model.evaluate` does not call `on_epoch_end`, so the window starts in
+  `on_test_begin` and ends in `on_test_end`. `KerasTrainer` writes the result
+  from `latest_metrics` (see `MetricsCallback`).
+  """
+
+  def on_test_begin(self, logs: dict[str, Any] | None = None):
+    self._open_window()
+
+  def on_test_batch_end(self, batch: int, logs: dict[str, Any] | None = None):
+    self._count_step(batch)
+
+  def on_test_end(self, logs: dict[str, Any] | None = None):
+    self._close_window(logs)

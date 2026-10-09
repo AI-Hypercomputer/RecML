@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import dataclasses
 import functools
 import gc
@@ -101,6 +101,25 @@ class KerasTask(abc.ABC):
       model: The Keras model constructed by `create_model`.
       model_dir: The model directory passed to the trainer.
     """
+
+  def create_callbacks(
+      self, training: bool
+  ) -> Sequence[keras.callbacks.Callback]:
+    """Creates task-specific callbacks for training or evaluation.
+
+    The trainer runs these callbacks before its own callbacks. Thus metrics that
+    they add to `logs` are written to TensorBoard. In evaluation, use
+    `keras_utils.MetricsCallback` to report metrics, because Keras does not
+    return changes made to `logs` in `on_test_end`.
+
+    Args:
+      training: Whether the callbacks are for training or for evaluation.
+
+    Returns:
+      The callbacks. The default is no callbacks.
+    """
+    del training
+    return ()
 
 
 class KerasTrainer(core.Trainer[KerasTask]):
@@ -307,6 +326,29 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
     return kws
 
+  def _task_callbacks(
+      self, task: KerasTask, *, training: bool
+  ) -> list[keras.callbacks.Callback]:
+    """Returns the task callbacks, or none if the task has no hook."""
+    create_callbacks = getattr(task, "create_callbacks", None)
+    if create_callbacks is None:
+      return []
+    return list(create_callbacks(training=training))
+
+  def _val_logs(
+      self,
+      history: Mapping[str, Any],
+      callbacks: Sequence[keras.callbacks.Callback],
+      steps_per_second: float,
+  ) -> dict[str, Any]:
+    """Returns the logs for `EpochSummaryCallback` after an evaluation."""
+    val_logs = {"val_" + k: v for k, v in history.items()}
+    for cbk in callbacks:
+      if isinstance(cbk, keras_utils.MetricsCallback):
+        val_logs.update({"val_" + k: v for k, v in cbk.latest_metrics.items()})
+    val_logs["val_steps_per_second"] = steps_per_second
+    return val_logs
+
   def train(self, task: KerasTask) -> core.Logs:
     """Trains a Keras model."""
     dataset = task.create_dataset(
@@ -320,7 +362,10 @@ class KerasTrainer(core.Trainer[KerasTask]):
         dataset,
         epochs=self._train_epochs + 1,
         steps_per_epoch=self._steps_per_loop,
-        callbacks=self.train_callbacks,
+        callbacks=[
+            *self._task_callbacks(task, training=True),
+            *self.train_callbacks,
+        ],
         initial_epoch=1,
     )
     model.summary(print_fn=logging.info)
@@ -339,6 +384,10 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, dataset, val=True)
     )
 
+    callbacks = [
+        *self._task_callbacks(task, training=False),
+        *self.eval_callbacks,
+    ]
     if keras.backend.backend() == "jax":
       [tb_cbk] = [
           cbk
@@ -349,20 +398,20 @@ class KerasTrainer(core.Trainer[KerasTask]):
       history = model.evaluate(
           dataset,
           steps=self._steps_per_eval,
-          callbacks=self.eval_callbacks,
+          callbacks=callbacks,
           return_dict=True,
       )
       epoch_dt = time.time() - epoch_start_time
       steps_per_second = self._steps_per_eval / epoch_dt  # pyrefly: ignore[unsupported-operation]
-      val_logs = {"val_" + k: v for k, v in history.items()}
-      val_logs["val_steps_per_second"] = steps_per_second
-      tb_cbk.on_epoch_end(0, val_logs)
+      tb_cbk.on_epoch_end(
+          0, self._val_logs(history, callbacks, steps_per_second)
+      )
       return history
 
     return model.evaluate(
         dataset,
         steps=self._steps_per_eval,
-        callbacks=self.eval_callbacks,
+        callbacks=callbacks,
     )
 
   def train_and_evaluate(self, task: KerasTask) -> core.Logs:
@@ -388,7 +437,10 @@ class KerasTrainer(core.Trainer[KerasTask]):
         steps_per_epoch=self._steps_per_loop,
         # Explicitly set to None for deterministic evaluation.
         validation_steps=None,
-        callbacks=self.train_callbacks,
+        callbacks=[
+            *self._task_callbacks(task, training=True),
+            *self.train_callbacks,
+        ],
         initial_epoch=1,
     )
     model.summary(print_fn=logging.info)
@@ -453,6 +505,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
           )
 
     history = None
+    task_callbacks = self._task_callbacks(task, training=False)
     for epoch in ocp.checkpoint_utils.checkpoints_iterator(
         self._checkpoint_dir,
         timeout=self._continuous_eval_timeout,
@@ -464,6 +517,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
           for cbk in self.eval_callbacks
           if isinstance(cbk, keras_utils.EpochSummaryCallback)
       ]
+      callbacks = [restore_callback, *task_callbacks, *self.eval_callbacks]
       try:
         logging.info(f"eval | epoch: {epoch: 6d} | {steps_msg}")
         epoch_start_time = time.time()
@@ -475,7 +529,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         history = model.evaluate(
             eval_dataset,
             steps=self._steps_per_eval,
-            callbacks=[restore_callback] + self.eval_callbacks,
+            callbacks=callbacks,
             return_dict=True,
         )
 
@@ -491,9 +545,9 @@ class KerasTrainer(core.Trainer[KerasTask]):
         epoch_dt = time.time() - epoch_start_time
         steps_per_second = self._steps_per_eval / epoch_dt  # pyrefly: ignore[unsupported-operation]
 
-        val_logs = {"val_" + k: v for k, v in history.items()}
-        val_logs["val_steps_per_second"] = steps_per_second
-        tb_cbk.on_epoch_end(epoch, val_logs)
+        tb_cbk.on_epoch_end(
+            epoch, self._val_logs(history, callbacks, steps_per_second)
+        )
       except FileNotFoundError:
         logging.info("Checkpoint epoch: %s did not finish writing...", epoch)
 
