@@ -32,10 +32,12 @@ import keras
 import orbax.checkpoint as ocp
 import psutil
 from recml.core.training import core
+from recml.core.training import device_prefetch
 from recml.core.utils import py_utils
 import tensorflow as tf
 
 with epy.lazy_imports():
+  from recml.core.training import batch_callbacks  # pylint: disable=g-import-not-at-top, g-bad-import-order
   from recml.core.utils import keras_utils  # pylint: disable=g-import-not-at-top, g-bad-import-order
 
 
@@ -124,6 +126,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
       rng_seed: int = core.DEFAULT_RNG_SEED,
       checkpoint_version: keras_utils.CheckpointVersion | str | None = None,
       legacy_checkpoint_format: bool | None = None,
+      device_prefetch_depth: int = 0,
+      skip_batch_logs: bool = False,
   ):
     """Initializes the instance.
 
@@ -143,12 +147,32 @@ class KerasTrainer(core.Trainer[KerasTask]):
       legacy_checkpoint_format: Deprecated. Use checkpoint_version instead. If
         set, True maps to V1, and False maps to V2. TODO(b/542602169): Remove
         this in v2.
+      device_prefetch_depth: Number of batches that a background thread fetches
+        and copies to the device ahead of the training step during `train`,
+        instead of Keras' main-thread one-batch-ahead iterator (see
+        `device_prefetch.model_prefetch_scope`). 0 keeps the Keras behaviour.
+        Not applied in `train_and_evaluate`.
+      skip_batch_logs: During `train`, always drop `ProgbarLogger` (`verbose=0`,
+        which suppresses `Epoch N/M` and epoch-end stdout progress lines while
+        keeping TensorBoard/XManager summaries and checkpoint logs) and disable
+        the per-step hooks of exact `keras_utils.EpochSummaryCallback`
+        instances (custom subclasses are kept as-is), and also skip the
+        per-step conversion of `logs` to Python when no callback needs per-step
+        logs (see `batch_callbacks.ZeroSyncCallbackList`). Epoch-end summaries
+        and checkpoints are unchanged. Not applied in `train_and_evaluate`.
       resume_training_launcher: Launcher to resume training.
       enable_xmanager_measurements: Whether to enable XManager measurements.
       enable_autoxprof: Whether to enable AutoXprof.
       autoxprof_settings: Settings for AutoXprof.
       s2_logging_settings: Settings for S2 logging.
+
+    Raises:
+      ValueError: If `device_prefetch_depth` is negative.
     """
+    if device_prefetch_depth < 0:
+      raise ValueError(
+          f"device_prefetch_depth must be >= 0, got {device_prefetch_depth}."
+      )
 
     keras.utils.set_random_seed(rng_seed)
 
@@ -171,6 +195,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._steps_per_eval = steps_per_eval
     self._continuous_eval_timeout = continuous_eval_timeout
     self._steps_per_loop = steps_per_loop
+    self._device_prefetch_depth = device_prefetch_depth
+    self._skip_batch_logs = skip_batch_logs
     self._marker_path = os.path.join(
         model_dir, core.TRAINING_COMPLETE_MARKER_FILE
     )
@@ -316,13 +342,27 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, dataset, val=False)
     )
 
-    history = model.fit(
-        dataset,
-        epochs=self._train_epochs + 1,
-        steps_per_epoch=self._steps_per_loop,
-        callbacks=self.train_callbacks,
-        initial_epoch=1,
-    )
+    epochs = self._train_epochs + 1
+    callbacks = self.train_callbacks
+    if self._skip_batch_logs:
+      callbacks = batch_callbacks.ZeroSyncCallbackList(
+          batch_callbacks.without_batch_hooks(callbacks),
+          add_history=True,
+          add_progbar=False,
+          epochs=epochs,
+          steps=self._steps_per_loop,
+          model=model,
+      )
+    with device_prefetch.model_prefetch_scope(
+        model, depth=self._device_prefetch_depth
+    ):
+      history = model.fit(
+          dataset,
+          epochs=epochs,
+          steps_per_epoch=self._steps_per_loop,
+          callbacks=callbacks,
+          initial_epoch=1,
+      )
     model.summary(print_fn=logging.info)
 
     if keras.backend.backend() == "jax" and jax.process_index() != 0:
@@ -367,6 +407,11 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
   def train_and_evaluate(self, task: KerasTask) -> core.Logs:
     """Trains and evaluates a Keras model."""
+    if self._device_prefetch_depth or self._skip_batch_logs:
+      logging.warning(
+          "device_prefetch_depth and skip_batch_logs only apply to `train`;"
+          " ignoring them in `train_and_evaluate`."
+      )
     train_dataset = task.create_dataset(
         training=True, **self._maybe_get_dataset_kws(task)
     )
