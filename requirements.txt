@@ -50,7 +50,7 @@ mdurl==0.1.2
 ml-collections==1.1.0
 ml-dtypes==0.5.1
 mpmath==1.3.0
-msgpack==1.1.0
+msgpack==1.2.1
 namex==0.0.8
 nest-asyncio==1.6.0
 networkx==3.4.2
