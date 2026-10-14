@@ -276,6 +276,38 @@ class KerasUtilsTest(parameterized.TestCase):
     # Ensures predictions are identical.
     np.testing.assert_allclose(preds, preds_after_restoration)
 
+  def test_keras_orbax_checkpointer_v3_no_non_trainable_variables(self):
+    model = keras.Sequential(
+        [keras.layers.Dense(5, name="dense")], name="model"
+    )
+    model.build((2, 10))
+    model.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+    model.optimizer.build(model.trainable_variables)
+    self.assertEmpty(model.non_trainable_variables)
+
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir, max_to_keep=None
+    )
+    checkpoint_manager.save_model_variables(model, 0)
+    checkpoint_manager.wait_until_finished()
+
+    new_model = keras.Sequential(
+        [keras.layers.Dense(5, name="dense")], name="model"
+    )
+    new_model.build((2, 10))
+    new_model.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+    new_model.optimizer.build(new_model.trainable_variables)
+
+    checkpoint_manager.restore_model_variables(new_model, 0)
+    checkpoint_manager.close()
+
+    for expected, observed in zip(
+        [v.value for v in model.trainable_variables],
+        [v.value for v in new_model.trainable_variables],
+    ):
+      np.testing.assert_allclose(observed, expected)
+
   def test_restore_keras_checkpoint(self):
     dummy_inputs = _create_dummy_inputs()
     bert_pretrainer = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
