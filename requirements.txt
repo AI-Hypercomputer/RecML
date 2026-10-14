@@ -27,7 +27,7 @@ grpcio==1.71.0
 h5py==3.13.0
 humanize==4.12.2
 identify==2.6.9
-idna==3.10
+idna==3.15
 immutabledict==4.2.1
 importlib-resources==6.5.2
 iniconfig==2.1.0
