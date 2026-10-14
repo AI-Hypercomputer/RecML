@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import dataclasses
 import functools
 import gc
@@ -124,6 +124,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
       rng_seed: int = core.DEFAULT_RNG_SEED,
       checkpoint_version: keras_utils.CheckpointVersion | str | None = None,
       legacy_checkpoint_format: bool | None = None,
+      train_callbacks: Sequence[keras.callbacks.Callback] = (),
+      eval_callbacks: Sequence[keras.callbacks.Callback] = (),
   ):
     """Initializes the instance.
 
@@ -143,6 +145,13 @@ class KerasTrainer(core.Trainer[KerasTask]):
       legacy_checkpoint_format: Deprecated. Use checkpoint_version instead. If
         set, True maps to V1, and False maps to V2. TODO(b/542602169): Remove
         this in v2.
+      train_callbacks: Additional callbacks for training. They run before the
+        trainer's own callbacks, so metrics that they add to `logs` are written
+        to TensorBoard.
+      eval_callbacks: Additional callbacks for evaluation. They run before the
+        trainer's own callbacks. Use `keras_utils.MetricsCallback` to report
+        metrics, because Keras does not return changes made to `logs` in
+        `on_test_end`.
       resume_training_launcher: Launcher to resume training.
       enable_xmanager_measurements: Whether to enable XManager measurements.
       enable_autoxprof: Whether to enable AutoXprof.
@@ -177,6 +186,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._checkpoint_dir = os.path.join(model_dir, core.CHECKPOINT_DIR)
     self._max_checkpoints_to_keep = max_checkpoints_to_keep
     self._checkpoint_save_interval_epochs = checkpoint_save_interval_epochs
+    self._custom_train_callbacks = list(train_callbacks)
+    self._custom_eval_callbacks = list(eval_callbacks)
     if checkpoint_version is not None:
       self._checkpoint_version = keras_utils.CheckpointVersion(
           checkpoint_version
@@ -216,6 +227,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       )
 
       callbacks = [
+          *self._custom_train_callbacks,
           keras_utils.EpochSummaryCallback(
               log_dir=os.path.join(self._model_dir, core.LOG_DIR),
               steps_per_epoch=self._steps_per_loop,
@@ -230,6 +242,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       return callbacks  # pyrefly: ignore[bad-return]
 
     return [
+        *self._custom_train_callbacks,
         keras.callbacks.TensorBoard(
             log_dir=os.path.join(self._model_dir, core.LOG_DIR),
             write_steps_per_second=True,
@@ -253,6 +266,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     """Returns the evaluation callbacks."""
     if keras.backend.backend() == "jax":
       return [
+          *self._custom_eval_callbacks,
           keras_utils.EpochSummaryCallback(
               log_dir=os.path.join(self._model_dir, core.LOG_DIR),
               steps_per_epoch=self._steps_per_loop,
@@ -266,6 +280,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
           ),
       ]
     return [
+        *self._custom_eval_callbacks,
         keras.callbacks.TensorBoard(
             log_dir=os.path.join(self._model_dir, core.LOG_DIR),
             write_steps_per_second=True,
@@ -306,6 +321,27 @@ class KerasTrainer(core.Trainer[KerasTask]):
       )
 
     return kws
+
+  def _val_logs(
+      self,
+      history: Mapping[str, Any],
+      callbacks: Sequence[keras.callbacks.Callback],
+      steps_per_second: float,
+  ) -> dict[str, Any]:
+    """Returns the logs for `EpochSummaryCallback` after an evaluation."""
+    val_logs = {f"val_{k}": v for k, v in history.items()}
+    for cbk in callbacks:
+      if isinstance(cbk, keras_utils.MetricsCallback):
+        for k, v in cbk.latest_metrics.items():
+          val_key = f"val_{k}"
+          if val_key in val_logs:
+            logging.warning(
+                f"{type(cbk).__name__} overwrites existing evaluation log key"
+                f" {val_key}."
+            )
+          val_logs[val_key] = v
+    val_logs["val_steps_per_second"] = steps_per_second
+    return val_logs
 
   def train(self, task: KerasTask) -> core.Logs:
     """Trains a Keras model."""
@@ -354,9 +390,9 @@ class KerasTrainer(core.Trainer[KerasTask]):
       )
       epoch_dt = time.time() - epoch_start_time
       steps_per_second = self._steps_per_eval / epoch_dt  # pyrefly: ignore[unsupported-operation]
-      val_logs = {"val_" + k: v for k, v in history.items()}
-      val_logs["val_steps_per_second"] = steps_per_second
-      tb_cbk.on_epoch_end(0, val_logs)
+      tb_cbk.on_epoch_end(
+          0, self._val_logs(history, self.eval_callbacks, steps_per_second)
+      )
       return history
 
     return model.evaluate(
@@ -464,6 +500,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
           for cbk in self.eval_callbacks
           if isinstance(cbk, keras_utils.EpochSummaryCallback)
       ]
+      callbacks = [restore_callback, *self.eval_callbacks]
       try:
         logging.info(f"eval | epoch: {epoch: 6d} | {steps_msg}")
         epoch_start_time = time.time()
@@ -475,7 +512,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         history = model.evaluate(
             eval_dataset,
             steps=self._steps_per_eval,
-            callbacks=[restore_callback] + self.eval_callbacks,
+            callbacks=callbacks,
             return_dict=True,
         )
 
@@ -491,9 +528,10 @@ class KerasTrainer(core.Trainer[KerasTask]):
         epoch_dt = time.time() - epoch_start_time
         steps_per_second = self._steps_per_eval / epoch_dt  # pyrefly: ignore[unsupported-operation]
 
-        val_logs = {"val_" + k: v for k, v in history.items()}
-        val_logs["val_steps_per_second"] = steps_per_second
-        tb_cbk.on_epoch_end(epoch, val_logs)
+        tb_cbk.on_epoch_end(
+            epoch,
+            self._val_logs(history, self.eval_callbacks, steps_per_second),
+        )
       except FileNotFoundError:
         logging.info("Checkpoint epoch: %s did not finish writing...", epoch)
 
