@@ -1210,6 +1210,112 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
         g_emb_forced, g_emb_clamped, atol=1e-5, rtol=1e-5
     )
 
+  def test_balanced_block_v(self):
+    lane = 128
+    # Exact multiple when vocab is divisible by v_blocks * lane (48000 / 5 = 9600)
+    blk = binary_cross_entropy_ops._balanced_block_v(
+        vocab=48000, max_block_v=11264, alignment=lane
+    )
+    self.assertEqual(blk, 9600)
+    self.assertEqual(48000 % blk, 0)
+    self.assertEqual((48000 + blk - 1) // blk, (48000 + 11264 - 1) // 11264)
+
+    # Minimizes tail remainder without increasing v_blocks when vocab is not a
+    # multiple of lane (100000 % 128 = 32).
+    blk_unaligned = binary_cross_entropy_ops._balanced_block_v(
+        vocab=100000, max_block_v=11264, alignment=lane
+    )
+    self.assertEqual(blk_unaligned % lane, 0)
+    self.assertEqual(
+        (100000 + blk_unaligned - 1) // blk_unaligned,
+        (100000 + 11264 - 1) // 11264,
+    )
+    self.assertEqual(blk_unaligned, 11136)
+
+  def test_resolve_block_v_unifies_fwd_and_bwd(self):
+    resolved_v = binary_cross_entropy_ops._resolve_block_v(
+        vocab=49152,
+        hidden=256,
+        local_n=1024,
+        block_n=128,
+        dtype=jnp.float32,
+        user_block_v=None,
+        use_pallas=True,
+        force_bwd_block_v=False,
+    )
+    config = binary_cross_entropy_ops.BCEConfig(block_v=resolved_v, block_n=128)
+    _, bwd_v = binary_cross_entropy_ops._effective_block_v(
+        config, hidden=256, vocab=49152
+    )
+    self.assertEqual(resolved_v, bwd_v)
+    self.assertEqual(resolved_v % binary_cross_entropy_ops._pallas_lane(), 0)
+
+  def test_balanced_block_v_avoids_hbm_padding(self):
+    batch, seq_len, hidden_dim, vocab_size, num_labels = 2, 64, 128, 3200, 4
+    key_act, key_emb, key_tgt = jax.random.split(
+        jax.random.PRNGKey(vocab_size), 3
+    )
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), -1, vocab_size
+    )
+
+    def run_naive(act, emb):
+      loss, _ = _keras_bce(act, emb, targets)
+      return loss
+
+    # Mock _max_safe_block_v to a prime-multiple ceiling (768) that does not
+    # divide 3200 (3200 % 768 = 128); _balanced_block_v balances it to 640
+    # (3200 / 5 = 640) so zero HBM padding occurs.
+    with mock.patch.object(
+        binary_cross_entropy_ops, '_max_safe_block_v', return_value=768
+    ):
+      def run_cut(act, emb):
+        return binary_cross_entropy_ops.cut_binary_cross_entropy(
+            act, emb, targets, block_v=None, use_pallas=True
+        )
+
+      loss_ref = run_naive(activations, embeddings)
+      loss_cut = run_cut(activations, embeddings)
+      np.testing.assert_allclose(loss_cut, loss_ref, atol=1e-5, rtol=1e-5)
+
+      grad_fn = jax.jit(jax.grad(run_cut, argnums=(0, 1)))
+      g_act_ref, g_emb_ref = jax.jit(jax.grad(run_naive, argnums=(0, 1)))(
+          activations, embeddings
+      )
+      g_act_cut, g_emb_cut = grad_fn(activations, embeddings)
+      np.testing.assert_allclose(g_act_cut, g_act_ref, atol=1e-4, rtol=1e-4)
+      np.testing.assert_allclose(g_emb_cut, g_emb_ref, atol=1e-4, rtol=1e-4)
+
+      # Raw ceiling 768 would have padded 3200 -> 3840; balanced 640 pads 0 rows
+      hlo_text = grad_fn.lower(activations, embeddings).as_text('hlo')
+      self.assertNotIn(f'f32[3840,{hidden_dim}]', hlo_text)
+
+  def test_ghostfish_64mb_vmem_and_focal_tiles(self):
+    gf_budget = 48 * 1024 * 1024  # 64 MiB VMEM - 16 MiB reserve
+    bce_v = binary_cross_entropy_ops._max_safe_block_v(
+        gf_budget, padded_d=256, block_n=128
+    )
+    focal_v = binary_cross_entropy_ops._max_safe_block_v(
+        gf_budget,
+        padded_d=256,
+        block_n=128,
+        logit_vmem_tiles=binary_cross_entropy_ops._FOCAL_LOGIT_VMEM_TILES,
+    )
+    self.assertGreater(bce_v, focal_v)
+    bce_n = binary_cross_entropy_ops._max_safe_chunk_n(
+        gf_budget, padded_d=256, block_v=2048, block_n=128
+    )
+    focal_n = binary_cross_entropy_ops._max_safe_chunk_n(
+        gf_budget,
+        padded_d=256,
+        block_v=2048,
+        block_n=128,
+        logit_vmem_tiles=binary_cross_entropy_ops._FOCAL_LOGIT_VMEM_TILES,
+    )
+    self.assertGreater(bce_n, focal_n)
+
 
 if __name__ == '__main__':
   absltest.main()
