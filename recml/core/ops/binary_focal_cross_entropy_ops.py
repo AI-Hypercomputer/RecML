@@ -61,6 +61,9 @@ _fwd_pos_correction = (
     bce_ops._fwd_pos_correction  # pylint: disable=protected-access
 )
 _BLOCK_N = bce_ops._BLOCK_N  # pylint: disable=protected-access
+_FOCAL_LOGIT_VMEM_TILES = (
+    bce_ops._FOCAL_LOGIT_VMEM_TILES  # pylint: disable=protected-access
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -663,10 +666,16 @@ def _focal_bce_bwd_kernel(
     )
     probs = jax.nn.sigmoid(logits)
 
-    # Target matching across labels: (block_n, block_v)
+    # Target matching across labels: (block_n, block_v).
+    # Iterating over L avoids materializing a 3D (labels, block_n, block_v)
+    # tensor in VMEM, preventing OOM on 64 MiB VMEM chips (e.g. Ghostfish).
     if labels > 0:
-      tgt_val = tgt_ref[:labels, pl.ds(n_idx * block_n, block_n)]
-      y_true_chunk = jnp.any(tgt_val[:, :, None] == chunk_indices_local, axis=0)
+      tgt_val = tgt_ref[:, pl.ds(n_idx * block_n, block_n)]
+      y_true_chunk = jnp.zeros((block_n, block_v), dtype=jnp.bool_)
+      for l_idx in range(labels):
+        y_true_chunk = y_true_chunk | (
+            tgt_val[l_idx : l_idx + 1, :].T == chunk_indices_local
+        )
       y_true_float = y_true_chunk.astype(probs.dtype)
     else:
       y_true_float = 0.0
@@ -787,10 +796,16 @@ def _focal_bce_bwd_pallas_chunked_n(
   n = batch * seq_len
 
   vocab = embeddings.shape[0]
-  padded_d, block_v = _effective_block_v(config, hidden, vocab)
+  padded_d, block_v = _effective_block_v(
+      config, hidden, vocab, logit_vmem_tiles=_FOCAL_LOGIT_VMEM_TILES
+  )
   vmem_budget = _pallas_vmem_budget()
   max_chunk_n = _max_safe_chunk_n(
-      vmem_budget, padded_d, block_v, config.block_n
+      vmem_budget,
+      padded_d,
+      block_v,
+      config.block_n,
+      logit_vmem_tiles=_FOCAL_LOGIT_VMEM_TILES,
   )
   if n <= max_chunk_n:
     return _focal_bce_bwd_pallas(
@@ -857,7 +872,9 @@ def _focal_bce_bwd_pallas(
   block_n = config.block_n
   batch, seq_len, hidden = activations.shape
   vocab = embeddings.shape[0]
-  padded_d, block_v = _effective_block_v(config, hidden, vocab)
+  padded_d, block_v = _effective_block_v(
+      config, hidden, vocab, logit_vmem_tiles=_FOCAL_LOGIT_VMEM_TILES
+  )
   global_vocab = vocab if config.global_vocab is None else config.global_vocab
   n = batch * seq_len
   n_blocks = (n + block_n - 1) // block_n
