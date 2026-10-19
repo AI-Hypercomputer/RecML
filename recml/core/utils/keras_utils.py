@@ -206,6 +206,7 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=save_interval_epochs,
             max_to_keep=max_to_keep,
+            enable_background_delete=True,
             file_options=ocp.options.FileOptions(
                 cns2_storage_options=ocp.options.Cns2StorageOptions(
                     choose_store_cell=choose_store_cell,
@@ -339,6 +340,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=save_interval_epochs,
             max_to_keep=max_to_keep,
+            enable_background_delete=True,
             file_options=ocp.options.FileOptions(
                 cns2_storage_options=ocp.options.Cns2StorageOptions(
                     choose_store_cell=choose_store_cell,
@@ -1427,6 +1429,7 @@ class KerasOrbaxCheckpointManager(ocp.CheckpointManager):
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=save_interval_epochs,
             max_to_keep=max_to_keep,
+            enable_background_delete=True,
             file_options=ocp.options.FileOptions(
                 cns2_storage_options=ocp.options.Cns2StorageOptions(
                     choose_store_cell=choose_store_cell,
@@ -1717,6 +1720,28 @@ class EpochSummaryCallback(keras.callbacks.TensorBoard):
     # asynchronously.
     self.async_safe = True
 
+  @property
+  def _train_writer(self):
+    if "train" not in self._writers:
+      if jax.process_index() == 0:
+        self._writers["train"] = self.summary.create_file_writer(
+            self._train_dir, max_queue=1000
+        )
+      else:
+        self._writers["train"] = self.summary.create_noop_writer()
+    return self._writers["train"]
+
+  @property
+  def _val_writer(self):
+    if "val" not in self._writers:
+      if jax.process_index() == 0:
+        self._writers["val"] = self.summary.create_file_writer(
+            self._val_dir, max_queue=1000
+        )
+      else:
+        self._writers["val"] = self.summary.create_noop_writer()
+    return self._writers["val"]
+
   def set_model(self, model: keras.Model):
     """Sets Keras model and writes graph if specified."""
     super().set_model(model)
@@ -1763,17 +1788,21 @@ class EpochSummaryCallback(keras.callbacks.TensorBoard):
       num_params = self._get_num_params(training=True)
       logs.update(num_params)
       train_logs.update(num_params)
-      with self._train_writer.as_default():
-        for name, value in train_logs.items():
-          self.summary.scalar(name, value, step=step)
+      if jax.process_index() == 0:
+        with self._train_writer.as_default():
+          for name, value in train_logs.items():
+            self.summary.scalar(name, value, step=step)
+        self._train_writer.flush()
 
     if val_logs:
       num_params = self._get_num_params(training=False)
       logs.update(num_params)
       val_logs.update(num_params)
-      with self._val_writer.as_default():
-        for name, value in val_logs.items():
-          self.summary.scalar(name.removeprefix("val_"), value, step=step)
+      if jax.process_index() == 0:
+        with self._val_writer.as_default():
+          for name, value in val_logs.items():
+            self.summary.scalar(name.removeprefix("val_"), value, step=step)
+        self._val_writer.flush()
 
   def _collect_learning_rate(self, logs: Any) -> Any:
     if not self.model:
