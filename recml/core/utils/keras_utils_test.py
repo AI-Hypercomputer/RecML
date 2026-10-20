@@ -889,6 +889,20 @@ class KerasUtilsTest(parameterized.TestCase):
     callback.on_train_begin()
     checkpoint_manager.wait_until_finished()
     self.assertTrue(os.path.exists(os.path.join(checkpoint_dir, "0")))
+    checkpoint_manager.close()
+
+  @parameterized.named_parameters(
+      ("v1", keras_utils.KerasOrbaxCheckpointManager),
+      ("v2", keras_utils.KerasOrbaxCheckpointManagerV2),
+      ("v3", keras_utils.KerasOrbaxCheckpointManagerV3),
+  )
+  def test_checkpoint_manager_enables_background_delete(
+      self, checkpoint_manager_cls
+  ):
+    checkpoint_dir = self.create_tempdir().full_path
+    checkpoint_manager = checkpoint_manager_cls(checkpoint_dir, max_to_keep=2)
+    self.assertTrue(checkpoint_manager._options.enable_background_delete)
+    checkpoint_manager.close()
 
 
 class KerasOrbaxCheckpointUtilsTest(absltest.TestCase):
