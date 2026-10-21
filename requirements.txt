@@ -4,7 +4,7 @@ array-record==0.8.3
 astroid==3.3.9
 astunparse==1.6.3
 attrs==25.3.0
-certifi==2025.1.31
+certifi==2026.10.19
 cfgv==3.4.0
 charset-normalizer==3.4.1
 chex==0.1.89
