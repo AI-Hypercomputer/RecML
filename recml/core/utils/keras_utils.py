@@ -13,7 +13,8 @@
 # limitations under the License.
 """Utilities for training Keras models on Jax backend."""
 
-from collections.abc import Container, Mapping, Sequence
+from collections.abc import Container, Iterator, Mapping, Sequence
+import contextlib
 import dataclasses
 import datetime
 import enum
@@ -24,7 +25,12 @@ from typing import Any
 from absl import logging
 from etils import epath
 import jax
+import jax.numpy as jnp
+from jax_tpu_embedding.sparsecore.lib.nn import embedding as jte_embedding
+from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
+from jax_tpu_embedding.sparsecore.lib.nn import table_stacking as jte_table_stacking
 import keras
+import numpy as np
 import orbax.checkpoint as ocp
 import tensorflow as tf
 
@@ -247,49 +253,50 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
 
   def restore_model_variables(self, model: keras.Model, epoch: int):
     """Restores the model variables and optimizer variables during training."""
+    with _sparsecore_restore_context(model, str(self.directory), epoch):
+      _assert_variables_built(model)
+      _assert_all_layers_built(model)
 
-    _assert_variables_built(model)
-    _assert_all_layers_built(model)
+      if not model._jax_state_synced:  # pylint: disable=protected-access
+        model.jax_state_sync()
 
-    if not model._jax_state_synced:  # pylint: disable=protected-access
-      model.jax_state_sync()
+      variables = {
+          TRAINABLE_VARIABLES_KEY: model.trainable_variables,
+          NON_TRAINABLE_VARIABLES_KEY: model.non_trainable_variables,
+          OPTIMIZER_VARIABLES_KEY: model.optimizer.variables,
+      }
 
-    variables = {
-        TRAINABLE_VARIABLES_KEY: model.trainable_variables,
-        NON_TRAINABLE_VARIABLES_KEY: model.non_trainable_variables,
-        OPTIMIZER_VARIABLES_KEY: model.optimizer.variables,
-    }
+      # TODO(zixiangzhou): Update variables to use a nested dictionary and index
+      # map instead of flattened list.
 
-    # TODO(zixiangzhou): Update variables to use a nested dictionary and index
-    # map instead of flattened list.
+      # Construct abstract variables to ensure the checkpoint is restored with
+      # the same sharding as the current variables. This is so we can delete the
+      # variables from device memory to reduce peak memory usage.
+      abstract_variables = jax.tree.map(_to_shape_dtype_struct, variables)
+      for var in jax.tree.flatten(variables)[0]:
+        var.value.delete()
+        var._value = None  # pylint: disable=protected-access
 
-    # Construct abstract variables to ensure the checkpoint is restored with
-    # the same sharding as the current variables. This is so we can delete the
-    # variables from device memory to reduce peak memory usage.
-    abstract_variables = jax.tree.map(_to_shape_dtype_struct, variables)
-    for var in jax.tree.flatten(variables)[0]:
-      var.value.delete()
-      var._value = None  # pylint: disable=protected-access
+      logging.info("Restoring checkpoint for epoch %s...", epoch)
 
-    logging.info("Restoring checkpoint for epoch %s...", epoch)
+      restored_items = self.restore(
+          step=epoch,
+          args=ocp.args.Composite(**{
+              STATE_CHECKPOINT_KEY: ocp.args.StandardRestore(abstract_variables)
+          }),
+      )
+      restored_variables = restored_items[STATE_CHECKPOINT_KEY]
 
-    restored_items = self.restore(
-        step=epoch,
-        args=ocp.args.Composite(**{
-            STATE_CHECKPOINT_KEY: ocp.args.StandardRestore(abstract_variables)
-        }),
-    )
-    restored_variables = restored_items[STATE_CHECKPOINT_KEY]
+      logging.info("Restored checkpoint for epoch %s.", epoch)
 
-    logging.info("Restored checkpoint for epoch %s.", epoch)
+      model._initial_epoch = epoch + 1  # pylint: disable=protected-access
 
-    model._initial_epoch = epoch + 1  # pylint: disable=protected-access
-
-    keras.tree.assert_same_structure(variables, restored_variables)
-    for var, restored_var in zip(
-        jax.tree.flatten(variables)[0], jax.tree.flatten(restored_variables)[0]
-    ):
-      var._value = restored_var  # pylint: disable=protected-access
+      keras.tree.assert_same_structure(variables, restored_variables)
+      for var, restored_var in zip(
+          jax.tree.flatten(variables)[0],
+          jax.tree.flatten(restored_variables)[0],
+      ):
+        var._value = restored_var  # pylint: disable=protected-access
 
 
 class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
@@ -409,75 +416,75 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
 
   def restore_model_variables(self, model: keras.Model, epoch: int):
     """Restores the model variables and optimizer variables during training."""
+    with _sparsecore_restore_context(model, str(self.directory), epoch):
+      _assert_variables_built(model)
+      _assert_all_layers_built(model)
 
-    _assert_variables_built(model)
-    _assert_all_layers_built(model)
+      if not model._jax_state_synced:  # pylint: disable=protected-access
+        model.jax_state_sync()
 
-    if not model._jax_state_synced:  # pylint: disable=protected-access
-      model.jax_state_sync()
+      trainable_variables = _variables_to_path_dict(
+          model.trainable_variables, TRAINABLE_VARIABLES_KEY
+      )
+      non_trainable_variables = _variables_to_path_dict(
+          model.non_trainable_variables, NON_TRAINABLE_VARIABLES_KEY
+      )
+      optimizer_variables = _variables_to_path_dict(
+          model.optimizer.variables, OPTIMIZER_VARIABLES_KEY
+      )
 
-    trainable_variables = _variables_to_path_dict(
-        model.trainable_variables, TRAINABLE_VARIABLES_KEY
-    )
-    non_trainable_variables = _variables_to_path_dict(
-        model.non_trainable_variables, NON_TRAINABLE_VARIABLES_KEY
-    )
-    optimizer_variables = _variables_to_path_dict(
-        model.optimizer.variables, OPTIMIZER_VARIABLES_KEY
-    )
+      variables = {
+          TRAINABLE_VARIABLES_KEY: trainable_variables,
+          NON_TRAINABLE_VARIABLES_KEY: non_trainable_variables,
+          OPTIMIZER_VARIABLES_KEY: optimizer_variables,
+      }
 
-    variables = {
-        TRAINABLE_VARIABLES_KEY: trainable_variables,
-        NON_TRAINABLE_VARIABLES_KEY: non_trainable_variables,
-        OPTIMIZER_VARIABLES_KEY: optimizer_variables,
-    }
+      # Construct abstract variables to ensure the checkpoint is restored with
+      # the same sharding as the current variables.
+      abstract_variables = jax.tree.map(_to_shape_dtype_struct, variables)
+      for var in jax.tree.flatten(variables)[0]:
+        var.value.delete()
+        var._value = None  # pylint: disable=protected-access
 
-    # Construct abstract variables to ensure the checkpoint is restored with
-    # the same sharding as the current variables.
-    abstract_variables = jax.tree.map(_to_shape_dtype_struct, variables)
-    for var in jax.tree.flatten(variables)[0]:
-      var.value.delete()
-      var._value = None  # pylint: disable=protected-access
+      logging.info("Restoring checkpoint for epoch %s...", epoch)
 
-    logging.info("Restoring checkpoint for epoch %s...", epoch)
+      step_path = os.path.join(self.directory, str(epoch))
+      abstract_variables, state_transforms = _prepare_v3_restore(
+          step_path,
+          abstract_variables,
+          model,
+          restore_optimizer_vars=True,
+      )
 
-    step_path = os.path.join(self.directory, str(epoch))
-    abstract_variables, state_transforms = _prepare_v3_restore(
-        step_path,
-        abstract_variables,
-        model,
-        restore_optimizer_vars=True,
-    )
+      restored_items = self.restore(
+          step=epoch,
+          args=ocp.args.Composite(**{
+              STATE_CHECKPOINT_KEY: ocp.args.PyTreeRestore(
+                  abstract_variables,
+                  transforms=state_transforms,
+                  restore_args=ocp.checkpoint_utils.construct_restore_args(
+                      abstract_variables
+                  ),
+              )
+          }),
+      )
+      restored_variables = restored_items[STATE_CHECKPOINT_KEY]
 
-    restored_items = self.restore(
-        step=epoch,
-        args=ocp.args.Composite(**{
-            STATE_CHECKPOINT_KEY: ocp.args.PyTreeRestore(
-                abstract_variables,
-                transforms=state_transforms,
-                restore_args=ocp.checkpoint_utils.construct_restore_args(
-                    abstract_variables
-                ),
-            )
-        }),
-    )
-    restored_variables = restored_items[STATE_CHECKPOINT_KEY]
+      logging.info("Restored checkpoint for epoch %s.", epoch)
 
-    logging.info("Restored checkpoint for epoch %s.", epoch)
+      model._initial_epoch = epoch + 1  # pylint: disable=protected-access
 
-    model._initial_epoch = epoch + 1  # pylint: disable=protected-access
+      keras.tree.assert_same_structure(variables, restored_variables)
 
-    keras.tree.assert_same_structure(variables, restored_variables)
-
-    for key in [
-        TRAINABLE_VARIABLES_KEY,
-        NON_TRAINABLE_VARIABLES_KEY,
-        OPTIMIZER_VARIABLES_KEY,
-    ]:
-      var_dict = variables[key]
-      restored_var_dict = restored_variables[key]
-      for path, var in var_dict.items():
-        var._value = restored_var_dict[path]  # pylint: disable=protected-access
+      for key in [
+          TRAINABLE_VARIABLES_KEY,
+          NON_TRAINABLE_VARIABLES_KEY,
+          OPTIMIZER_VARIABLES_KEY,
+      ]:
+        var_dict = variables[key]
+        restored_var_dict = restored_variables[key]
+        for path, var in var_dict.items():
+          var._value = restored_var_dict[path]  # pylint: disable=protected-access
 
 
 def resolve_orbax_checkpoint_path(
@@ -1163,81 +1170,82 @@ def restore_keras_checkpoint(
 
   _assert_all_layers_built(model)
 
-  if is_v3:
-    variables = {
-        TRAINABLE_VARIABLES_KEY: _variables_to_path_dict(
-            model.trainable_variables, TRAINABLE_VARIABLES_KEY
-        ),
-        NON_TRAINABLE_VARIABLES_KEY: _variables_to_path_dict(
-            model.non_trainable_variables, NON_TRAINABLE_VARIABLES_KEY
-        ),
-    }
-    if restore_optimizer_vars:
-      if not model.optimizer.built:
-        raise ValueError(
-            "To use `restore_keras_checkpoint` on an existing model with"
-            " `restore_optimizer_vars` set to True, the optimizer must be"
-            " built."
+  with _sparsecore_restore_context(model, checkpoint_dir, epoch):
+    if is_v3:
+      variables = {
+          TRAINABLE_VARIABLES_KEY: _variables_to_path_dict(
+              model.trainable_variables, TRAINABLE_VARIABLES_KEY
+          ),
+          NON_TRAINABLE_VARIABLES_KEY: _variables_to_path_dict(
+              model.non_trainable_variables, NON_TRAINABLE_VARIABLES_KEY
+          ),
+      }
+      if restore_optimizer_vars:
+        if not model.optimizer.built:
+          raise ValueError(
+              "To use `restore_keras_checkpoint` on an existing model with"
+              " `restore_optimizer_vars` set to True, the optimizer must be"
+              " built."
+          )
+        variables[OPTIMIZER_VARIABLES_KEY] = _variables_to_path_dict(
+            model.optimizer.variables, OPTIMIZER_VARIABLES_KEY
         )
-      variables[OPTIMIZER_VARIABLES_KEY] = _variables_to_path_dict(
-          model.optimizer.variables, OPTIMIZER_VARIABLES_KEY
+    else:
+      variables = {
+          TRAINABLE_VARIABLES_KEY: model.trainable_variables,
+          NON_TRAINABLE_VARIABLES_KEY: model.non_trainable_variables,
+      }
+      if restore_optimizer_vars:
+        if not model.optimizer.built:
+          raise ValueError(
+              "To use `restore_keras_checkpoint` on an existing model with"
+              " `restore_optimizer_vars` set to True, the optimizer must be"
+              " built."
+          )
+        variables[OPTIMIZER_VARIABLES_KEY] = model.optimizer.variables
+
+    # TODO(zixiangzhou): Update variables to use a nested dictionary and index
+    # map instead of flattened list.
+
+    # Construct abstract variables to ensure the checkpoint is restored with
+    # the same sharding as the current variables.
+    abstract_state = jax.tree.map(_to_shape_dtype_struct, variables)
+
+    state_transforms = {}
+    if is_v3:
+      abstract_state, state_transforms = _prepare_v3_restore(
+          checkpoint_path, abstract_state, model, restore_optimizer_vars
       )
-  else:
-    variables = {
-        TRAINABLE_VARIABLES_KEY: model.trainable_variables,
-        NON_TRAINABLE_VARIABLES_KEY: model.non_trainable_variables,
-    }
-    if restore_optimizer_vars:
-      if not model.optimizer.built:
-        raise ValueError(
-            "To use `restore_keras_checkpoint` on an existing model with"
-            " `restore_optimizer_vars` set to True, the optimizer must be"
-            " built."
-        )
-      variables[OPTIMIZER_VARIABLES_KEY] = model.optimizer.variables
 
-  # TODO(zixiangzhou): Update variables to use a nested dictionary and index map
-  # instead of flattened list.
-
-  # Construct abstract variables to ensure the checkpoint is restored with
-  # the same sharding as the current variables.
-  abstract_state = jax.tree.map(_to_shape_dtype_struct, variables)
-
-  state_transforms = {}
-  if is_v3:
-    abstract_state, state_transforms = _prepare_v3_restore(
-        checkpoint_path, abstract_state, model, restore_optimizer_vars
-    )
-
-  # Delete the variables from device memory to reduce peak memory usage.
-  # Only delete variables that we are actually trying to restore.
-  if is_v3:
-    for key, path_dict in abstract_state.items():
-      for path in path_dict.keys():
-        var = variables[key][path]
+    # Delete the variables from device memory to reduce peak memory usage.
+    # Only delete variables that we are actually trying to restore.
+    if is_v3:
+      for key, path_dict in abstract_state.items():
+        for path in path_dict.keys():
+          var = variables[key][path]
+          var.value.delete()
+          var._value = None  # pylint: disable=protected-access
+    else:
+      for var in jax.tree.flatten(variables)[0]:
         var.value.delete()
         var._value = None  # pylint: disable=protected-access
-  else:
-    for var in jax.tree.flatten(variables)[0]:
-      var.value.delete()
-      var._value = None  # pylint: disable=protected-access
 
-  restored_state = _restore_state_pytree(
-      checkpoint_path,
-      abstract_state,
-      state_transforms=state_transforms,
-  )
-
-  if is_v3:
-    _assign_v3_restored_values(
-        variables, restored_state, restore_optimizer_vars
+    restored_state = _restore_state_pytree(
+        checkpoint_path,
+        abstract_state,
+        state_transforms=state_transforms,
     )
-  else:
-    keras.tree.assert_same_structure(variables, restored_state)
-    for var, restored_var in zip(
-        jax.tree.flatten(variables)[0], jax.tree.flatten(restored_state)[0]
-    ):
-      var._value = restored_var  # pylint: disable=protected-access
+
+    if is_v3:
+      _assign_v3_restored_values(
+          variables, restored_state, restore_optimizer_vars
+      )
+    else:
+      keras.tree.assert_same_structure(variables, restored_state)
+      for var, restored_var in zip(
+          jax.tree.flatten(variables)[0], jax.tree.flatten(restored_state)[0]
+      ):
+        var._value = restored_var  # pylint: disable=protected-access
 
   if restore_model_epoch:
     model._initial_epoch = epoch + 1  # pylint: disable=protected-access  # pyrefly: ignore[unsupported-operation]
@@ -1245,6 +1253,351 @@ def restore_keras_checkpoint(
     model.optimizer.iterations.assign(0)
 
   return model
+
+
+class _RestoreValuePlaceholder:
+  """Placeholder for `keras.Variable._value` during Orbax shape discovery."""
+
+  __slots__ = ("shape", "dtype", "sharding")
+
+  def __init__(
+      self,
+      shape: tuple[int, ...],
+      dtype: Any,
+      sharding: jax.sharding.Sharding,
+  ):
+    self.shape = shape
+    self.dtype = dtype
+    self.sharding = sharding
+
+  def delete(self) -> None:
+    pass
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+  return ((value + multiple - 1) // multiple) * multiple
+
+
+def _reshard_stacked_array(
+    stacked_array: jax.Array,
+    table_stack: Sequence[embedding_spec.TableSpec],
+    *,
+    src_num_shards: int,
+    src_rotation: int,
+    dst_num_shards: int,
+    dst_rotation: int,
+    pad_value: float = 0.0,
+) -> jax.Array:
+  """Reshards a stacked SparseCore table or slot tensor across topologies."""
+  stack_embedding_dim = stacked_array.shape[-1]
+  src_3d = stacked_array.reshape(src_num_shards, -1, stack_embedding_dim)
+  src_row_offset = 0
+  src_shard_rotation = 0
+  dst_shards = []
+  dst_shard_rotation = 0
+  for table_spec in table_stack:
+    vocab_size = table_spec.vocabulary_size
+    embedding_dim = table_spec.embedding_dim
+    src_padded_vocab = _round_up_to_multiple(vocab_size, 8 * src_num_shards)
+    src_sharded_vocab = src_padded_vocab // src_num_shards
+    padded_values = src_3d[
+        :, src_row_offset : (src_row_offset + src_sharded_vocab), :
+    ]
+    padded_values = jnp.roll(padded_values, -src_shard_rotation, axis=0)
+    padded_values = jnp.swapaxes(padded_values, 0, 1).reshape(
+        -1, stack_embedding_dim
+    )
+    unstacked = padded_values[:vocab_size, :embedding_dim]
+    src_row_offset += src_sharded_vocab
+    src_shard_rotation = (src_shard_rotation + src_rotation) % src_num_shards
+
+    dst_padded_vocab = _round_up_to_multiple(vocab_size, 8 * dst_num_shards)
+    dst_padded = jnp.pad(
+        unstacked,
+        (
+            (0, dst_padded_vocab - vocab_size),
+            (0, stack_embedding_dim - embedding_dim),
+        ),
+        constant_values=pad_value,
+    )
+    dst_sharded = jnp.swapaxes(
+        dst_padded.reshape(-1, dst_num_shards, stack_embedding_dim), 0, 1
+    )
+    dst_rotated = jnp.roll(dst_sharded, dst_shard_rotation, axis=0)
+    dst_shards.append(dst_rotated)
+    dst_shard_rotation = (dst_shard_rotation + dst_rotation) % dst_num_shards
+
+  return jnp.concatenate(dst_shards, axis=1).reshape(-1, stack_embedding_dim)
+
+
+def _infer_source_sharding(
+    table_stacks: Mapping[str, Sequence[embedding_spec.TableSpec]],
+    stored_meta_by_stack: Mapping[str, Any],
+    dst_global_device_count: int,
+    dst_num_sc_per_device: int,
+) -> tuple[int, int]:
+  """Infers `(src_num_shards, src_num_sc_per_device)` from checkpoint metadata."""
+  first_meta = next(iter(stored_meta_by_stack.values()))
+  sharding_meta = getattr(first_meta, "sharding", None)
+  sharding_shape = getattr(sharding_meta, "shape", None)
+  if sharding_shape is not None and len(sharding_shape) > 0:
+    src_global_device_count = int(np.prod(sharding_shape))
+  else:
+    src_global_device_count = dst_global_device_count
+
+  def _matches(num_shards: int) -> bool:
+    for stack_name, table_stack in table_stacks.items():
+      meta = stored_meta_by_stack.get(stack_name)
+      if meta is None or getattr(meta, "shape", None) is None:
+        continue
+      expected_rows = sum(
+          _round_up_to_multiple(t.vocabulary_size, 8 * num_shards)
+          for t in table_stack
+      )
+      if expected_rows != meta.shape[0]:
+        return False
+    return True
+
+  sc_candidates = list(dict.fromkeys((dst_num_sc_per_device, 2, 4, 1, 8, 16)))
+  for sc_per_dev in sc_candidates:
+    cand_shards = src_global_device_count * sc_per_dev
+    if _matches(cand_shards):
+      return cand_shards, sc_per_dev
+
+  dst_num_shards = dst_global_device_count * dst_num_sc_per_device
+  shard_candidates = list(
+      dict.fromkeys([dst_num_shards, *(1 << k for k in range(15))])
+  )
+  for cand_shards in shard_candidates:
+    if _matches(cand_shards):
+      sc_per_dev = (
+          cand_shards // src_global_device_count
+          if cand_shards % src_global_device_count == 0
+          else dst_num_sc_per_device
+      )
+      return cand_shards, sc_per_dev
+
+  return dst_num_shards, dst_num_sc_per_device
+
+
+def _extract_sparsecore_layer_state(
+    layer: Any,
+) -> tuple[Any, Any, Mapping[str, Any]] | None:
+  """Extracts `(config, sc_layout, table_and_slot_vars)` from a layer."""
+  if not getattr(layer, "built", False) or not getattr(
+      layer, "_sparsecore_built", False
+  ):
+    return None
+  # Direct SparseCoreEmbedding (jax_tpu_embedding):
+  config = getattr(layer, "_config", None)
+  sc_layout = getattr(layer, "_sparsecore_layout", None)
+  table_vars = getattr(layer, "_table_and_slot_variables", None)
+  if config is not None and sc_layout is not None and table_vars is not None:
+    return config, sc_layout, table_vars
+  # KerasRS DistributedEmbedding wrapper:
+  inner = getattr(layer, "_embedding", None)
+  if inner is not None and getattr(inner, "built", False):
+    config = getattr(inner, "_config", None)
+    if config is not None:
+      sc_layout = getattr(config, "sparsecore_layout", None)
+      table_vars = getattr(config, "table_and_slot_variables", None)
+      if sc_layout is not None and table_vars is not None:
+        return config, sc_layout, table_vars
+  return None
+
+
+@contextlib.contextmanager
+def _sparsecore_restore_context(
+    model: keras.Model | None,
+    checkpoint_dir: str,
+    epoch: int | None = None,
+) -> Iterator[None]:
+  """Adapts `SparseCoreEmbedding` variables for cross-topology Orbax restore.
+
+  Why this is needed:
+  On SparseCore, `jax_tpu_embedding` stacks and shards tables according to the
+  total number of SparseCores in the active topology
+  (`num_shards = global_device_count * num_sc_per_device`):
+  1. Each constituent table's vocabulary size is padded up to a multiple of
+     `8 * num_shards`, so the physical stacked tensor shape
+     `(stack_vocab_size, stack_embedding_dim)` changes across topologies (e.g.,
+     `glp=4x4` train with 32 SparseCores vs. `glp=2x2` eval with 8 SparseCores).
+  2. Within each stacked tensor, rows are mod-sharded across `num_shards` and
+     rotated by `shard_rotation = (table_idx * num_sc_per_device) % num_shards`.
+
+  Unlike TensorFlow's `TPUEmbeddingV2` (which registers
+  `TpuEmbeddingV3CheckpointAdapter` with `tf.train.Checkpoint`), RecML's
+  `restore_keras_checkpoint` asks Orbax's `PyTreeCheckpointHandler` to restore
+  each `keras.Variable` directly into `jax.ShapeDtypeStruct(var.value.shape,
+  var.value.dtype, var.value.sharding)`. When the train and eval topologies
+  differ, Orbax fails with a shape mismatch error, or—if vocabulary sizes happen
+  to be divisible by both `8 * src_num_shards` and `8 * dst_num_shards`—loads
+  rows that are mod-sharded for the wrong number of SparseCores.
+
+  Before yielding to the Orbax restore call, this context manager inspects the
+  checkpoint's `ArrayMetadata` to infer `(src_num_shards,
+  src_num_sc_per_device)` and replaces mismatched `var._value` buffers with
+  lightweight `_RestoreValuePlaceholder` descriptors matching the stored shape.
+  After Orbax restores the raw stacked tensors, it un-rotates, un-mod-shards,
+  and un-pads each constituent table from `src_num_shards`, then re-pads,
+  mod-shards, rotates, and re-stacks them for `dst_num_shards` with the target
+  SparseCore physical layout.
+
+  Args:
+    model: The target Keras model being restored into.
+    checkpoint_dir: Directory containing the Orbax checkpoint(s).
+    epoch: Optional step/epoch being restored.
+  """
+  if model is None or keras.backend.backend() != "jax":
+    yield
+    return
+
+  sc_layer_states = []
+  for layer in model._flatten_layers(include_self=True):  # pylint: disable=protected-access
+    state = _extract_sparsecore_layer_state(layer)
+    if state is not None:
+      sc_layer_states.append(state)
+  if not sc_layer_states:
+    yield
+    return
+
+  if not model._jax_state_synced:  # pylint: disable=protected-access
+    model.jax_state_sync()
+
+  try:
+    checkpoint_path, _ = resolve_orbax_checkpoint_path(checkpoint_dir, epoch)
+    state_dir = epath.Path(checkpoint_path) / STATE_CHECKPOINT_KEY
+    if not state_dir.exists():
+      yield
+      return
+    saved_state_metadata = ocp.handlers.PyTreeCheckpointHandler().metadata(
+        state_dir
+    )
+  except Exception:  # pylint: disable=broad-exception-caught
+    yield
+    return
+
+  saved_trainable_meta = saved_state_metadata.get(TRAINABLE_VARIABLES_KEY)
+  meta_by_path: dict[str, Any] = {}
+  if isinstance(saved_trainable_meta, Mapping):
+    for var in model.trainable_variables:
+      if var.path in saved_trainable_meta:
+        meta_by_path[var.path] = saved_trainable_meta[var.path]
+  elif isinstance(saved_trainable_meta, Sequence) and len(
+      saved_trainable_meta
+  ) == len(model.trainable_variables):
+    for var, meta in zip(model.trainable_variables, saved_trainable_meta):
+      meta_by_path[var.path] = meta
+
+  if not meta_by_path:
+    yield
+    return
+
+  saved_layouts: list[tuple[keras.Variable, Any]] = []
+  stacks_to_postprocess: list[
+      tuple[
+          Any,
+          list[embedding_spec.TableSpec],
+          list[keras.Variable],
+          int,
+          int,
+          int,
+          int,
+      ]
+  ] = []
+
+  for config, sc_layout, table_vars in sc_layer_states:
+    dst_mesh = config.mesh
+    dst_global_device_count = dst_mesh.devices.size
+    dst_num_sc_per_device = config.num_sc_per_device
+    dst_num_shards = dst_global_device_count * dst_num_sc_per_device
+    sc_sharding = sc_layout.backend_layout.sharding
+    replicated_sharding = jax.sharding.NamedSharding(
+        dst_mesh, jax.sharding.PartitionSpec()
+    )
+    table_specs = jte_embedding.get_table_specs(config.feature_specs)
+    table_stacks = jte_table_stacking.get_table_stacks(table_specs)
+    stored_meta_by_stack = {
+        stack_name: meta_by_path[table_vars[stack_name].table.path]
+        for stack_name in table_stacks
+        if table_vars[stack_name].table.path in meta_by_path
+    }
+    if not stored_meta_by_stack:
+      continue
+    src_num_shards, src_num_sc_per_device = _infer_source_sharding(
+        table_stacks,
+        stored_meta_by_stack,
+        dst_global_device_count,
+        dst_num_sc_per_device,
+    )
+    for stack_name, table_stack in table_stacks.items():
+      if stack_name not in stored_meta_by_stack:
+        continue
+      emb_vars = table_vars[stack_name]
+      stack_vars: list[Any] = [
+          emb_vars.table,
+          *keras.tree.flatten(emb_vars.slot),
+      ]
+      stacks_to_postprocess.append((
+          sc_layout,
+          table_stack,
+          stack_vars,
+          src_num_shards,
+          src_num_sc_per_device,
+          dst_num_shards,
+          dst_num_sc_per_device,
+      ))
+      for var in stack_vars:
+        saved_layouts.append((var, var._layout))  # pylint: disable=protected-access
+        var._layout = None  # pylint: disable=protected-access
+        var_meta = meta_by_path.get(var.path, stored_meta_by_stack[stack_name])
+        stored_shape = tuple(var_meta.shape)
+        if stored_shape != tuple(var.shape):
+          restore_sharding = (
+              sc_sharding
+              if stored_shape[0] % dst_global_device_count == 0
+              else replicated_sharding
+          )
+          var_dtype = var.value.dtype
+          var.value.delete()
+          var._value = _RestoreValuePlaceholder(  # pylint: disable=protected-access
+              shape=stored_shape,
+              dtype=var_dtype,
+              sharding=restore_sharding,
+          )
+
+  try:
+    yield
+  finally:
+    for var, orig_layout in saved_layouts:
+      var._layout = orig_layout  # pylint: disable=protected-access
+
+  for (
+      sc_layout,
+      table_stack,
+      stack_vars,
+      src_num_shards,
+      src_num_sc_per_device,
+      dst_num_shards,
+      dst_num_sc_per_device,
+  ) in stacks_to_postprocess:
+    needs_reshard = (src_num_shards, src_num_sc_per_device) != (
+        dst_num_shards,
+        dst_num_sc_per_device,
+    )
+    for var in stack_vars:
+      restored_val = var._value  # pylint: disable=protected-access
+      if needs_reshard or tuple(restored_val.shape) != tuple(var.shape):
+        restored_val = _reshard_stacked_array(
+            restored_val,
+            table_stack,
+            src_num_shards=src_num_shards,
+            src_rotation=src_num_sc_per_device,
+            dst_num_shards=dst_num_shards,
+            dst_rotation=dst_num_sc_per_device,
+        )
+      var._layout = sc_layout  # pylint: disable=protected-access
+      var.assign(restored_val)
 
 
 def restore_partial_checkpoint(
