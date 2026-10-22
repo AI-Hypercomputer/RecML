@@ -1160,6 +1160,70 @@ class BinaryFocalCrossEntropyOpsTest(parameterized.TestCase):
         g_emb_forced, g_emb_clamped, atol=1e-4, rtol=1e-4
     )
 
+  @parameterized.named_parameters(
+      ('pure_jax', False),
+      ('pallas', True),
+  )
+  def test_cut_focal_bce_inside_shard_map_jit_grad(self, use_pallas):
+    num_devices = jax.device_count()
+    batch, seq_len, hidden_dim = 2 * num_devices, 16, 128
+    vocab_size, block_v, num_labels = 256, 128, 3
+    key_act, key_emb, key_tgt = jax.random.split(jax.random.PRNGKey(17), 3)
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), 0, vocab_size
+    )
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ('batch',))
+
+    def sharded_loss(act, emb):
+      tiled_emb = jnp.tile(emb, (num_devices, 1))
+
+      def per_shard(local_act, local_emb, local_tgt):
+        _, per_pos = (
+            binary_focal_cross_entropy_ops.cut_binary_focal_cross_entropy(
+                local_act,
+                local_emb,
+                local_tgt,
+                block_v=block_v,
+                use_pallas=use_pallas,
+                return_per_target_losses=True,
+            )
+        )
+        return per_pos
+
+      losses = jax.shard_map(
+          per_shard,
+          mesh=mesh,
+          in_specs=(P('batch'), P('batch'), P('batch')),
+          out_specs=P('batch'),
+          check_vma=False,
+      )(act, tiled_emb, targets)
+      return jnp.mean(losses)
+
+    def ref_loss(act, emb):
+      _, per_pos = (
+          binary_focal_cross_entropy_ops.cut_binary_focal_cross_entropy(
+              act,
+              emb,
+              targets,
+              block_v=block_v,
+              use_pallas=use_pallas,
+              return_per_target_losses=True,
+          )
+      )
+      return jnp.mean(per_pos)
+
+    loss_got, (g_act_got, g_emb_got) = jax.jit(
+        jax.value_and_grad(sharded_loss, argnums=(0, 1))
+    )(activations, embeddings)
+    loss_ref, (g_act_ref, g_emb_ref) = jax.jit(
+        jax.value_and_grad(ref_loss, argnums=(0, 1))
+    )(activations, embeddings)
+    np.testing.assert_allclose(loss_got, loss_ref, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_act_got, g_act_ref, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_emb_got, g_emb_ref, atol=1e-5, rtol=1e-5)
+
 
 if __name__ == '__main__':
   absltest.main()
