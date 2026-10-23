@@ -309,7 +309,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
   def __init__(
       self,
       checkpoint_dir: str,
-      max_to_keep: int = 5,
+      max_to_keep: int | None = 5,
       save_interval_epochs: int = 1,
       choose_store_cell: bool = True,
   ):
@@ -317,7 +317,8 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
 
     Args:
       checkpoint_dir: The directory to save checkpoints to.
-      max_to_keep: The maximum number of checkpoints to keep.
+      max_to_keep: The maximum number of checkpoints to keep, or None to keep
+        every checkpoint.
       save_interval_epochs: The interval (in epochs) to save checkpoints.
       choose_store_cell: Whether to dynamically select the CNS2 store cell.
     """
@@ -823,9 +824,10 @@ def _prepare_v3_restore(
     checkpointer.close()
 
   # Load index path metadata for non-trainable and optimizer variables if
-  # needed.
+  # present in `abstract_state` (partial restore omits these keys, whereas full
+  # restore includes them even when the dict is empty `{}`).
   non_trainable_paths = None
-  if model is not None and abstract_state.get(NON_TRAINABLE_VARIABLES_KEY):
+  if model is not None and NON_TRAINABLE_VARIABLES_KEY in abstract_state:
     nt_path = epath.Path(checkpoint_path) / NON_TRAINABLE_PATHS_KEY
     checkpointer = ocp.Checkpointer(ocp.handlers.JsonCheckpointHandler())
     try:
@@ -839,7 +841,7 @@ def _prepare_v3_restore(
   if (
       model is not None
       and restore_optimizer_vars
-      and abstract_state.get(OPTIMIZER_VARIABLES_KEY)
+      and OPTIMIZER_VARIABLES_KEY in abstract_state
   ):
     opt_path = epath.Path(checkpoint_path) / OPTIMIZER_PATHS_KEY
     checkpointer = ocp.Checkpointer(ocp.handlers.JsonCheckpointHandler())
@@ -858,7 +860,9 @@ def _prepare_v3_restore(
   state_transforms = {}
 
   for key in keys:
-    if not abstract_state.get(key):
+    # Keep empty dicts (e.g. `{}` when a model has no non-trainable variables)
+    # in `filtered_abstract_state` so the restored PyTree structure matches.
+    if key not in abstract_state:
       continue
 
     filtered_abstract_state[key] = {}
