@@ -26,8 +26,8 @@ from jax.experimental.pallas.ops.tpu import splash_attention
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask_info
 import jax.numpy as jnp
 import jaxtyping as jt
-import keras
 import numpy as np
+from recml.core.utils import distribution_utils
 
 
 NUM_LANES = 128
@@ -835,8 +835,8 @@ def pointwise_splash_attention(
     q_segment_ids: jax.Array | None = None,
     kv_segment_ids: jax.Array | None = None,
     sliding_window_size: int | None = None,
-    qkv_axis_names: tuple[str | None, ...] = (),
-    segment_id_axis_names: tuple[str | None, ...] = (),
+    qkv_axis_names: tuple[distribution_utils.AxisSpec, ...] = (),
+    segment_id_axis_names: tuple[distribution_utils.AxisSpec, ...] = (),
     scale: float | None = None,
     block_q: int | None = None,
     block_kv: int | None = None,
@@ -978,16 +978,7 @@ def pointwise_splash_attention(
         " provided."
     )
 
-  if (global_abstract_mesh := jax.sharding.get_abstract_mesh()).shape_tuple:
-    abstract_mesh = global_abstract_mesh
-  elif (distribution := keras.distribution.distribution()) is not None:
-    device_mesh: keras.distribution.DeviceMesh = distribution.device_mesh
-    abstract_mesh = jax.sharding.AbstractMesh(
-        axis_sizes=tuple(device_mesh.shape),
-        axis_names=tuple(device_mesh.axis_names),
-    )
-  else:
-    abstract_mesh = None
+  abstract_mesh = distribution_utils.get_abstract_mesh()
 
   def _kernel_wrapper(
       query: jax.Array,
@@ -1016,16 +1007,18 @@ def pointwise_splash_attention(
     )(query, key, value, segment_ids=segment_ids)
 
   if abstract_mesh is not None and abstract_mesh.shape_tuple:
+    batch_axis = distribution_utils.resolve_batch_axis(abstract_mesh)
+
     if not qkv_axis_names:
       qkv_axis_names = (
-          abstract_mesh.axis_names[0],  # batch dimension
+          batch_axis,  # batch dimension
           None,  # heads dimension
           None,  # length dimension
           None,  # hidden dimension
       )
     if not segment_id_axis_names:
       segment_id_axis_names = (
-          abstract_mesh.axis_names[0],  # batch dimension
+          batch_axis,  # batch dimension
           None,  # length dimension
       )
 
