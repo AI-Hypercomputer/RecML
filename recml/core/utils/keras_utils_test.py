@@ -163,6 +163,14 @@ class KerasUtilsTest(parameterized.TestCase):
     )
     checkpoint_manager.save_model_variables(bert_pretrainer, 0)
     checkpoint_manager.wait_until_finished()
+    # Only models with SparseCore tables save their SparseCore topology.
+    self.assertFalse(
+        os.path.exists(
+            os.path.join(
+                checkpoint_dir, "0", keras_utils.SPARSECORE_TOPOLOGY_KEY
+            )
+        )
+    )
 
     preds = bert_pretrainer(dummy_inputs)
 
@@ -242,6 +250,14 @@ class KerasUtilsTest(parameterized.TestCase):
     )
     checkpoint_manager.save_model_variables(bert_pretrainer, 0)
     checkpoint_manager.wait_until_finished()
+    # Only models with SparseCore tables save their SparseCore topology.
+    self.assertFalse(
+        os.path.exists(
+            os.path.join(
+                checkpoint_dir, "0", keras_utils.SPARSECORE_TOPOLOGY_KEY
+            )
+        )
+    )
 
     preds = bert_pretrainer(dummy_inputs)
 
@@ -287,6 +303,14 @@ class KerasUtilsTest(parameterized.TestCase):
     )
     checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
     checkpoint_manager.close()
+    # Only models with SparseCore tables save their SparseCore topology.
+    self.assertFalse(
+        os.path.exists(
+            os.path.join(
+                checkpoint_dir, "1", keras_utils.SPARSECORE_TOPOLOGY_KEY
+            )
+        )
+    )
 
     restored_model = keras_utils.restore_keras_checkpoint(checkpoint_dir)
     preds_after_restoration = restored_model(dummy_inputs)
@@ -318,6 +342,14 @@ class KerasUtilsTest(parameterized.TestCase):
     )
     checkpoint_manager.save_model_variables(bert_pretrainer, epoch=1)
     checkpoint_manager.close()
+    # Only models with SparseCore tables save their SparseCore topology.
+    self.assertFalse(
+        os.path.exists(
+            os.path.join(
+                checkpoint_dir, "1", keras_utils.SPARSECORE_TOPOLOGY_KEY
+            )
+        )
+    )
 
     restored_model = keras_utils.restore_keras_checkpoint(checkpoint_dir)
     preds_after_restoration = restored_model(dummy_inputs)
