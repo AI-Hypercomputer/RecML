@@ -26,6 +26,7 @@ from etils import epath
 import jax
 import keras
 import orbax.checkpoint as ocp
+from recml.core.utils import sparsecore_checkpoint_utils
 import tensorflow as tf
 
 
@@ -38,6 +39,9 @@ FORMAT_VERSION_KEY = "format_version"
 NON_TRAINABLE_PATHS_KEY = "non_trainable_paths"
 OPTIMIZER_PATHS_KEY = "optimizer_paths"
 SHARED_VARIABLE_MAP_KEY = "shared_variable_map"
+# How the SparseCore stacked tables were sharded, only saved for models with
+# SparseCore tables (see `sparsecore_checkpoint_utils.sparsecore_topology`).
+SPARSECORE_TOPOLOGY_KEY = sparsecore_checkpoint_utils.SPARSECORE_TOPOLOGY_KEY
 ORBAX_CHECKPOINT_DEFAULT_KEY = "default"
 
 
@@ -241,6 +245,7 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
         args=ocp.args.Composite(**{
             STATE_CHECKPOINT_KEY: ocp.args.StandardSave(state),
             CONFIG_CHECKPOINT_KEY: ocp.args.JsonSave(config),
+            **sparsecore_checkpoint_utils.sparsecore_topology_save_args(model),
         }),
         metrics=logs,
     )
@@ -262,6 +267,11 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
 
     # TODO(zixiangzhou): Update variables to use a nested dictionary and index
     # map instead of flattened list.
+
+    checkpoint_path, _ = resolve_orbax_checkpoint_path(
+        str(self.directory), epoch
+    )
+    sparsecore_restores = _prepare_sparsecore_restore(model, checkpoint_path)
 
     # Construct abstract variables to ensure the checkpoint is restored with
     # the same sharding as the current variables. This is so we can delete the
@@ -290,6 +300,8 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
         jax.tree.flatten(variables)[0], jax.tree.flatten(restored_variables)[0]
     ):
       var._value = restored_var  # pylint: disable=protected-access
+
+    sparsecore_checkpoint_utils.finish_sparsecore_restore(sparsecore_restores)
 
 
 class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
@@ -335,6 +347,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
             NON_TRAINABLE_PATHS_KEY,
             OPTIMIZER_PATHS_KEY,
             SHARED_VARIABLE_MAP_KEY,
+            SPARSECORE_TOPOLOGY_KEY,
         ),
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=save_interval_epochs,
@@ -403,6 +416,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
             NON_TRAINABLE_PATHS_KEY: ocp.args.JsonSave(non_trainable_paths),
             OPTIMIZER_PATHS_KEY: ocp.args.JsonSave(optimizer_paths),
             SHARED_VARIABLE_MAP_KEY: ocp.args.JsonSave(shared_variable_map),
+            **sparsecore_checkpoint_utils.sparsecore_topology_save_args(model),
         }),
         metrics=logs,
     )
@@ -432,6 +446,13 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
         OPTIMIZER_VARIABLES_KEY: optimizer_variables,
     }
 
+    step_path = os.path.join(self.directory, str(epoch))
+    # Read once for the SparseCore restore and `_prepare_v3_restore`.
+    saved_state_metadata = _validate_v3_checkpoint(step_path)
+    sparsecore_restores = _prepare_sparsecore_restore(
+        model, step_path, saved_state_metadata
+    )
+
     # Construct abstract variables to ensure the checkpoint is restored with
     # the same sharding as the current variables.
     abstract_variables = jax.tree.map(_to_shape_dtype_struct, variables)
@@ -441,12 +462,12 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
 
     logging.info("Restoring checkpoint for epoch %s...", epoch)
 
-    step_path = os.path.join(self.directory, str(epoch))
     abstract_variables, state_transforms = _prepare_v3_restore(
         step_path,
         abstract_variables,
         model,
         restore_optimizer_vars=True,
+        saved_state_metadata=saved_state_metadata,
     )
 
     restored_items = self.restore(
@@ -478,6 +499,8 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
       restored_var_dict = restored_variables[key]
       for path, var in var_dict.items():
         var._value = restored_var_dict[path]  # pylint: disable=protected-access
+
+    sparsecore_checkpoint_utils.finish_sparsecore_restore(sparsecore_restores)
 
 
 def resolve_orbax_checkpoint_path(
@@ -593,6 +616,25 @@ def is_v3_checkpoint(checkpoint_dir: str, epoch: int | None = None) -> bool:
   """Checks if a checkpoint is in V3 format."""
   checkpoint_path, _ = resolve_orbax_checkpoint_path(checkpoint_dir, epoch)
   return _detect_checkpoint_version(checkpoint_path) == CheckpointVersion.V3
+
+
+def _load_shared_variable_map(checkpoint_path: str) -> dict[str, str]:
+  """Returns the shared variable map of a V3 checkpoint.
+
+  Args:
+    checkpoint_path: The resolved checkpoint directory path of one step.
+
+  Returns:
+    Map from the alias path of each shared variable to its canonical path.
+  """
+  map_path = epath.Path(checkpoint_path) / SHARED_VARIABLE_MAP_KEY
+  checkpointer = ocp.Checkpointer(ocp.handlers.JsonCheckpointHandler())
+  try:
+    return checkpointer.restore(
+        os.fspath(map_path), args=ocp.args.JsonRestore()
+    )[SHARED_VARIABLE_MAP_KEY]
+  finally:
+    checkpointer.close()
 
 
 def _validate_v3_checkpoint(
@@ -783,6 +825,7 @@ def _prepare_v3_restore(
     restore_optimizer_vars: bool = False,
     transforms: Mapping[str, Any] | None = None,
     prefix_map: Mapping[str, str] | None = None,
+    saved_state_metadata: Any | None = None,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
   """Prepares the abstract state and constructs transforms for V3 restore.
 
@@ -804,23 +847,20 @@ def _prepare_v3_restore(
     transforms: An optional mapping of custom transforms for variable mapping.
     prefix_map: An optional map from target path prefix to source path prefix
       for trainable variables. See `restore_partial_checkpoint`.
+    saved_state_metadata: Optional state metadata already read from the
+      checkpoint (see `_validate_v3_checkpoint`), so it isn't read again.
 
   Returns:
     A tuple of (filtered_abstract_state, state_transforms) to be passed to
     the Orbax restore call.
   """
   # Validate that underlying checkpoint is healthy and retrieve state metadata.
-  saved_state_metadata = _validate_v3_checkpoint(checkpoint_path)
+  saved_state_metadata = _validate_v3_checkpoint(
+      checkpoint_path, saved_state_metadata
+  )
 
   # The shared variable map is a required V3 item, checked above.
-  map_path = epath.Path(checkpoint_path) / SHARED_VARIABLE_MAP_KEY
-  checkpointer = ocp.Checkpointer(ocp.handlers.JsonCheckpointHandler())
-  try:
-    shared_var_map = checkpointer.restore(
-        os.fspath(map_path), args=ocp.args.JsonRestore()
-    )[SHARED_VARIABLE_MAP_KEY]
-  finally:
-    checkpointer.close()
+  shared_var_map = _load_shared_variable_map(checkpoint_path)
 
   # Load index path metadata for non-trainable and optimizer variables if
   # needed.
@@ -1199,6 +1239,14 @@ def restore_keras_checkpoint(
   # TODO(zixiangzhou): Update variables to use a nested dictionary and index map
   # instead of flattened list.
 
+  # Read once for the SparseCore restore and `_prepare_v3_restore`.
+  saved_state_metadata = (
+      _validate_v3_checkpoint(checkpoint_path) if is_v3 else None
+  )
+  sparsecore_restores = _prepare_sparsecore_restore(
+      model, checkpoint_path, saved_state_metadata
+  )
+
   # Construct abstract variables to ensure the checkpoint is restored with
   # the same sharding as the current variables.
   abstract_state = jax.tree.map(_to_shape_dtype_struct, variables)
@@ -1206,7 +1254,11 @@ def restore_keras_checkpoint(
   state_transforms = {}
   if is_v3:
     abstract_state, state_transforms = _prepare_v3_restore(
-        checkpoint_path, abstract_state, model, restore_optimizer_vars
+        checkpoint_path,
+        abstract_state,
+        model,
+        restore_optimizer_vars,
+        saved_state_metadata=saved_state_metadata,
     )
 
   # Delete the variables from device memory to reduce peak memory usage.
@@ -1239,12 +1291,115 @@ def restore_keras_checkpoint(
     ):
       var._value = restored_var  # pylint: disable=protected-access
 
+  sparsecore_checkpoint_utils.finish_sparsecore_restore(sparsecore_restores)
+
   if restore_model_epoch:
     model._initial_epoch = epoch + 1  # pylint: disable=protected-access  # pyrefly: ignore[unsupported-operation]
   if restore_optimizer_vars and not restore_iterations:
     model.optimizer.iterations.assign(0)
 
   return model
+
+
+def _saved_trainable_metadata(
+    model: keras.Model,
+    checkpoint_path: str,
+    saved_state_metadata: Any | None = None,
+) -> dict[str, Any]:
+  """Returns the checkpoint metadata of the model's trainable variables by path.
+
+  Matches the saved trainable variables like the restore does: by path for V3
+  checkpoints (following the aliases of shared variables, see
+  `_find_stored_path`), and by order for V2 checkpoints.
+
+  Args:
+    model: The model being restored.
+    checkpoint_path: The resolved checkpoint directory path of one step.
+    saved_state_metadata: Optional state metadata already read from the
+      checkpoint, so it isn't read again.
+
+  Returns:
+    Variable path to its Orbax `ArrayMetadata`, or an empty dict if the
+    checkpoint has no Orbax state item.
+  """
+  try:
+    if saved_state_metadata is None:
+      state_dir = epath.Path(checkpoint_path) / STATE_CHECKPOINT_KEY
+      if not state_dir.exists():
+        return {}
+      saved_state_metadata = ocp.handlers.PyTreeCheckpointHandler().metadata(
+          state_dir
+      )
+    saved_trainable_meta = saved_state_metadata.get(TRAINABLE_VARIABLES_KEY)
+    shared_var_map = {}
+    if (
+        isinstance(saved_trainable_meta, Mapping)
+        and (epath.Path(checkpoint_path) / SHARED_VARIABLE_MAP_KEY).exists()
+    ):
+      shared_var_map = _load_shared_variable_map(checkpoint_path)
+  except Exception:
+    # Without the metadata, the SparseCore tables can't be resharded, and
+    # restoring them as is would fail with a shape mismatch or silently load
+    # rows sharded for another topology.
+    logging.exception(
+        "Failed to read the metadata of the checkpoint in %s to restore the"
+        " SparseCore tables across TPU topologies.",
+        checkpoint_path,
+    )
+    raise
+
+  if isinstance(saved_trainable_meta, Mapping):  # V3: keyed by variable path.
+    meta_by_path = {}
+    for var in model.trainable_variables:
+      stored_path = _find_stored_path(
+          var.path, saved_trainable_meta, shared_var_map
+      )
+      if stored_path is not None:
+        meta_by_path[var.path] = saved_trainable_meta[stored_path]
+    return meta_by_path
+  if isinstance(saved_trainable_meta, Sequence) and len(
+      saved_trainable_meta
+  ) == len(
+      model.trainable_variables
+  ):  # V2: in variable order.
+    return {
+        var.path: meta
+        for var, meta in zip(model.trainable_variables, saved_trainable_meta)
+    }
+  return {}
+
+
+def _prepare_sparsecore_restore(
+    model: keras.Model,
+    checkpoint_path: str,
+    saved_state_metadata: Any | None = None,
+) -> list[sparsecore_checkpoint_utils.StackRestore]:
+  """Prepares the SparseCore tables of `model`, if any, for the restore.
+
+  Call this before building the Orbax restore target and
+  `sparsecore_checkpoint_utils.finish_sparsecore_restore` after the restore,
+  so that SparseCore tables saved on another TPU topology are resharded (see
+  `sparsecore_checkpoint_utils.prepare_sparsecore_restore`).
+
+  Args:
+    model: The model being restored.
+    checkpoint_path: The resolved checkpoint directory path of one step.
+    saved_state_metadata: Optional state metadata already read from the
+      checkpoint, so it isn't read again.
+
+  Returns:
+    The SparseCore stacks to reshard after the restore.
+  """
+  if not sparsecore_checkpoint_utils.has_sparsecore_tables(model):
+    return []
+  saved_trainable_metadata = _saved_trainable_metadata(
+      model, checkpoint_path, saved_state_metadata
+  )
+  if not saved_trainable_metadata:
+    return []
+  return sparsecore_checkpoint_utils.prepare_sparsecore_restore(
+      model, checkpoint_path, saved_trainable_metadata
+  )
 
 
 def restore_partial_checkpoint(
