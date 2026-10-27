@@ -52,6 +52,16 @@ class _KerasTask(keras_trainer.KerasTask):
     return model
 
 
+class _MarkerCallback(keras_utils.MetricsCallback):
+  """Reports a fixed metric at the end of each training epoch and eval pass."""
+
+  def on_epoch_end(self, epoch, logs=None):
+    self._record(logs, "custom/marker", 7.0)
+
+  def on_test_end(self, logs=None):
+    self._record(logs, "custom/marker", 7.0)
+
+
 class KerasTrainerTest(parameterized.TestCase):
 
   def setUp(self):
@@ -63,11 +73,21 @@ class KerasTrainerTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
       {"testcase_name": "train", "mode": core.Trainer.Mode.TRAIN},
+      {
+          "testcase_name": "train_with_callbacks",
+          "mode": core.Trainer.Mode.TRAIN,
+          "with_train_callbacks": True,
+      },
       {"testcase_name": "eval", "mode": core.Trainer.Mode.EVAL},
       {
           "testcase_name": "train_and_eval_v3",
           "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
           "checkpoint_version": "v3",
+      },
+      {
+          "testcase_name": "train_and_eval_with_callbacks",
+          "mode": core.Trainer.Mode.TRAIN_AND_EVAL,
+          "with_train_callbacks": True,
       },
       {
           "testcase_name": "train_and_eval_v2",
@@ -96,7 +116,10 @@ class KerasTrainerTest(parameterized.TestCase):
       },
   )
   def test_keras_task_and_trainer(
-      self, mode: str, checkpoint_version: str = "v3"
+      self,
+      mode: str,
+      checkpoint_version: str = "v3",
+      with_train_callbacks: bool = False,
   ):
     if keras.backend.backend() == "jax":
       distribution = keras.distribution.DataParallel()
@@ -113,6 +136,7 @@ class KerasTrainerTest(parameterized.TestCase):
         model_dir=self.create_tempdir().full_path,
         continuous_eval_timeout=5,
         checkpoint_version=checkpoint_version,
+        train_callbacks=[_MarkerCallback()] if with_train_callbacks else (),
     )
     experiment = core.Experiment(_KerasTask(), trainer)
 
@@ -128,6 +152,72 @@ class KerasTrainerTest(parameterized.TestCase):
         and keras.backend.backend() == "jax"
     ):
       self.assertEqual(history.history["num_params/trainable"][0], 2)
+    if with_train_callbacks:
+      self.assertEqual(
+          history.history["custom/marker"],
+          [7.0] * len(history.history["loss"]),
+      )
+
+  def _run_eval_with_callbacks(self, model_dir: str, mode: core.Trainer.Mode):
+    if keras.backend.backend() != "jax":
+      self.skipTest("`EpochSummaryCallback` is only used on the Jax backend.")
+    trainer = keras_trainer.KerasTrainer(
+        distribution=keras.distribution.DataParallel(),
+        train_steps=2,
+        steps_per_eval=1,
+        steps_per_loop=2,
+        model_dir=model_dir,
+        continuous_eval_timeout=1,
+        eval_callbacks=[_MarkerCallback()],
+    )
+    with mock.patch.object(
+        keras_utils.EpochSummaryCallback, "on_epoch_end", autospec=True
+    ) as on_epoch_end:
+      core.run_experiment(core.Experiment(_KerasTask(), trainer), mode)
+
+    val_logs = on_epoch_end.call_args.args[2]
+    self.assertEqual(val_logs["val_custom/marker"], 7.0)
+    self.assertIn("val_loss", val_logs)
+    self.assertIn("val_steps_per_second", val_logs)
+
+  def test_eval_metrics_callbacks_are_written_in_eval(self):
+    self._run_eval_with_callbacks(
+        self.create_tempdir().full_path, core.Trainer.Mode.EVAL
+    )
+
+  def test_eval_metrics_callbacks_are_written_in_continuous_eval(self):
+    if keras.backend.backend() != "jax":
+      self.skipTest("`EpochSummaryCallback` is only used on the Jax backend.")
+    model_dir = self.create_tempdir().full_path
+    # Produce one checkpoint so there is something to evaluate.
+    train_trainer = keras_trainer.KerasTrainer(
+        distribution=keras.distribution.DataParallel(),
+        train_steps=2,
+        steps_per_eval=1,
+        steps_per_loop=2,
+        model_dir=model_dir,
+    )
+    core.run_experiment(
+        core.Experiment(_KerasTask(), train_trainer), core.Trainer.Mode.TRAIN
+    )
+    keras.backend.clear_session()
+
+    self._run_eval_with_callbacks(model_dir, core.Trainer.Mode.CONTINUOUS_EVAL)
+
+  def test_val_logs_warns_when_metrics_callback_overwrites_key(self):
+    trainer = keras_trainer.KerasTrainer(
+        model_dir=self.create_tempdir().full_path
+    )
+    callback = _MarkerCallback()
+    callback.on_test_end()
+
+    with self.assertLogs(level="WARNING") as log:
+      val_logs = trainer._val_logs(
+          {"custom/marker": 1.0}, [callback], steps_per_second=2.0
+      )
+
+    self.assertIn("overwrites existing evaluation log key", log.output[0])
+    self.assertEqual(val_logs["val_custom/marker"], 7.0)
 
   def test_eval_name(self):
     if keras.backend.backend() != "jax":
