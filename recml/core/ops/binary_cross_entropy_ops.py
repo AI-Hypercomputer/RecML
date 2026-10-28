@@ -158,12 +158,38 @@ def _get_sharding(x: jt.ArrayLike) -> jax.sharding.Sharding | None:
   return None
 
 
+def _check_not_partially_manual(
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh,
+) -> None:
+  """Raises if `mesh` mixes manual and non-manual axes."""
+  if 0 < len(mesh.manual_axes) < len(mesh.axis_names):
+    raise NotImplementedError(
+        "Partially-manual shard_map meshes mixing manual and non-manual axes"
+        f" are not supported; got {mesh}."
+    )
+
+
+def _has_non_manual_axes(
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh,
+) -> bool:
+  """Returns whether the active mesh has non-manual axes."""
+  ctx_mesh = jax.sharding.get_abstract_mesh()
+  effective = ctx_mesh if not ctx_mesh.empty else mesh
+  _check_not_partially_manual(effective)
+  if effective is not mesh:
+    _check_not_partially_manual(mesh)
+  return not effective.empty and not effective.manual_axes
+
+
 def _token_shard_count(
     x: jt.Float[jt.Array, "... D"],
     mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None,
     spec: jax.sharding.PartitionSpec | None = None,
 ) -> int | None:
   """Returns how many ways the token axes of `x` are sharded, or None."""
+  ctx_mesh = jax.sharding.get_abstract_mesh()
+  if not ctx_mesh.empty and not _has_non_manual_axes(ctx_mesh):
+    return 1
   if mesh is None or spec is None:
     sharding = _get_sharding(x)
     if not isinstance(sharding, jax.sharding.NamedSharding):
@@ -171,6 +197,8 @@ def _token_shard_count(
     mesh, spec = sharding.mesh, sharding.spec
   if mesh.empty:
     return None
+  if not _has_non_manual_axes(mesh):
+    return 1
 
   # A PartitionSpec may be shorter than `x.ndim`; trailing axes are unsharded.
   factor = 1
@@ -207,7 +235,7 @@ def _replicate_hidden_dim(
   sharding = _get_sharding(x)
   if isinstance(sharding, jax.sharding.NamedSharding):
     mesh = sharding.mesh
-    if not mesh.empty:
+    if _has_non_manual_axes(mesh):
       spec = sharding.spec
       new_spec_list = list(spec) + [None] * (x.ndim - len(spec))
       if new_spec_list:
@@ -633,6 +661,10 @@ def cut_binary_cross_entropy(
   and above raise a `ValueError`. Reshape or vmap over the extra leading axes
   before calling this op.
 
+  When called inside an outer ``jax.shard_map`` with ``use_pallas=True``, the
+  outer ``shard_map`` must set ``check_vma=False`` because the backward Pallas
+  kernel declares ``ShapeDtypeStruct`` outputs without ``manual_axis_type``.
+
   Args:
     activations: Hidden-state outputs of shape ``[B, N, D]``, or ``[X, B, N,
       D]`` with a single extra leading axis.
@@ -679,6 +711,8 @@ def cut_binary_cross_entropy(
   Raises:
     ValueError: If ``activations`` has rank 5 or above, or if ``weights`` does
       not exactly match the per-position loss shape.
+    NotImplementedError: If ``embeddings`` are sharded along hidden dim ``D``,
+      or if the active mesh mixes manual and non-manual axes.
   """
   # `_bce_fwd_local` operates on a single `[B, N, D]` array and the forward
   # pass only vmaps over one extra leading axis, so ranks >= 5 are unsupported.
@@ -703,13 +737,14 @@ def cut_binary_cross_entropy(
         f" {tuple(weights.shape)}."
     )
 
+  _check_not_partially_manual(jax.sharding.get_abstract_mesh())
+
   # Prevent collective communications inside the loop by forcing replication of
   # weights.
   sharding = _get_sharding(embeddings)
-  if (
-      isinstance(sharding, jax.sharding.NamedSharding)
-      and not sharding.mesh.empty
-  ):
+  if isinstance(
+      sharding, jax.sharding.NamedSharding
+  ) and _has_non_manual_axes(sharding.mesh):
     replicated_sharding = jax.sharding.NamedSharding(
         sharding.mesh, jax.sharding.PartitionSpec()
     )
@@ -1580,6 +1615,7 @@ def _bce_bwd_sharded(
     jt.Float[jt.Array, "V D"],
 ]:
   """Sharding-aware dispatcher for BCE backward."""
+  _check_not_partially_manual(jax.sharding.get_abstract_mesh())
   mesh = None
   act_spec = None
   emb_spec = None
@@ -1589,13 +1625,13 @@ def _bce_bwd_sharded(
     act_spec = config.act_spec
     emb_spec = config.emb_spec or jax.sharding.PartitionSpec()
     act_sharding = jax.sharding.NamedSharding(mesh, act_spec)
-    is_sharded = True
+    is_sharded = _has_non_manual_axes(mesh)
   else:
     act_sharding = _get_sharding(activations)
     emb_sharding = _get_sharding(embeddings)
     is_sharded = (
         isinstance(act_sharding, jax.sharding.NamedSharding)
-        and not act_sharding.mesh.empty
+        and _has_non_manual_axes(act_sharding.mesh)
         and isinstance(emb_sharding, jax.sharding.NamedSharding)
     )
     if is_sharded:

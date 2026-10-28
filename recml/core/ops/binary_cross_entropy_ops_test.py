@@ -264,6 +264,45 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
         binary_cross_entropy_ops._local_tokens(activations), 8 * 64
     )
 
+  def test_local_tokens_inside_shard_map(self):
+    num_devices = jax.device_count()
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ('batch',))
+    local_counts = []
+    explicit_counts = []
+    eager_counts = []
+
+    def per_shard_eager(local_x):
+      eager_counts.append(binary_cross_entropy_ops._local_tokens(local_x))
+      return local_x
+
+    jax.shard_map(
+        per_shard_eager, mesh=mesh, in_specs=P('batch'), out_specs=P('batch')
+    )(jnp.ones((2 * num_devices, 64, 32)))
+    self.assertEqual(eager_counts[-1], 2 * 64)
+
+    @jax.jit
+    def f(x):
+      def per_shard(local_x):
+        local_counts.append(binary_cross_entropy_ops._local_tokens(local_x))
+        explicit_counts.append(
+            binary_cross_entropy_ops._local_tokens(
+                local_x, mesh, P('batch', None, None)
+            )
+        )
+        return local_x
+
+      return jax.shard_map(
+          per_shard, mesh=mesh, in_specs=P('batch'), out_specs=P('batch')
+      )(x)
+
+    x_sharded = jax.device_put(
+        jnp.ones((2 * num_devices, 64, 32)),
+        jax.sharding.NamedSharding(mesh, P('batch', None, None)),
+    )
+    f(x_sharded)
+    self.assertEqual(local_counts[-1], 2 * 64)
+    self.assertEqual(explicit_counts[-1], 2 * 64)
+
   # --- `block_v` selection: the memory budget itself. ------------------------
 
   def test_auto_block_v_is_clamped_to_vocab_size(self):
@@ -1209,6 +1248,149 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
     np.testing.assert_allclose(
         g_emb_forced, g_emb_clamped, atol=1e-5, rtol=1e-5
     )
+
+  @parameterized.named_parameters(
+      ('pure_jax_tiled', False, False),
+      ('pallas_tiled', True, False),
+      ('pure_jax_explicit_mesh', False, True),
+      ('pallas_explicit_mesh', True, True),
+  )
+  def test_cut_bce_inside_shard_map_jit_grad(
+      self, use_pallas, explicit_mesh_and_closed_emb
+  ):
+    num_devices = jax.device_count()
+    batch, seq_len, hidden_dim = 2 * num_devices, 16, 128
+    vocab_size, num_labels = 256, 3
+    key_act, key_emb, key_tgt = jax.random.split(jax.random.PRNGKey(17), 3)
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ('batch',))
+    batch_sharding = jax.sharding.NamedSharding(mesh, P('batch', None, None))
+    replicated_sharding = jax.sharding.NamedSharding(mesh, P())
+    activations = jax.device_put(
+        jax.random.normal(key_act, (batch, seq_len, hidden_dim)),
+        batch_sharding,
+    )
+    embeddings = jax.device_put(
+        jax.random.normal(key_emb, (vocab_size, hidden_dim)),
+        replicated_sharding,
+    )
+    targets = jax.device_put(
+        jax.random.randint(
+            key_tgt, (batch, seq_len, num_labels), 0, vocab_size
+        ),
+        batch_sharding,
+    )
+
+    def sharded_loss_and_metrics(act, emb):
+      if explicit_mesh_and_closed_emb:
+
+        def per_shard_closed(local_act, local_tgt):
+          _, per_pos, tp, fp, fn, tn = (
+              binary_cross_entropy_ops.cut_binary_cross_entropy(
+                  local_act,
+                  emb,
+                  local_tgt,
+                  block_v=None,
+                  mesh=mesh,
+                  act_spec=P('batch', None, None),
+                  use_pallas=use_pallas,
+                  return_per_target_losses=True,
+                  return_metrics=True,
+                  return_per_target_metrics=True,
+              )
+          )
+          return per_pos, tp, fp, fn, tn
+
+        losses, tp, fp, fn, tn = jax.shard_map(
+            per_shard_closed,
+            mesh=mesh,
+            in_specs=(P('batch'), P('batch')),
+            out_specs=(P('batch'),) * 5,
+            check_vma=False,
+        )(act, targets)
+      else:
+        tiled_emb = jnp.tile(emb, (num_devices, 1))
+
+        def per_shard_tiled(local_act, local_emb, local_tgt):
+          _, per_pos, tp, fp, fn, tn = (
+              binary_cross_entropy_ops.cut_binary_cross_entropy(
+                  local_act,
+                  local_emb,
+                  local_tgt,
+                  block_v=None,
+                  use_pallas=use_pallas,
+                  return_per_target_losses=True,
+                  return_metrics=True,
+                  return_per_target_metrics=True,
+              )
+          )
+          return per_pos, tp, fp, fn, tn
+
+        losses, tp, fp, fn, tn = jax.shard_map(
+            per_shard_tiled,
+            mesh=mesh,
+            in_specs=(P('batch'), P('batch'), P('batch')),
+            out_specs=(P('batch'),) * 5,
+            check_vma=False,
+        )(act, tiled_emb, targets)
+
+      metrics = (jnp.sum(tp), jnp.sum(fp), jnp.sum(fn), jnp.sum(tn))
+      return jnp.mean(losses), metrics
+
+    def ref_loss_and_metrics(act, emb):
+      _, per_pos, tp, fp, fn, tn = (
+          binary_cross_entropy_ops.cut_binary_cross_entropy(
+              act,
+              emb,
+              targets,
+              block_v=None,
+              use_pallas=use_pallas,
+              return_per_target_losses=True,
+              return_metrics=True,
+          )
+      )
+      return jnp.mean(per_pos), (tp, fp, fn, tn)
+
+    (loss_got, metrics_got), (g_act_got, g_emb_got) = jax.jit(
+        jax.value_and_grad(
+            sharded_loss_and_metrics, argnums=(0, 1), has_aux=True
+        )
+    )(activations, embeddings)
+    (loss_ref, metrics_ref), (g_act_ref, g_emb_ref) = jax.jit(
+        jax.value_and_grad(ref_loss_and_metrics, argnums=(0, 1), has_aux=True)
+    )(activations, embeddings)
+    np.testing.assert_allclose(loss_got, loss_ref, atol=1e-5, rtol=1e-5)
+    for got_metric, ref_metric in zip(metrics_got, metrics_ref, strict=True):
+      np.testing.assert_allclose(got_metric, ref_metric, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_act_got, g_act_ref, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(g_emb_got, g_emb_ref, atol=1e-5, rtol=1e-5)
+
+  def test_partially_manual_shard_map_raises(self):
+    num_devices = jax.device_count()
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()).reshape(num_devices, 1), ('dp', 'tp')
+    )
+    activations = jnp.ones((num_devices, 8, 128))
+    embeddings = jnp.ones((128, 128))
+    targets = jnp.zeros((num_devices, 8, 2), dtype=jnp.int32)
+
+    def per_dp_shard(local_act, local_tgt):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          local_act,
+          embeddings,
+          local_tgt,
+          use_pallas=False,
+          return_per_target_losses=True,
+      )[1]
+
+    with self.assertRaisesRegex(NotImplementedError, 'Partially-manual'):
+      jax.shard_map(
+          per_dp_shard,
+          mesh=mesh,
+          axis_names={'dp'},
+          in_specs=(P('dp'), P('dp')),
+          out_specs=P('dp'),
+          check_vma=False,
+      )(activations, targets)
 
 
 if __name__ == '__main__':
