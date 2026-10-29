@@ -90,6 +90,24 @@ class KerasTask(abc.ABC):
     """
     return self.create_model(**kwargs)
 
+  def create_eval_callbacks(
+      self, model: keras.Model
+  ) -> Sequence[keras.callbacks.Callback]:
+    """Returns extra callbacks for evaluating `model`.
+
+    They run after the trainer restores the evaluated checkpoint into `model`,
+    so `on_test_begin` sees its weights, e.g. to rebuild state derived from
+    them before the first evaluation step. Defaults to none.
+
+    Args:
+      model: The Keras model constructed by `create_model_for_eval`.
+
+    Returns:
+      A sequence of Keras callbacks.
+    """
+    del model
+    return []
+
   def export_model(self, model: keras.Model, model_dir: str):
     """Exports a Keras model.
 
@@ -375,6 +393,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, dataset, val=True)
     )
 
+    callbacks = [*task.create_eval_callbacks(model), *self.eval_callbacks]
     if keras.backend.backend() == "jax":
       [tb_cbk] = [
           cbk
@@ -385,7 +404,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       history = model.evaluate(
           dataset,
           steps=self._steps_per_eval,
-          callbacks=self.eval_callbacks,
+          callbacks=callbacks,
           return_dict=True,
       )
       epoch_dt = time.time() - epoch_start_time
@@ -398,7 +417,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     return model.evaluate(
         dataset,
         steps=self._steps_per_eval,
-        callbacks=self.eval_callbacks,
+        callbacks=callbacks,
     )
 
   def train_and_evaluate(self, task: KerasTask) -> core.Logs:
@@ -488,6 +507,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
               f"Unsupported checkpoint version: {checkpoint_version}"
           )
 
+    task_callbacks = list(task.create_eval_callbacks(model))
     history = None
     for epoch in ocp.checkpoint_utils.checkpoints_iterator(
         self._checkpoint_dir,
@@ -500,7 +520,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
           for cbk in self.eval_callbacks
           if isinstance(cbk, keras_utils.EpochSummaryCallback)
       ]
-      callbacks = [restore_callback, *self.eval_callbacks]
+      callbacks = [restore_callback, *task_callbacks, *self.eval_callbacks]
       try:
         logging.info(f"eval | epoch: {epoch: 6d} | {steps_msg}")
         epoch_start_time = time.time()
