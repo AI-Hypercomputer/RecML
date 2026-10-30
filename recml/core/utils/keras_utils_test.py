@@ -31,6 +31,7 @@ import keras_hub
 import numpy as np
 import orbax.checkpoint as ocp
 from recml.core.utils import keras_utils
+import tensorflow as tf
 
 
 def _create_dummy_inputs() -> dict[str, jax.Array]:
@@ -889,6 +890,115 @@ class KerasUtilsTest(parameterized.TestCase):
     callback.on_train_begin()
     checkpoint_manager.wait_until_finished()
     self.assertTrue(os.path.exists(os.path.join(checkpoint_dir, "0")))
+
+  def test_epoch_summary_callback_writes_on_process_0(self):
+    log_dir = self.create_tempdir().full_path
+    dummy_inputs = _create_dummy_inputs()
+    model = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    with mock.patch.object(keras_utils.jax, "process_index", return_value=0):
+      callback = keras_utils.EpochSummaryCallback(
+          log_dir=log_dir,
+          steps_per_epoch=10,
+          write_steps_per_second=False,
+      )
+    callback.set_model(model)
+    with mock.patch.object(
+        callback.summary,
+        "create_file_writer",
+        wraps=callback.summary.create_file_writer,
+    ) as mock_create_file_writer:
+      callback.on_train_begin()
+      logs = {f"metric_{i}": float(i) for i in range(15)}
+      logs["val_loss"] = 0.4
+      callback.on_epoch_end(epoch=1, logs=logs)
+
+      self.assertIn("num_params/total", logs)
+      self.assertIn("val_num_params/total", logs)
+      train_dir = os.path.join(log_dir, "train")
+      val_dir = os.path.join(log_dir, "validation")
+      mock_create_file_writer.assert_has_calls([
+          mock.call(train_dir, max_queue=1000),
+          mock.call(val_dir, max_queue=1000),
+      ])
+
+      # Leaving `with writer.as_default():` flushes events before
+      # `on_train_end` (needed by `evaluate_continuously`).
+      [train_event_file] = os.listdir(train_dir)
+      train_events = list(
+          tf.compat.v1.train.summary_iterator(
+              os.path.join(train_dir, train_event_file)
+          )
+      )
+      expected_train_tags = {f"metric_{i}" for i in range(15)} | {
+          "learning_rate",
+          "num_params/trainable",
+          "num_params/non_trainable",
+          "num_params/optimizer",
+          "num_params/total",
+      }
+      self.assertEqual(
+          {
+              value.tag
+              for event in train_events
+              for value in event.summary.value
+          },
+          expected_train_tags,
+      )
+      self.assertEqual(
+          {event.step for event in train_events if event.summary.value},
+          {10},
+      )
+
+      [val_event_file] = os.listdir(val_dir)
+      val_events = list(
+          tf.compat.v1.train.summary_iterator(
+              os.path.join(val_dir, val_event_file)
+          )
+      )
+      self.assertEqual(
+          {value.tag for event in val_events for value in event.summary.value},
+          {
+              "loss",
+              "num_params/trainable",
+              "num_params/non_trainable",
+              "num_params/optimizer",
+              "num_params/total",
+          },
+      )
+      self.assertEqual(
+          {event.step for event in val_events if event.summary.value},
+          {10},
+      )
+      callback.on_train_end()
+
+  def test_epoch_summary_callback_skips_writes_on_other_processes(self):
+    log_dir = self.create_tempdir().full_path
+    dummy_inputs = _create_dummy_inputs()
+    model = _create_model(jax.tree.map(jnp.shape, dummy_inputs))
+    with mock.patch.object(keras_utils.jax, "process_index", return_value=1):
+      callback = keras_utils.EpochSummaryCallback(
+          log_dir=log_dir,
+          steps_per_epoch=10,
+          write_steps_per_second=False,
+      )
+    callback.set_model(model)
+    with mock.patch.object(
+        callback.summary,
+        "create_file_writer",
+        wraps=callback.summary.create_file_writer,
+    ) as mock_create_file_writer:
+      callback.on_train_begin()
+      logs = {f"metric_{i}": float(i) for i in range(15)}
+      logs["val_loss"] = 0.4
+      callback.on_epoch_end(epoch=1, logs=logs)
+
+      # `num_params` must still be populated in `logs` on all processes.
+      self.assertIn("num_params/total", logs)
+      self.assertIn("val_num_params/total", logs)
+      mock_create_file_writer.assert_not_called()
+      self.assertFalse(os.path.exists(os.path.join(log_dir, "train")))
+      self.assertFalse(os.path.exists(os.path.join(log_dir, "validation")))
+      callback.on_train_end()
 
 
 class KerasOrbaxCheckpointUtilsTest(absltest.TestCase):

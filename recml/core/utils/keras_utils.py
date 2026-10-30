@@ -1694,6 +1694,12 @@ def restore_keras_model(
     model.optimizer.iterations.assign(0)
 
 
+# One process writes TensorBoard event files and XManager measurements so
+# hosts don't issue concurrent CNS flushes.
+_SUMMARY_PROCESS_INDEX = 0
+_SUMMARY_MAX_QUEUE = 1000  # Fits a full epoch of scalars (~300 per writer).
+
+
 # TODO(b/343544467): Support logging metrics more frequently.
 class EpochSummaryCallback(keras.callbacks.TensorBoard):
   """A custom summary callback that only reports epoch metrics."""
@@ -1711,12 +1717,37 @@ class EpochSummaryCallback(keras.callbacks.TensorBoard):
         update_freq="epoch",
         write_graph=False,
     )
+    self._is_summary_writer = jax.process_index() == _SUMMARY_PROCESS_INDEX
     self._steps_per_epoch = steps_per_epoch
     self._num_params = None
     self._eval_subdir = eval_subdir
     # Marks the callback as async safe so batch end callbacks can be dispatched
     # asynchronously.
     self.async_safe = True
+
+  def _get_or_create_writer(
+      self, key: str, log_dir: str
+  ) -> tf.summary.SummaryWriter:
+    # The base `TensorBoard.on_train_begin` / `on_test_begin` read
+    # `_train_writer` and `_val_writer` even with `update_freq="epoch"`, so
+    # returning no-op writers here keeps other processes from creating event
+    # files.
+    if key not in self._writers:
+      if self._is_summary_writer:
+        self._writers[key] = self.summary.create_file_writer(
+            log_dir, max_queue=_SUMMARY_MAX_QUEUE
+        )
+      else:
+        self._writers[key] = self.summary.create_noop_writer()
+    return self._writers[key]
+
+  @property
+  def _train_writer(self) -> tf.summary.SummaryWriter:
+    return self._get_or_create_writer("train", self._train_dir)
+
+  @property
+  def _val_writer(self) -> tf.summary.SummaryWriter:
+    return self._get_or_create_writer("val", self._val_dir)
 
   def set_model(self, model: keras.Model):
     """Sets Keras model and writes graph if specified."""
