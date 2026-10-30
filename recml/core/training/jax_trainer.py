@@ -455,8 +455,10 @@ class JaxTrainer(core.Trainer[JaxTask]):
 
     save_on_steps = set(save_on_steps)
 
+    checkpoint_dir = os.path.join(self._model_dir, core.CHECKPOINT_DIR)
+
     return ocp.CheckpointManager(
-        directory=os.path.join(self._model_dir, core.CHECKPOINT_DIR),
+        directory=checkpoint_dir,
         options=ocp.CheckpointManagerOptions(
             should_save_fn=lambda step, _: step in save_on_steps,
             max_to_keep=self._max_checkpoints_to_keep,

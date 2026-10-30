@@ -16,9 +16,11 @@
 from collections.abc import Mapping, Sequence
 import dataclasses
 import os
+from unittest import mock
 
 from absl import flags
 from absl.testing import absltest
+from absl.testing import flagsaver
 from absl.testing import parameterized
 import clu.metrics as clu_metrics
 import flax.linen as nn
@@ -259,7 +261,6 @@ class JaxTest(parameterized.TestCase):
     metrics = jax_trainer._state_metrics(state)
     self.assertIn("optimizer/learning_rate", metrics)
     self.assertEqual(metrics["optimizer/learning_rate"].compute(), 0.1)
-
 
 if __name__ == "__main__":
   absltest.main()
