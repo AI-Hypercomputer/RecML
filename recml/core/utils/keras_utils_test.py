@@ -923,6 +923,23 @@ class KerasUtilsTest(parameterized.TestCase):
     checkpoint_manager.wait_until_finished()
     self.assertTrue(os.path.exists(os.path.join(checkpoint_dir, "0")))
 
+  def test_epoch_summary_callback_batch_hooks_are_noops(self):
+    log_dir = self.create_tempdir().full_path
+    with mock.patch.object(keras_utils.jax, "process_index", return_value=0):
+      callback = keras_utils.EpochSummaryCallback(
+          log_dir=log_dir,
+          steps_per_epoch=10,
+          write_steps_per_second=False,
+      )
+
+    with mock.patch.object(
+        callback.summary, "scalar", autospec=True
+    ) as mock_scalar:
+      logs = {"loss": 0.5}
+      callback.on_train_batch_begin(0, logs=logs)
+      callback.on_train_batch_end(0, logs=logs)
+      mock_scalar.assert_not_called()
+
   def test_epoch_summary_callback_writes_on_process_0(self):
     log_dir = self.create_tempdir().full_path
     dummy_inputs = _create_dummy_inputs()

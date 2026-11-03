@@ -158,6 +158,198 @@ class KerasTrainerTest(parameterized.TestCase):
           [7.0] * len(history.history["loss"]),
       )
 
+  def test_verbose_passed_to_keras(self):
+    original_fit = keras.Model.fit
+    original_evaluate = keras.Model.evaluate
+
+    with mock.patch.object(
+        keras.Model, "fit", autospec=True, side_effect=original_fit
+    ) as mock_fit, mock.patch.object(
+        keras.Model, "evaluate", autospec=True, side_effect=original_evaluate
+    ) as mock_evaluate:
+      trainer = keras_trainer.KerasTrainer(
+          model_dir=self.create_tempdir().full_path,
+          train_steps=2,
+          steps_per_loop=2,
+          steps_per_eval=1,
+          verbose=2,
+          continuous_eval_timeout=5,
+          distribution=keras.distribution.DataParallel()
+          if keras.backend.backend() == "jax"
+          else None,
+      )
+      experiment = core.Experiment(_KerasTask(), trainer)
+
+      mock_fit.reset_mock()
+      mock_evaluate.reset_mock()
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN)
+      mock_fit.assert_called()
+      self.assertEqual(mock_fit.call_args.kwargs.get("verbose"), 2)
+
+      mock_fit.reset_mock()
+      mock_evaluate.reset_mock()
+      core.run_experiment(experiment, core.Trainer.Mode.EVAL)
+      mock_evaluate.assert_called()
+      self.assertEqual(mock_evaluate.call_args.kwargs.get("verbose"), 2)
+
+      mock_fit.reset_mock()
+      mock_evaluate.reset_mock()
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN_AND_EVAL)
+      mock_fit.assert_called()
+      self.assertEqual(mock_fit.call_args.kwargs.get("verbose"), 2)
+
+      if keras.backend.backend() == "jax":
+        keras.backend.clear_session()
+        mock_fit.reset_mock()
+        mock_evaluate.reset_mock()
+        core.run_experiment(experiment, core.Trainer.Mode.CONTINUOUS_EVAL)
+        mock_evaluate.assert_called()
+        self.assertEqual(mock_evaluate.call_args.kwargs.get("verbose"), 2)
+
+  def test_default_verbose_passed_to_keras(self):
+    original_fit = keras.Model.fit
+    original_evaluate = keras.Model.evaluate
+
+    with mock.patch.object(
+        keras.Model, "fit", autospec=True, side_effect=original_fit
+    ) as mock_fit, mock.patch.object(
+        keras.Model, "evaluate", autospec=True, side_effect=original_evaluate
+    ) as mock_evaluate:
+      trainer = keras_trainer.KerasTrainer(
+          model_dir=self.create_tempdir().full_path,
+          train_steps=2,
+          steps_per_loop=2,
+          steps_per_eval=1,
+          continuous_eval_timeout=5,
+          distribution=keras.distribution.DataParallel()
+          if keras.backend.backend() == "jax"
+          else None,
+      )
+      experiment = core.Experiment(_KerasTask(), trainer)
+
+      mock_fit.reset_mock()
+      mock_evaluate.reset_mock()
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN)
+      mock_fit.assert_called()
+      self.assertEqual(mock_fit.call_args.kwargs.get("verbose"), "auto")
+
+      mock_fit.reset_mock()
+      mock_evaluate.reset_mock()
+      core.run_experiment(experiment, core.Trainer.Mode.EVAL)
+      mock_evaluate.assert_called()
+      self.assertEqual(mock_evaluate.call_args.kwargs.get("verbose"), "auto")
+
+      mock_fit.reset_mock()
+      mock_evaluate.reset_mock()
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN_AND_EVAL)
+      mock_fit.assert_called()
+      self.assertEqual(mock_fit.call_args.kwargs.get("verbose"), "auto")
+
+      if keras.backend.backend() == "jax":
+        keras.backend.clear_session()
+        mock_fit.reset_mock()
+        mock_evaluate.reset_mock()
+        core.run_experiment(experiment, core.Trainer.Mode.CONTINUOUS_EVAL)
+        mock_evaluate.assert_called()
+        self.assertEqual(mock_evaluate.call_args.kwargs.get("verbose"), "auto")
+
+  @parameterized.named_parameters(
+      ("set", 2, 2),
+      ("default", None, 1),
+  )
+  def test_steps_per_execution_passed_to_keras(
+      self, configured_value, expected_value
+  ):
+    model_steps_per_execution = []
+    original_fit = keras.Model.fit
+
+    def original_fit_with_record(model, *args, **kwargs):
+      model_steps_per_execution.append(
+          getattr(model, "steps_per_execution", None)
+      )
+      return original_fit(model, *args, **kwargs)
+
+    with mock.patch.object(
+        keras.Model, "fit", autospec=True, side_effect=original_fit_with_record
+    ) as mock_fit:
+      trainer = keras_trainer.KerasTrainer(
+          model_dir=self.create_tempdir().full_path,
+          train_steps=4,
+          steps_per_loop=4,
+          steps_per_eval=1,
+          steps_per_execution=configured_value,
+          distribution=keras.distribution.DataParallel()
+          if keras.backend.backend() == "jax"
+          else None,
+      )
+      experiment = core.Experiment(_KerasTask(), trainer)
+
+      model_steps_per_execution.clear()
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN)
+      mock_fit.assert_called()
+      self.assertEqual(model_steps_per_execution, [expected_value])
+
+      model_steps_per_execution.clear()
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN_AND_EVAL)
+      mock_fit.assert_called()
+      self.assertEqual(model_steps_per_execution, [expected_value])
+
+  def test_steps_per_execution_resets_functions(self):
+    model_train_functions = []
+    original_fit = keras.Model.fit
+    task = _KerasTask()
+    original_create_model = task.create_model
+
+    def mock_create_model(*args, **kwargs):
+      model = original_create_model(*args, **kwargs)
+      model.train_function = "stale_train"
+      model.test_function = "stale_test"
+      model.predict_function = "stale_predict"
+      return model
+
+    def original_fit_with_record(model, *args, **kwargs):
+      model_train_functions.append(getattr(model, "train_function", None))
+      return original_fit(model, *args, **kwargs)
+
+    with mock.patch.object(
+        task, "create_model", autospec=True, side_effect=mock_create_model
+    ), mock.patch.object(
+        keras.Model, "fit", autospec=True, side_effect=original_fit_with_record
+    ) as mock_fit:
+      trainer = keras_trainer.KerasTrainer(
+          model_dir=self.create_tempdir().full_path,
+          train_steps=4,
+          steps_per_loop=4,
+          steps_per_eval=1,
+          steps_per_execution=2,
+          distribution=keras.distribution.DataParallel()
+          if keras.backend.backend() == "jax"
+          else None,
+      )
+      experiment = core.Experiment(task, trainer)
+      core.run_experiment(experiment, core.Trainer.Mode.TRAIN)
+      mock_fit.assert_called()
+      self.assertEqual(model_train_functions, [None])
+
+  def test_steps_per_execution_validation(self):
+    with self.assertRaisesRegex(
+        ValueError, r"`steps_per_execution` \(0\) must be at least 1\."
+    ):
+      keras_trainer.KerasTrainer(
+          steps_per_loop=4,
+          steps_per_execution=0,
+      )
+
+    with self.assertRaisesRegex(
+        ValueError,
+        r"`steps_per_loop` \(5\) must be divisible by `steps_per_execution`"
+        r" \(2\)\.",
+    ):
+      keras_trainer.KerasTrainer(
+          steps_per_loop=5,
+          steps_per_execution=2,
+      )
+
   def _run_eval_with_callbacks(self, model_dir: str, mode: core.Trainer.Mode):
     if keras.backend.backend() != "jax":
       self.skipTest("`EpochSummaryCallback` is only used on the Jax backend.")

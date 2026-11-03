@@ -126,6 +126,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
       legacy_checkpoint_format: bool | None = None,
       train_callbacks: Sequence[keras.callbacks.Callback] = (),
       eval_callbacks: Sequence[keras.callbacks.Callback] = (),
+      verbose: int | str = "auto",
+      steps_per_execution: int | None = None,
   ):
     """Initializes the instance.
 
@@ -152,6 +154,17 @@ class KerasTrainer(core.Trainer[KerasTask]):
         trainer's own callbacks. Use `keras_utils.MetricsCallback` to report
         metrics, because Keras does not return changes made to `logs` in
         `on_test_end`.
+      verbose: The verbosity passed to `model.fit` and `model.evaluate`. "auto"
+        (the Keras default) and 1 show a progress bar that updates after every
+        step, 2 prints one line per epoch in `fit` and a single line in
+        `evaluate`, and 0 prints nothing.
+      steps_per_execution: If set, the number of training steps that each `jit`
+        call runs, which reduces the per-step host work of dispatching steps and
+        running batch-level callbacks. Batch-level callbacks run once per call
+        and see the logs of its last step. `steps_per_loop` must be divisible by
+        it. It applies to `train` and `train_and_evaluate`, including the
+        validation pass that `train_and_evaluate` runs inside `fit`. If None,
+        the model keeps the value that its `compile` call set.
       resume_training_launcher: Launcher to resume training.
       enable_xmanager_measurements: Whether to enable XManager measurements.
       enable_autoxprof: Whether to enable AutoXprof.
@@ -163,6 +176,17 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
     if model_dir is None:
       model_dir = "/tmp"
+
+    if steps_per_execution is not None:
+      if steps_per_execution < 1:
+        raise ValueError(
+            f"`steps_per_execution` ({steps_per_execution}) must be at least 1."
+        )
+      if steps_per_loop % steps_per_execution != 0:
+        raise ValueError(
+            f"`steps_per_loop` ({steps_per_loop}) must be divisible by "
+            f"`steps_per_execution` ({steps_per_execution})."
+        )
 
     # This should be set before any layers are constructed and this is a
     # fallback in case the trainer binary doesn't already do this.
@@ -180,6 +204,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._steps_per_eval = steps_per_eval
     self._continuous_eval_timeout = continuous_eval_timeout
     self._steps_per_loop = steps_per_loop
+    self._steps_per_execution = steps_per_execution
     self._marker_path = os.path.join(
         model_dir, core.TRAINING_COMPLETE_MARKER_FILE
     )
@@ -188,6 +213,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._checkpoint_save_interval_epochs = checkpoint_save_interval_epochs
     self._custom_train_callbacks = list(train_callbacks)
     self._custom_eval_callbacks = list(eval_callbacks)
+    self._verbose = verbose
     if checkpoint_version is not None:
       self._checkpoint_version = keras_utils.CheckpointVersion(
           checkpoint_version
@@ -322,6 +348,17 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
     return kws
 
+  def _maybe_set_steps_per_execution(self, model: keras.Model):
+    """Sets steps_per_execution and resets cached execution functions."""
+    if self._steps_per_execution is None:
+      return
+    model.steps_per_execution = self._steps_per_execution
+    # Clear functions so they are rebuilt by fit with the new value, mirroring
+    # Keras Trainer.compile (third_party/py/keras/src/trainers/trainer.py:223).
+    model.train_function = None
+    model.test_function = None
+    model.predict_function = None
+
   def _val_logs(
       self,
       history: Mapping[str, Any],
@@ -352,12 +389,15 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, dataset, val=False)
     )
 
+    self._maybe_set_steps_per_execution(model)
+
     history = model.fit(
         dataset,
         epochs=self._train_epochs + 1,
         steps_per_epoch=self._steps_per_loop,
         callbacks=self.train_callbacks,
         initial_epoch=1,
+        verbose=self._verbose,
     )
     model.summary(print_fn=logging.info)
 
@@ -387,6 +427,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
           steps=self._steps_per_eval,
           callbacks=self.eval_callbacks,
           return_dict=True,
+          verbose=self._verbose,
       )
       epoch_dt = time.time() - epoch_start_time
       steps_per_second = self._steps_per_eval / epoch_dt  # pyrefly: ignore[unsupported-operation]
@@ -399,6 +440,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         dataset,
         steps=self._steps_per_eval,
         callbacks=self.eval_callbacks,
+        verbose=self._verbose,
     )
 
   def train_and_evaluate(self, task: KerasTask) -> core.Logs:
@@ -417,6 +459,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, train_dataset, val=False)
     )
 
+    self._maybe_set_steps_per_execution(model)
+
     history = model.fit(
         train_dataset,
         validation_data=eval_dataset,
@@ -426,6 +470,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         validation_steps=None,
         callbacks=self.train_callbacks,
         initial_epoch=1,
+        verbose=self._verbose,
     )
     model.summary(print_fn=logging.info)
 
@@ -514,6 +559,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
             steps=self._steps_per_eval,
             callbacks=callbacks,
             return_dict=True,
+            verbose=self._verbose,
         )
 
         logging.info(

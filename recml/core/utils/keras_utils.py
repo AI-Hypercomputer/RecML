@@ -1744,6 +1744,20 @@ class EpochSummaryCallback(keras.callbacks.TensorBoard):
     # asynchronously.
     self.async_safe = True
 
+  def on_train_batch_begin(
+      self, batch: int, logs: dict[str, Any] | None = None
+  ):
+    # Skips the per-batch bookkeeping of the inherited hook;
+    # see `on_train_batch_end`.
+    del batch, logs
+
+  def on_train_batch_end(self, batch: int, logs: dict[str, Any] | None = None):
+    # The inherited `TensorBoard.on_train_batch_end` calls `summary.scalar` for
+    # every log on every step, even with `update_freq="epoch"`, when no summary
+    # writer records them. This callback only reports epoch metrics, and epoch
+    # summaries and `steps_per_second` don't use the batch hooks.
+    del batch, logs
+
   def _get_or_create_writer(
       self, key: str, log_dir: str
   ) -> tf.summary.SummaryWriter:
