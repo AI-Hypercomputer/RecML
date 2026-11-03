@@ -14,12 +14,15 @@
 """Tests for `sparsecore_checkpoint_utils`.
 
 The SparseCore tables are described by `jax_tpu_embedding` `TableSpec`s stacked
-for a given number of SparseCores per chip, so the tests run on CPU without
-SparseCore. `sparsecore_checkpoint_utils_multidevice_test` runs them on 8
-virtual CPU devices.
+for a given number of SparseCores per chip, and models hold them in a layer with
+the SparseCore state of `keras_rs.layers.DistributedEmbedding`, so the tests run
+on CPU without SparseCore. `sparsecore_checkpoint_utils_multidevice_test` runs
+them on 8 virtual CPU devices.
 """
 
 from collections.abc import Mapping, Sequence
+import os
+import types
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -28,7 +31,9 @@ from jax.experimental import layout as jax_layout
 from jax_tpu_embedding.sparsecore.lib.nn import embedding as jte_embedding
 from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
 from jax_tpu_embedding.sparsecore.lib.nn import table_stacking as jte_table_stacking
+import keras
 import numpy as np
+from recml.core.utils import keras_utils
 from recml.core.utils import sparsecore_checkpoint_utils
 
 # Three tables in one stack (all dims pad to 8) with vocab sizes that pad
@@ -36,12 +41,12 @@ from recml.core.utils import sparsecore_checkpoint_utils
 _VOCABS_AND_DIMS = {"t1": (19, 6), "t2": (35, 8), "t3": (10, 4)}
 
 
-def _table_stack(
+def _stacked_feature_specs(
     num_sc_per_device: int,
     rotation: int | None = None,
     global_device_count: int | None = None,
-) -> Sequence[embedding_spec.TableSpec]:
-  """Returns the tables stacked like `keras_rs` (for the current devices)."""
+) -> list[embedding_spec.FeatureSpec]:
+  """Returns features of tables stacked like `keras_rs` (for the devices)."""
   feature_specs = []
   for name, (vocab, dim) in _VOCABS_AND_DIMS.items():
     table_spec = embedding_spec.TableSpec(
@@ -67,8 +72,21 @@ def _table_stack(
       num_sc_per_device=num_sc_per_device,
       rotation=rotation,
   )
+  return feature_specs
+
+
+def _table_stack(
+    num_sc_per_device: int,
+    rotation: int | None = None,
+    global_device_count: int | None = None,
+) -> Sequence[embedding_spec.TableSpec]:
+  """Returns the tables stacked like `keras_rs` (for the current devices)."""
   (table_stack,) = jte_table_stacking.get_table_stacks(
-      jte_embedding.get_table_specs(feature_specs)
+      jte_embedding.get_table_specs(
+          _stacked_feature_specs(
+              num_sc_per_device, rotation, global_device_count
+          )
+      )
   ).values()
   return table_stack
 
@@ -94,6 +112,140 @@ def _sparsecore_sharding() -> jax.sharding.NamedSharding:
   return jax.sharding.NamedSharding(
       mesh, jax.sharding.PartitionSpec("sparsecore")
   )
+
+
+class _FakeSparseCoreLayer(keras.layers.Layer):
+  """Holds the SparseCore state of a `keras_rs.layers.DistributedEmbedding`.
+
+  `sparsecore_checkpoint_utils` reads the SparseCore lookup config, layout and
+  stacked table and slot variables of the layers. This layer has one stack of
+  `_VOCABS_AND_DIMS`, stacked like `keras_rs` for `num_sc_per_device`
+  SparseCores per chip, and sharded across the devices like the SparseCore
+  tables, so that checkpoints can be tested without SparseCore.
+  """
+
+  def __init__(self, num_sc_per_device: int, **kwargs):
+    super().__init__(**kwargs)
+    self._num_sc_per_device = num_sc_per_device
+    self._sparsecore_built = False
+    feature_specs = _stacked_feature_specs(num_sc_per_device)
+    (table_stack,) = jte_table_stacking.get_table_stacks(
+        jte_embedding.get_table_specs(feature_specs)
+    ).values()
+    # In a namespace, so that Keras doesn't wrap the lists for tracking.
+    self._specs = types.SimpleNamespace(
+        feature_specs=feature_specs, table_stack=table_stack
+    )
+
+  @property
+  def table_stack(self) -> Sequence[embedding_spec.TableSpec]:
+    return self._specs.table_stack
+
+  @property
+  def num_shards(self) -> int:
+    return jax.device_count() * self._num_sc_per_device
+
+  def build(self, input_shape=None):
+    del input_shape
+    stacked_spec = self.table_stack[0].stacked_table_spec
+    shape = (stacked_spec.stack_vocab_size, stacked_spec.stack_embedding_dim)
+    sharding = _sparsecore_sharding()
+    layout = keras.distribution.TensorLayout(
+        ("sparsecore", None),
+        keras.distribution.DeviceMesh(
+            (jax.device_count(),), ("sparsecore",), jax.devices()
+        ),
+    )
+    # Like `keras_rs`, a JAX `Format` (here without the TPU tiling).
+    # pylint: disable-next=protected-access
+    layout._backend_layout = jax_layout.Format(None, sharding)
+    # Like `keras_rs`, the table and its slot are trainable but trained on
+    # SparseCore, so the Keras optimizer has no slots for them.
+    table = self.add_weight(shape=shape, initializer="zeros", name="table")
+    slot = self.add_weight(shape=shape, initializer="zeros", name="slot")
+    for var in (table, slot):
+      var.overwrite_with_gradient = True
+      var._layout = layout  # pylint: disable=protected-access
+      var.assign(var.value)
+    self._config = types.SimpleNamespace(
+        num_sc_per_device=self._num_sc_per_device,
+        mesh=sharding.mesh,
+        feature_specs=self._specs.feature_specs,
+    )
+    self._sparsecore_layout = layout
+    self._table_and_slot_variables = {
+        stacked_spec.stack_name: types.SimpleNamespace(
+            table=table, slot=(slot,)
+        )
+    }
+    self._sparsecore_built = True
+    self.built = True
+
+  @property
+  def stack_variables(self) -> types.SimpleNamespace:
+    (emb_vars,) = self._table_and_slot_variables.values()
+    return emb_vars
+
+  def set_tables(
+      self, tables: Mapping[str, np.ndarray], slots: Mapping[str, np.ndarray]
+  ) -> None:
+    self.stack_variables.table.assign(
+        _stack(self.table_stack, tables, self.num_shards)
+    )
+    (slot,) = self.stack_variables.slot
+    slot.assign(_stack(self.table_stack, slots, self.num_shards))
+
+  def get_tables(self, var: keras.Variable) -> dict[str, np.ndarray]:
+    stack_name = self.table_stack[0].stacked_table_spec.stack_name
+    tables = jte_table_stacking.unshard_and_unstack_tables(
+        list(self.table_stack), {stack_name: var.value}, self.num_shards
+    )
+    return {
+        spec.name: np.asarray(table)
+        for spec, table in zip(self.table_stack, tables)
+    }
+
+
+class _TestModel(keras.Model):
+
+  def __init__(self, num_sc_per_device: int | None):
+    super().__init__(name="test_model")
+    self._num_sc_per_device = num_sc_per_device
+    self.sc_layer = (
+        _FakeSparseCoreLayer(num_sc_per_device, name="sc_emb")
+        if num_sc_per_device
+        else None
+    )
+    self.dense = keras.layers.Dense(2, name="head")
+
+  def build(self, input_shape=None):
+    if self.sc_layer is not None:
+      self.sc_layer.build()
+    self.dense.build((None, 8))
+    self.built = True
+
+  def get_config(self):
+    # Saved with the checkpoints.
+    return {"num_sc_per_device": self._num_sc_per_device}
+
+
+def _build_model(num_sc_per_device: int | None) -> _TestModel:
+  model = _TestModel(num_sc_per_device)
+  model.build()
+  model.compile(optimizer=keras.optimizers.Adam(1e-3))
+  model.optimizer.build(model.trainable_variables)
+  return model
+
+
+def _save_checkpoint(
+    manager_cls,
+    ckpt_dir: str,
+    model: _TestModel,
+) -> None:
+  manager = manager_cls(ckpt_dir, choose_store_cell=False)
+  manager.save_model_variables(model, epoch=5)
+  manager.wait_until_finished()
+  manager.close()
 
 
 class SparseCoreCheckpointUtilsTest(parameterized.TestCase):
@@ -268,6 +420,95 @@ class SparseCoreCheckpointUtilsTest(parameterized.TestCase):
     x = jax.device_put(np.arange(num_rows * 2.0).reshape(num_rows, 2), sharding)
     self.assertEqual(
         {shard.data.shape for shard in x.addressable_shards}, {(3, 2)}
+    )
+
+  @parameterized.parameters(2, 4)
+  def test_sparsecore_topology(self, num_sc_per_device):
+    model = _build_model(num_sc_per_device)
+    self.assertTrue(sparsecore_checkpoint_utils.has_sparsecore_tables(model))
+    (state,) = sparsecore_checkpoint_utils.sparsecore_layer_states(model)
+    self.assertIs(state.layout, model.sc_layer._sparsecore_layout)
+    self.assertEqual(
+        sparsecore_checkpoint_utils.sparsecore_topology(model),
+        {
+            model.sc_layer.stack_variables.table.path: {
+                "num_shards": jax.device_count() * num_sc_per_device,
+                "num_sc_per_device": num_sc_per_device,
+            }
+        },
+    )
+
+  def test_models_without_sparsecore_tables(self):
+    model = _build_model(None)
+    self.assertFalse(sparsecore_checkpoint_utils.has_sparsecore_tables(model))
+    self.assertEqual(sparsecore_checkpoint_utils.sparsecore_topology(model), {})
+    self.assertEqual(
+        sparsecore_checkpoint_utils.sparsecore_topology_save_args(model), {}
+    )
+
+  def test_unbuilt_layers_raise(self):
+    unbuilt_model = _TestModel(2)
+    with self.assertRaisesRegex(ValueError, "must be built"):
+      sparsecore_checkpoint_utils.sparsecore_layer_states(unbuilt_model)
+
+    model = _build_model(2)
+    model.sc_layer._sparsecore_built = False
+    with self.assertRaisesRegex(ValueError, "must be built"):
+      sparsecore_checkpoint_utils.sparsecore_layer_states(model)
+
+  @parameterized.parameters(
+      "_config", "_sparsecore_layout", "_table_and_slot_variables"
+  )
+  def test_incomplete_sparsecore_layer_state_raises(self, attr):
+    model = _build_model(2)
+    setattr(model.sc_layer, attr, None)
+    with self.assertRaisesRegex(ValueError, f"is missing .*'{attr}'"):
+      sparsecore_checkpoint_utils.sparsecore_layer_states(model)
+
+  def test_duplicate_sparsecore_table_paths_raise(self):
+    model = _build_model(2)
+    emb_vars = model.sc_layer.stack_variables
+    # Like two SparseCore layers with the same names.
+    model.sc_layer._table_and_slot_variables = {
+        "stack_a": emb_vars,
+        "stack_b": emb_vars,
+    }
+    with self.assertRaisesRegex(ValueError, "Duplicate SparseCore table"):
+      sparsecore_checkpoint_utils.sparsecore_topology(model)
+
+  @parameterized.named_parameters(
+      ("v2", keras_utils.KerasOrbaxCheckpointManagerV2),
+      ("v3", keras_utils.KerasOrbaxCheckpointManagerV3),
+  )
+  def test_sparsecore_topology_is_saved_with_the_checkpoint(self, manager_cls):
+    model = _build_model(4)
+    ckpt_dir = self.create_tempdir().full_path
+    _save_checkpoint(manager_cls, ckpt_dir, model)
+    self.assertEqual(
+        sparsecore_checkpoint_utils.saved_sparsecore_topology(
+            os.path.join(ckpt_dir, "5")
+        ),
+        {
+            model.sc_layer.stack_variables.table.path: {
+                "num_shards": jax.device_count() * 4,
+                "num_sc_per_device": 4,
+            }
+        },
+    )
+
+  @parameterized.named_parameters(
+      ("v2", keras_utils.KerasOrbaxCheckpointManagerV2),
+      ("v3", keras_utils.KerasOrbaxCheckpointManagerV3),
+  )
+  def test_sparsecore_topology_is_not_saved_without_sparsecore_tables(
+      self, manager_cls
+  ):
+    ckpt_dir = self.create_tempdir().full_path
+    _save_checkpoint(manager_cls, ckpt_dir, _build_model(None))
+    self.assertIsNone(
+        sparsecore_checkpoint_utils.saved_sparsecore_topology(
+            os.path.join(ckpt_dir, "5")
+        )
     )
 
 

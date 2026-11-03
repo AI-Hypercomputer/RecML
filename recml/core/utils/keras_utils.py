@@ -27,6 +27,7 @@ from etils import epath
 import jax
 import keras
 import orbax.checkpoint as ocp
+from recml.core.utils import sparsecore_checkpoint_utils
 import tensorflow as tf
 
 
@@ -39,6 +40,14 @@ FORMAT_VERSION_KEY = "format_version"
 NON_TRAINABLE_PATHS_KEY = "non_trainable_paths"
 OPTIMIZER_PATHS_KEY = "optimizer_paths"
 SHARED_VARIABLE_MAP_KEY = "shared_variable_map"
+# Optional checkpoint item recording how the SparseCore stacked tables were
+# sharded (`num_shards` and `num_sc_per_device`), saved only for models with
+# SparseCore tables (see `sparsecore_checkpoint_utils.sparsecore_topology`).
+# Used during restore to unshard/unstack and reshard SparseCore tables when the
+# restoring TPU topology differs from the saving topology.
+# TODO(b/576848327): Remove `SPARSECORE_TOPOLOGY_KEY` once `keras_rs`
+# `DistributedEmbedding` natively supports cross-topology resharding.
+SPARSECORE_TOPOLOGY_KEY = sparsecore_checkpoint_utils.SPARSECORE_TOPOLOGY_KEY
 ORBAX_CHECKPOINT_DEFAULT_KEY = "default"
 
 
@@ -242,6 +251,7 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
         args=ocp.args.Composite(**{
             STATE_CHECKPOINT_KEY: ocp.args.StandardSave(state),
             CONFIG_CHECKPOINT_KEY: ocp.args.JsonSave(config),
+            **sparsecore_checkpoint_utils.sparsecore_topology_save_args(model),
         }),
         metrics=logs,
     )
@@ -336,6 +346,14 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
             NON_TRAINABLE_PATHS_KEY,
             OPTIMIZER_PATHS_KEY,
             SHARED_VARIABLE_MAP_KEY,
+            # Optional item saved only when the model has SparseCore tables,
+            # used to reshard stacked tables across TPU topologies on restore.
+            # TODO(b/576848327): Remove once `keras_rs` supports cross-topology
+            # resharding natively.
+            # TODO(b/578977772): Verify that checkpoints with and without this
+            # item stay restorable with the backward compatibility test once it
+            # is ready.
+            SPARSECORE_TOPOLOGY_KEY,
         ),
         options=ocp.CheckpointManagerOptions(
             save_interval_steps=save_interval_epochs,
@@ -404,6 +422,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
             NON_TRAINABLE_PATHS_KEY: ocp.args.JsonSave(non_trainable_paths),
             OPTIMIZER_PATHS_KEY: ocp.args.JsonSave(optimizer_paths),
             SHARED_VARIABLE_MAP_KEY: ocp.args.JsonSave(shared_variable_map),
+            **sparsecore_checkpoint_utils.sparsecore_topology_save_args(model),
         }),
         metrics=logs,
     )

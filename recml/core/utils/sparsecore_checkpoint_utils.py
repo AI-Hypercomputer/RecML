@@ -18,8 +18,9 @@ of `keras_rs.layers.DistributedEmbedding` (and their optimizer slots) for the
 total number of SparseCores of the TPU topology (`global_device_count *
 num_sc_per_device`), so both the shape and the row layout of a stacked variable
 change across topologies (e.g. `glp=4x4` train vs. `glp=2x2` eval). This module
-reshards such variables across topologies, so that checkpoints can be restored
-on another topology than the one they were saved on.
+saves the topology of the stacked variables with the checkpoint, and reshards
+them across topologies, so that checkpoints can be restored on another topology
+than the one they were saved on.
 
 TODO(b/576848327): Remove this module (and its `jax_tpu_embedding` dependency)
 once keras_rs `DistributedEmbedding` supports resharding SparseCore tables and
@@ -29,12 +30,16 @@ optimizer slots across TPU topologies.
 from collections.abc import Mapping, Sequence
 import copy
 import math
-from typing import cast
+import os
+from typing import Any, NamedTuple, cast
 
+from etils import epath
 import jax
 from jax.experimental import layout as jax_layout
 from jax_tpu_embedding.sparsecore.lib.nn import embedding_spec
 from jax_tpu_embedding.sparsecore.lib.nn import table_stacking as jte_table_stacking
+import keras
+import orbax.checkpoint as ocp
 
 
 def settings_in_stack(
@@ -209,3 +214,183 @@ def row_sharding(
       devices.reshape(num_row_shards, -1), ("rows", "replicas")
   )
   return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("rows"))
+
+
+# Optional checkpoint item key storing the source SparseCore topology
+# (`num_shards` and `num_sc_per_device` per stacked table; see
+# `sparsecore_topology`). Saved only for models with SparseCore tables and read
+# on restore to unshard/unstack and reshard stacked tables when restoring on a
+# different TPU topology.
+# TODO(b/576848327): Remove once `keras_rs` `DistributedEmbedding` natively
+# supports cross-topology resharding.
+SPARSECORE_TOPOLOGY_KEY = "sparsecore_topology"
+
+
+class SparseCoreLayerState(NamedTuple):
+  """The SparseCore state of a `keras_rs.layers.DistributedEmbedding` layer.
+
+  Attributes:
+    config: The SparseCore lookup config of the layer (with `feature_specs`,
+      `mesh` and `num_sc_per_device`).
+    layout: The SparseCore `TensorLayout` of the stacked variables.
+    table_and_slot_variables: The stacked table and slot variables by stack
+      name.
+  """
+
+  config: Any
+  layout: keras.distribution.TensorLayout
+  table_and_slot_variables: Mapping[str, Any]
+
+
+def sparsecore_layer_states(model: keras.Model) -> list[SparseCoreLayerState]:
+  """Returns the SparseCore state of the SparseCore layers of `model`.
+
+  Matches the JAX `keras_rs.layers.DistributedEmbedding` layers with tables on
+  SparseCore, including the one wrapped by `SparseCoreEmbeddings`. Only these
+  layers set `_sparsecore_built`, so models on other backends have none.
+
+  Args:
+    model: The model being saved or restored. Must be built, along with all of
+      its layers.
+
+  Returns:
+    The SparseCore state of each built SparseCore layer.
+
+  Raises:
+    ValueError: If `model` or any of its layers is not built, or if a built
+      SparseCore layer is missing its SparseCore state.
+  """
+  states = []
+  # pylint: disable-next=protected-access
+  for layer in model._flatten_layers(include_self=True):
+    if not getattr(layer, "built", False) or not getattr(
+        layer, "_sparsecore_built", True
+    ):
+      raise ValueError(
+          "All layers of `model` must be built before inspecting SparseCore"
+          f" state, but layer '{layer.name}' ({type(layer).__name__}) is not"
+          " built."
+      )
+    if not getattr(layer, "_sparsecore_built", False):
+      continue
+    config = getattr(layer, "_config", None)
+    layout = getattr(layer, "_sparsecore_layout", None)
+    table_and_slot_variables = getattr(layer, "_table_and_slot_variables", None)
+    if config is None or layout is None or table_and_slot_variables is None:
+      missing = [
+          name
+          for name, value in (
+              ("_config", config),
+              ("_sparsecore_layout", layout),
+              ("_table_and_slot_variables", table_and_slot_variables),
+          )
+          if value is None
+      ]
+      raise ValueError(
+          f"SparseCore layer '{layer.name}' has `_sparsecore_built=True` but"
+          f" is missing {missing}."
+      )
+    states.append(
+        SparseCoreLayerState(config, layout, table_and_slot_variables)
+    )
+  return states
+
+
+def has_sparsecore_tables(model: keras.Model) -> bool:
+  """Returns whether `model` has embedding tables on SparseCore.
+
+  Args:
+    model: The model being saved or restored.
+
+  Raises:
+    ValueError: See `sparsecore_layer_states`.
+  """
+  return bool(sparsecore_layer_states(model))
+
+
+def sparsecore_topology(model: keras.Model) -> dict[str, dict[str, int]]:
+  """Returns the SparseCore topology of each stacked table of `model`.
+
+  Saved with the checkpoint so that a restore on another TPU topology knows
+  how the stacked tables (and their optimizer slots, which share the layout of
+  their table) were sharded.
+
+  Args:
+    model: The model being saved.
+
+  Returns:
+    Stacked table variable path to `{"num_shards": ..., "num_sc_per_device":
+    ...}`. Empty for models without SparseCore tables.
+
+  Raises:
+    ValueError: If two stacked tables have the same variable path (e.g. two
+      SparseCore layers with the same name and stack names), or see
+      `sparsecore_layer_states`.
+  """
+  topology = {}
+  for state in sparsecore_layer_states(model):
+    num_sc_per_device = int(state.config.num_sc_per_device)
+    num_shards = int(state.config.mesh.devices.size) * num_sc_per_device
+    for emb_vars in state.table_and_slot_variables.values():
+      # V2 checkpoints store the variables in a list, so only this check
+      # catches duplicate paths, whose topologies would overwrite each other.
+      if emb_vars.table.path in topology:
+        raise ValueError(
+            "Duplicate SparseCore table variable path"
+            f" '{emb_vars.table.path}'. Give the SparseCore layers unique"
+            " names."
+        )
+      topology[emb_vars.table.path] = {
+          "num_shards": num_shards,
+          "num_sc_per_device": num_sc_per_device,
+      }
+  return topology
+
+
+def sparsecore_topology_save_args(model: keras.Model) -> dict[str, Any]:
+  """Returns the Orbax save args of `sparsecore_topology`, if any.
+
+  Only models with SparseCore tables get the item, so the checkpoints of other
+  models are unchanged.
+
+  Args:
+    model: The model being saved.
+
+  Returns:
+    `{SPARSECORE_TOPOLOGY_KEY: ocp.args.JsonSave(...)}` to merge into the Orbax
+    `Composite` save args, or an empty dict for models without SparseCore
+    tables.
+  """
+  topology = sparsecore_topology(model)
+  if not topology:
+    return {}
+  return {
+      SPARSECORE_TOPOLOGY_KEY: ocp.args.JsonSave(
+          {SPARSECORE_TOPOLOGY_KEY: topology}
+      )
+  }
+
+
+def saved_sparsecore_topology(
+    checkpoint_path: str,
+) -> dict[str, dict[str, int]] | None:
+  """Returns the saved `sparsecore_topology`, or None if it wasn't saved.
+
+  Args:
+    checkpoint_path: Path to the checkpoint directory of one step.
+
+  Returns:
+    The `sparsecore_topology` saved with the checkpoint, or None if the
+    checkpoint has no `SPARSECORE_TOPOLOGY_KEY` item (e.g. it was saved for a
+    model without SparseCore tables).
+  """
+  topology_path = epath.Path(checkpoint_path) / SPARSECORE_TOPOLOGY_KEY
+  if not topology_path.exists():
+    return None
+  checkpointer = ocp.Checkpointer(ocp.handlers.JsonCheckpointHandler())
+  try:
+    return checkpointer.restore(
+        os.fspath(topology_path), args=ocp.args.JsonRestore()
+    )[SPARSECORE_TOPOLOGY_KEY]
+  finally:
+    checkpointer.close()
