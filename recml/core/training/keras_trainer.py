@@ -32,6 +32,7 @@ import keras
 import orbax.checkpoint as ocp
 import psutil
 from recml.core.training import core
+from recml.core.training import device_prefetch
 from recml.core.utils import py_utils
 import tensorflow as tf
 
@@ -126,6 +127,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       legacy_checkpoint_format: bool | None = None,
       train_callbacks: Sequence[keras.callbacks.Callback] = (),
       eval_callbacks: Sequence[keras.callbacks.Callback] = (),
+      device_prefetch_depth: int = 0,
   ):
     """Initializes the instance.
 
@@ -152,12 +154,26 @@ class KerasTrainer(core.Trainer[KerasTask]):
         trainer's own callbacks. Use `keras_utils.MetricsCallback` to report
         metrics, because Keras does not return changes made to `logs` in
         `on_test_end`.
+      device_prefetch_depth: Number of batches that a background thread fetches
+        and copies to the device ahead of the training step during `train`,
+        instead of Keras' main-thread one-batch-ahead iterator (see
+        `device_prefetch.model_prefetch_scope`). 0 keeps the Keras behaviour.
+        `depth=1` keeps 2 batches alive (matching Keras), and each extra step of
+        depth holds 1 more batch in device HBM. Not applied in
+        `train_and_evaluate`.
       resume_training_launcher: Launcher to resume training.
       enable_xmanager_measurements: Whether to enable XManager measurements.
       enable_autoxprof: Whether to enable AutoXprof.
       autoxprof_settings: Settings for AutoXprof.
       s2_logging_settings: Settings for S2 logging.
+
+    Raises:
+      ValueError: If `device_prefetch_depth` is negative.
     """
+    if device_prefetch_depth < 0:
+      raise ValueError(
+          f"device_prefetch_depth must be >= 0, got {device_prefetch_depth}."
+      )
 
     keras.utils.set_random_seed(rng_seed)
 
@@ -180,6 +196,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._steps_per_eval = steps_per_eval
     self._continuous_eval_timeout = continuous_eval_timeout
     self._steps_per_loop = steps_per_loop
+    self._device_prefetch_depth = device_prefetch_depth
     self._marker_path = os.path.join(
         model_dir, core.TRAINING_COMPLETE_MARKER_FILE
     )
@@ -352,13 +369,16 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, dataset, val=False)
     )
 
-    history = model.fit(
-        dataset,
-        epochs=self._train_epochs + 1,
-        steps_per_epoch=self._steps_per_loop,
-        callbacks=self.train_callbacks,
-        initial_epoch=1,
-    )
+    with device_prefetch.model_prefetch_scope(
+        model, depth=self._device_prefetch_depth
+    ):
+      history = model.fit(
+          dataset,
+          epochs=self._train_epochs + 1,
+          steps_per_epoch=self._steps_per_loop,
+          callbacks=self.train_callbacks,
+          initial_epoch=1,
+      )
     model.summary(print_fn=logging.info)
 
     if keras.backend.backend() == "jax" and jax.process_index() != 0:
@@ -403,6 +423,11 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
   def train_and_evaluate(self, task: KerasTask) -> core.Logs:
     """Trains and evaluates a Keras model."""
+    if self._device_prefetch_depth:
+      logging.warning(
+          "device_prefetch_depth only applies to `train`; ignoring it in"
+          " `train_and_evaluate`."
+      )
     train_dataset = task.create_dataset(
         training=True, **self._maybe_get_dataset_kws(task)
     )
