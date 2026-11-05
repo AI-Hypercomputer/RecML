@@ -13,8 +13,15 @@
 # limitations under the License.
 """Utilities for inspecting the active JAX/Keras distribution mesh."""
 
+from collections.abc import Callable
+import math
+from typing import Any
+import weakref
+
 import jax
+import jax.numpy as jnp
 import keras
+from keras.src.backend.common import variables as keras_variables
 
 # Conventional name of the mesh axis used for model/tensor parallelism. Any
 # other axis of the mesh is assumed to shard the batch.
@@ -120,3 +127,151 @@ def resolve_batch_axis(
     # somewhere; fall back to the full set of axis names.
     batch_axes = tuple(abstract_mesh.axis_names)
   return normalize_axis(batch_axes)
+
+
+def fuse_table_grads_enabled() -> bool:
+  """Returns whether the active distribution fuses table gradients.
+
+  A distribution opts in by setting a truthy `fuse_table_grads` attribute.
+  Layers that read a large table with a batch (embedding lookups, tied output
+  projections) then run that read through `fused_table_grad_call`.
+
+  Returns:
+    True if a distribution is active and its `fuse_table_grads` is truthy.
+  """
+  return bool(
+      getattr(keras.distribution.distribution(), 'fuse_table_grads', False)
+  )
+
+
+class FusedTableGradDataParallel(keras.distribution.DataParallel):
+  """`DataParallel` that fuses gradients across reads of each replicated table.
+
+  Under plain `DataParallel`, XLA partitions every embedding lookup's gradient
+  (a scatter-add into a replicated table) as a local scatter plus an
+  all-reduce, and it seeds the next scatter of the same table with that
+  all-reduce's result. A table read by N lookups then pays a chain of up to N
+  table-sized all-reduces per step. With this distribution, every read of a
+  table runs under `jax.shard_map` on a shared per-device copy of the table.
+  Each device adds up its reads' table gradients locally, and one all-reduce
+  per table sums the result across devices. The forward computation is
+  unchanged; only the order in which the table gradient is summed changes.
+  """
+
+  fuse_table_grads = True
+
+
+# Shared per-device copies of replicated tables. Maps id(table) to a weak
+# reference to the table, the table's value in the trace that read it last, and
+# the copies of that value. See `_shared_table_copies`.
+_shared_table_copies_cache: dict[
+    int, tuple[weakref.ref[keras.Variable], jax.Array, jax.Array]
+] = {}
+
+
+def _shared_table_copies(
+    table: keras.Variable, table_value: jax.Array, num_copies: int
+) -> jax.Array:
+  """Returns `num_copies` copies of `table_value` stacked on dim 0.
+
+  Every call on `table` with the same traced `table_value` gets the same
+  copies. JAX then adds up the table gradients of all those calls on each
+  device before it reaches the transpose of the tile, which sums the copies
+  across devices once.
+
+  The copies are a tracer, so all calls on a table must run at the same trace
+  level. If the first call runs inside a nested transformation such as
+  `jax.checkpoint` and a later one outside it, JAX raises an escaped-tracer
+  error.
+
+  Args:
+    table: The table variable.
+    table_value: The table's value in the current trace.
+    num_copies: The number of devices that share the table.
+
+  Returns:
+    An array of shape `(num_copies * table.shape[0], *table.shape[1:])`.
+  """
+  key = id(table)
+  cached = _shared_table_copies_cache.get(key)
+  if cached is not None and cached[0]() is table and cached[1] is table_value:
+    return cached[2]
+  copies = jnp.tile(table_value, (num_copies,) + (1,) * (table_value.ndim - 1))
+  _shared_table_copies_cache[key] = (
+      # Drops the entry, and the tracers in it, when the table goes away.
+      weakref.ref(table, lambda _: _shared_table_copies_cache.pop(key, None)),
+      table_value,
+      copies,
+  )
+  return copies
+
+
+def fused_table_grad_call(
+    fn: Callable[..., Any],
+    table: keras.Variable,
+    *batch_args: Any,
+) -> Any:
+  """Calls `fn(table, *batch_args)` on each device and fuses table gradients.
+
+  The table must be replicated. Each device gets its own copy, and all calls on
+  the table in the same trace share that copy. So each device adds up the table
+  gradients of all calls, and one all-reduce per table sums them across
+  devices. All calls on a table must run at the same trace level (see
+  `_shared_table_copies`).
+
+  Under a Keras autocast scope, `fn` gets the table in the scope's dtype, but
+  the gradient is still all-reduced in the variable dtype.
+
+  Args:
+    fn: A function of the full table and the local batch shards. Each output row
+      must depend only on the same row of the batch args.
+    table: A replicated table variable.
+    *batch_args: Arrays whose dim 0 is the global batch.
+
+  Returns:
+    The output of `fn`, sharded on dim 0 over the batch axes.
+
+  Raises:
+    NotImplementedError: If the active distribution shards the table.
+  """
+  # TODO(jinchi): Support sharded (FSDP) tables.
+  if any(keras.distribution.distribution().get_variable_layout(table).axes):
+    raise NotImplementedError(
+        'fused_table_grad_call supports only replicated tables.'
+    )
+  abstract_mesh = get_abstract_mesh()
+  batch_axis = resolve_batch_axis(abstract_mesh)
+
+  # Read the table in its variable dtype and cast inside `fn`, so the gradient
+  # is all-reduced in that dtype rather than in bf16.
+  autocast_scope = keras_variables.get_autocast_scope()
+  with keras_variables.AutocastScope(None):
+    table_value = keras.ops.convert_to_tensor(table)
+
+  if abstract_mesh is not None and isinstance(table_value, jax.core.Tracer):
+    mesh = abstract_mesh
+    batch_axes = batch_axis if isinstance(batch_axis, tuple) else (batch_axis,)
+    axis_sizes = dict(zip(abstract_mesh.axis_names, abstract_mesh.axis_sizes))
+    table_value = _shared_table_copies(
+        table, table_value, math.prod(axis_sizes[axis] for axis in batch_axes)
+    )
+    table_spec = jax.P(batch_axis)
+  else:
+    # Eager `shard_map` on an `AbstractMesh` rejects inputs without a
+    # `NamedSharding`, so eager calls use the concrete mesh and one table.
+    mesh = keras.distribution.distribution().device_mesh.backend_mesh
+    table_spec = jax.P()
+
+  def local_fn(full_table, *local_batch_args):
+    if autocast_scope is not None:
+      full_table = autocast_scope.maybe_cast(full_table)
+    return fn(full_table, *local_batch_args)
+
+  # The transpose of the tile sums the copies' gradients across devices.
+  return jax.shard_map(
+      local_fn,
+      mesh=mesh,
+      in_specs=(table_spec,) + (jax.P(batch_axis),) * len(batch_args),
+      out_specs=jax.P(batch_axis),
+      check_vma=False,
+  )(table_value, *batch_args)
