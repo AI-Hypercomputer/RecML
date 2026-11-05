@@ -62,6 +62,25 @@ class _MarkerCallback(keras_utils.MetricsCallback):
     self._record(logs, "custom/marker", 7.0)
 
 
+class _RecordWeightsCallback(keras.callbacks.Callback):
+  """Records the model's kernel at the start of each evaluation."""
+
+  def __init__(self, model: keras.Model):
+    super().__init__()
+    self._model = model
+    self.kernels = []
+
+  def on_test_begin(self, logs=None):
+    self.kernels.append(float(self._model.layers[-1].kernel.numpy()[0, 0]))
+
+
+class _KerasTaskWithEvalCallbacks(_KerasTask):
+
+  def create_eval_callbacks(self, model: keras.Model):
+    self.callback = _RecordWeightsCallback(model)
+    return [self.callback]
+
+
 class KerasTrainerTest(parameterized.TestCase):
 
   def setUp(self):
@@ -218,6 +237,28 @@ class KerasTrainerTest(parameterized.TestCase):
 
     self.assertIn("overwrites existing evaluation log key", log.output[0])
     self.assertEqual(val_logs["val_custom/marker"], 7.0)
+
+  def test_task_eval_callbacks_see_restored_weights(self):
+    if keras.backend.backend() != "jax":
+      self.skipTest("Continuous eval is only supported on the Jax backend.")
+    trainer = keras_trainer.KerasTrainer(
+        distribution=keras.distribution.DataParallel(),
+        train_steps=5,
+        steps_per_eval=1,
+        steps_per_loop=5,
+        model_dir=self.create_tempdir().full_path,
+        continuous_eval_timeout=5,
+    )
+    task = _KerasTaskWithEvalCallbacks()
+    experiment = core.Experiment(task, trainer)
+    core.run_experiment(experiment, core.Trainer.Mode.TRAIN)
+    keras.backend.clear_session()
+
+    core.run_experiment(experiment, core.Trainer.Mode.CONTINUOUS_EVAL)
+    # The kernel starts at -1.0 and training moves it, so the callback ran
+    # after the checkpoint restore.
+    self.assertNotEmpty(task.callback.kernels)
+    self.assertNotAlmostEqual(task.callback.kernels[0], -1.0)
 
   def test_eval_name(self):
     if keras.backend.backend() != "jax":
