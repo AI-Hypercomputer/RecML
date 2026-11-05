@@ -189,7 +189,17 @@ def _to_shape_dtype_struct(x: keras.Variable) -> jax.ShapeDtypeStruct:
 
 
 class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
-  """An Orbax checkpoint manager for Keras 3."""
+  """An Orbax checkpoint manager for Keras 3.
+
+  SparseCore support (see `sparsecore_checkpoint_utils`):
+  - Supported: models with and without SparseCore-sharded
+    `DistributedEmbedding` tables. SparseCore-sharded tables are resharded when
+    restored on another TPU topology (e.g. `glp=4x4` train vs. `glp=2x2` eval).
+  - Not supported: restoring across models with and without SparseCore-sharded
+    tables, in either direction. For example, a side eval on a TPU without
+    SparseCores (e.g. `vlp`) cannot restore the checkpoints of a training job
+    with SparseCore-sharded tables (e.g. on `glp`).
+  """
 
   def __init__(
       self,
@@ -274,6 +284,26 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
     # TODO(zixiangzhou): Update variables to use a nested dictionary and index
     # map instead of flattened list.
 
+    # Must run before `_to_shape_dtype_struct` and `var.value.delete()`: on a
+    # different TPU topology, stacked SparseCore tables have a different saved
+    # shape on disk, so `prepare_sparsecore_restore` swaps `var._value` with a
+    # placeholder of the saved shape/sharding (and `self.restore` does not have
+    # `model` or its `DistributedEmbedding` specs).
+    # TODO(b/576848327): Remove once `keras_rs` natively supports cross-topology
+    # SparseCore resharding.
+    sparsecore_restores = []
+    if sparsecore_checkpoint_utils.has_sparsecore_tables(model):
+      # Only resolved for SparseCore models, to not list the checkpoint
+      # directory again on every restore.
+      checkpoint_path, _ = resolve_orbax_checkpoint_path(
+          str(self.directory), epoch
+      )
+      sparsecore_restores = (
+          sparsecore_checkpoint_utils.prepare_sparsecore_restore(
+              model, checkpoint_path, version=CheckpointVersion.V2
+          )
+      )
+
     # Construct abstract variables to ensure the checkpoint is restored with
     # the same sharding as the current variables. This is so we can delete the
     # variables from device memory to reduce peak memory usage.
@@ -302,6 +332,8 @@ class KerasOrbaxCheckpointManagerV2(ocp.CheckpointManager):
     ):
       var._value = restored_var  # pylint: disable=protected-access
 
+    sparsecore_checkpoint_utils.finish_sparsecore_restore(sparsecore_restores)
+
 
 class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
   """An Orbax checkpoint manager for Keras 3 with dictionary state.
@@ -315,6 +347,16 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
   partial restoration is restricted to trainable variables (weights).
   Non-trainable and optimizer variables are specific to the training run and
   are not supported for partial transfer.
+
+  SparseCore support (see `sparsecore_checkpoint_utils`):
+  - Supported: models with and without SparseCore-sharded
+    `DistributedEmbedding` tables. SparseCore-sharded tables are resharded when
+    restored on another TPU topology (e.g. `glp=4x4` train vs. `glp=2x2` eval).
+  - Not supported: restoring across models with and without SparseCore-sharded
+    tables, in either direction. For example, a side eval on a TPU without
+    SparseCores (e.g. `vlp`) cannot restore the checkpoints of a training job
+    with SparseCore-sharded tables (e.g. on `glp`). To transfer only the shared
+    dense weights between such checkpoints, use `restore_partial_checkpoint`.
   """
 
   def __init__(
@@ -452,22 +494,39 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
         OPTIMIZER_VARIABLES_KEY: optimizer_variables,
     }
 
-    # Construct abstract variables to ensure the checkpoint is restored with
-    # the same sharding as the current variables.
-    abstract_variables = jax.tree.map(_to_shape_dtype_struct, variables)
-    for var in jax.tree.flatten(variables)[0]:
-      var.value.delete()
-      var._value = None  # pylint: disable=protected-access
+    step_path = os.path.join(self.directory, str(epoch))
+    # Must run before `_to_shape_dtype_struct` and `var.value.delete()` so
+    # cross-topology SparseCore variables get placeholders with their saved
+    # shapes/shardings before Orbax restore. Same-topology restores
+    # short-circuit after checking `sparsecore_topology`, leaving all V3 state
+    # metadata reading to `_prepare_v3_restore`.
+    # TODO(b/576848327): Remove once `keras_rs` natively supports cross-topology
+    # SparseCore resharding.
+    sparsecore_restores = (
+        sparsecore_checkpoint_utils.prepare_sparsecore_restore(
+            model, step_path, version=CheckpointVersion.V3
+        )
+    )
 
     logging.info("Restoring checkpoint for epoch %s...", epoch)
 
-    step_path = os.path.join(self.directory, str(epoch))
-    abstract_variables, state_transforms = _prepare_v3_restore(
-        step_path,
-        abstract_variables,
-        model,
-        restore_optimizer_vars=True,
-    )
+    try:
+      # Construct abstract variables to ensure the checkpoint is restored with
+      # the same sharding as the current variables.
+      abstract_variables = jax.tree.map(_to_shape_dtype_struct, variables)
+      abstract_variables, state_transforms = _prepare_v3_restore(
+          step_path,
+          abstract_variables,
+          model,
+          restore_optimizer_vars=True,
+      )
+    except BaseException:
+      sparsecore_checkpoint_utils.abort_sparsecore_restore(sparsecore_restores)
+      raise
+
+    for var in jax.tree.flatten(variables)[0]:
+      var.value.delete()
+      var._value = None  # pylint: disable=protected-access
 
     restored_items = self.restore(
         step=epoch,
@@ -487,17 +546,12 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
 
     model._initial_epoch = epoch + 1  # pylint: disable=protected-access
 
-    keras.tree.assert_same_structure(variables, restored_variables)
+    keras.tree.assert_same_structure(abstract_variables, restored_variables)
+    _assign_v3_restored_values(
+        variables, restored_variables, restore_optimizer_vars=True
+    )
 
-    for key in [
-        TRAINABLE_VARIABLES_KEY,
-        NON_TRAINABLE_VARIABLES_KEY,
-        OPTIMIZER_VARIABLES_KEY,
-    ]:
-      var_dict = variables[key]
-      restored_var_dict = restored_variables[key]
-      for path, var in var_dict.items():
-        var._value = restored_var_dict[path]  # pylint: disable=protected-access
+    sparsecore_checkpoint_utils.finish_sparsecore_restore(sparsecore_restores)
 
 
 def resolve_orbax_checkpoint_path(
@@ -1107,6 +1161,15 @@ def restore_keras_checkpoint(
 ) -> keras.Model:
   """Restores a Keras 3 Jax backend model from an Orbax checkpoint.
 
+  For models with SparseCore-sharded `DistributedEmbedding` tables (tables
+  placed on SparseCore, not HBM embeddings on TPUs with SparseCores), stacked
+  tables saved with `KerasOrbaxCheckpointManagerV2/V3` are automatically
+  resharded when restored on a different TPU topology (stacked tables saved
+  without `sparsecore_topology` can only be restored on the saving topology).
+  Full restoration requires matching model variables; to transfer only shared
+  dense weights between V3 checkpoints with and without SparseCore-sharded
+  tables, use `restore_partial_checkpoint`.
+
   Args:
     checkpoint_dir: The directory containing the Orbax checkpoint(s).
     model: The Keras model to restore. If not provided, the model will be
@@ -1219,15 +1282,34 @@ def restore_keras_checkpoint(
   # TODO(zixiangzhou): Update variables to use a nested dictionary and index map
   # instead of flattened list.
 
-  # Construct abstract variables to ensure the checkpoint is restored with
-  # the same sharding as the current variables.
-  abstract_state = jax.tree.map(_to_shape_dtype_struct, variables)
+  # Must run before `_to_shape_dtype_struct` so cross-topology SparseCore
+  # variables get placeholders with their saved shapes/shardings before Orbax
+  # restore. Same-topology restores short-circuit after checking
+  # `sparsecore_topology`, leaving V3 state metadata reading to
+  # `_prepare_v3_restore`.
+  # TODO(b/576848327): Remove once `keras_rs` natively supports cross-topology
+  # SparseCore resharding.
+  sparsecore_restores = sparsecore_checkpoint_utils.prepare_sparsecore_restore(
+      model, checkpoint_path, version=version
+  )
 
-  state_transforms = {}
-  if is_v3:
-    abstract_state, state_transforms = _prepare_v3_restore(
-        checkpoint_path, abstract_state, model, restore_optimizer_vars
-    )
+  try:
+    # Construct abstract variables to ensure the checkpoint is restored with
+    # the same sharding as the current variables.
+    abstract_state = jax.tree.map(_to_shape_dtype_struct, variables)
+
+    state_transforms = {}
+    if is_v3:
+      abstract_state, state_transforms = _prepare_v3_restore(
+          checkpoint_path,
+          abstract_state,
+          model,
+          restore_optimizer_vars,
+      )
+  except BaseException:
+    # The variables are still intact: leave the model as it was.
+    sparsecore_checkpoint_utils.abort_sparsecore_restore(sparsecore_restores)
+    raise
 
   # Delete the variables from device memory to reduce peak memory usage.
   # Only delete variables that we are actually trying to restore.
@@ -1259,6 +1341,8 @@ def restore_keras_checkpoint(
     ):
       var._value = restored_var  # pylint: disable=protected-access
 
+  sparsecore_checkpoint_utils.finish_sparsecore_restore(sparsecore_restores)
+
   if restore_model_epoch:
     model._initial_epoch = epoch + 1  # pylint: disable=protected-access  # pyrefly: ignore[unsupported-operation]
   if restore_optimizer_vars and not restore_iterations:
@@ -1287,34 +1371,39 @@ def restore_partial_checkpoint(
   variables; they are resolved to their stored paths through the checkpoint's
   shared variable map.
 
+  `prefix_map` subtree remapping rules:
+  - Depth matching: A prefix matches all variables at any depth beneath it on
+    whole path segments (`layer_a` matches `layer_a/var_a` and
+    `layer_a/layer_b/var_b`, but not `layer_a_2`).
+  - Overlapping prefixes: The longest (most specific) prefix wins, allowing
+    subtree overrides (`model/new/tower` overrides `model/new`).
+  - Subtree structure: The path remainder below the prefix is preserved, so
+    source and target subtrees must share identical structure.
+
+  SparseCore stacked tables are restored as saved: unlike
+  `restore_keras_checkpoint`, this does not reshard tables saved on another TPU
+  topology, so only restore them on the topology they were saved on.
+
   Args:
-      checkpoint_dir: The directory containing the Orbax checkpoint(s).
-      partial_variables: A dictionary mapping keys (e.g.
-        TRAINABLE_VARIABLES_KEY) to dictionaries mapping variable paths to
-        keras.Variable instances.
-      epoch: The epoch to restore. If None, latest is used.
-      transforms: An optional mapping of custom transforms (e.g. mapping target
-        variable paths to `ocp.transform_utils.Transform` objects) for explicit
-        variable re-mapping. Keys and `original_key` values must be exact
-        variable paths, including Keras layer name suffixes (e.g. `dense_1`).
-        Prefer `prefix_map` or the default resolution unless you need
-        per-variable control.
-      prefix_map: An optional map from target path prefix to source path prefix
-        for subtree remapping, e.g. `{"model/target_tower": "model/src_tower"}`.
-        Paths omit the state key (e.g. `trainable_variables/`).
-        Rules:
-        - Depth matching: A prefix matches all variables at any depth beneath
-          it on whole path segments (`layer_a` matches `layer_a/var_a` and
-          `layer_a/layer_b/var_b`, but not `layer_a_2`).
-        - Overlapping prefixes: The longest (most specific) prefix wins,
-          allowing subtree overrides (`model/new/tower` overrides `model/new`).
-        - Subtree structure: The path remainder below the prefix is preserved,
-          so source and target subtrees must share identical structure.
-        Logs a warning if a prefix matches no target variables; raises if a
-        mapped source is missing; shape mismatches fail at restore.
+    checkpoint_dir: The directory containing the Orbax checkpoint(s).
+    partial_variables: A dictionary mapping keys (e.g. TRAINABLE_VARIABLES_KEY)
+      to dictionaries mapping variable paths to keras.Variable instances.
+    epoch: The epoch to restore. If None, latest is used.
+    transforms: An optional mapping of custom transforms (e.g. mapping target
+      variable paths to `ocp.transform_utils.Transform` objects) for explicit
+      variable re-mapping. Keys and `original_key` values must be exact variable
+      paths, including Keras layer name suffixes (e.g. `dense_1`). Prefer
+      `prefix_map` or the default resolution unless you need per-variable
+      control.
+    prefix_map: An optional map from target path prefix to source path prefix
+      for subtree remapping, e.g. `{"model/target_tower": "model/src_tower"}`.
+      Paths omit the state key (e.g. `trainable_variables/`). See the subtree
+      remapping rules above. Logs a warning if a prefix matches no target
+      variables; raises if a mapped source is missing; shape mismatches fail at
+      restore.
 
   Returns:
-      The restored state dictionary (containing Jax Arrays).
+    The restored state dictionary (containing Jax Arrays).
   """
   checkpoint_path, _ = resolve_orbax_checkpoint_path(checkpoint_dir, epoch)
 
@@ -1340,6 +1429,12 @@ def restore_partial_checkpoint(
         "Partial restoration is only supported for trainable variables."
     )
 
+  # TODO(b/576848327): Support cross-topology SparseCore resharding in
+  # `restore_partial_checkpoint` once Keras 3 / `keras_rs` provides
+  # variable-level Orbax resharding. Unlike `restore_keras_checkpoint`, this
+  # function only receives `keras.Variable`s (no `keras.Model`), so
+  # `sparsecore_checkpoint_utils` cannot inspect the `DistributedEmbedding`
+  # layer specs to unstack and restack tables.
   abstract_state = jax.tree.map(_to_shape_dtype_struct, partial_variables)
 
   # Delete variables from device memory to reduce peak memory usage.
