@@ -13,13 +13,19 @@
 # limitations under the License.
 """Tests for the opt-in training loop options of `KerasTrainer`."""
 
+import os
 import types
 from unittest import mock
 
 from absl.testing import absltest
 import jax
+import keras
+from keras.src.utils import python_utils
+import numpy as np
+from recml.core.training import batch_callbacks
 from recml.core.training import device_prefetch
 from recml.core.training import keras_trainer
+from recml.core.utils import keras_utils
 
 
 def _trainer(tmpdir, **overrides):
@@ -140,6 +146,99 @@ class KerasTrainerOptionsTest(absltest.TestCase):
       with self.assertRaisesRegex(RuntimeError, "stop"):
         trainer.train_and_evaluate(task)
     self.assertIn("device_prefetch_depth", logs.output[0])
+
+  def test_train_and_evaluate_warns_that_skip_batch_logs_is_not_applied(self):
+    trainer = _trainer(self._tmpdir, skip_batch_logs=True)
+    task = mock.Mock()
+    task.create_dataset.side_effect = RuntimeError("stop")
+    with self.assertLogs(level="WARNING") as logs:
+      with self.assertRaisesRegex(RuntimeError, "stop"):
+        trainer.train_and_evaluate(task)
+    self.assertIn("skip_batch_logs", logs.output[0])
+
+  def test_skip_batch_logs_uses_the_zero_sync_list(self):
+    trainer = _trainer(self._tmpdir, skip_batch_logs=True)
+    model = _DummyModel()
+
+    trainer.train(_task(model, []))
+
+    fn_in_fit, callbacks_in_fit = model.seen_in_fit[0]
+    self.assertNotIsInstance(
+        fn_in_fit, device_prefetch.PrefetchingTrainFunction
+    )
+    self.assertIsInstance(
+        callbacks_in_fit, batch_callbacks.ZeroSyncCallbackList
+    )
+    summaries = [
+        cbk
+        for cbk in callbacks_in_fit.callbacks
+        if isinstance(cbk, keras_utils.EpochSummaryCallback)
+    ]
+    self.assertLen(summaries, 1)
+    self.assertIsInstance(
+        summaries[0], batch_callbacks.EpochSummaryNoBatchHooks
+    )
+    self.assertEqual(
+        callbacks_in_fit.params, {"verbose": 0, "epochs": 3, "steps": 5}
+    )
+    self.assertIs(callbacks_in_fit._model, model)  # pylint: disable=protected-access
+    self.assertIsNotNone(callbacks_in_fit._history)  # pylint: disable=protected-access
+
+  def test_skip_batch_logs_with_prefetch(self):
+    trainer = _trainer(
+        self._tmpdir, device_prefetch_depth=2, skip_batch_logs=True
+    )
+    model = _DummyModel()
+
+    trainer.train(_task(model, []))
+
+    fn_in_fit, callbacks_in_fit = model.seen_in_fit[0]
+    self.assertIsInstance(fn_in_fit, device_prefetch.PrefetchingTrainFunction)
+    self.assertIsInstance(
+        callbacks_in_fit, batch_callbacks.ZeroSyncCallbackList
+    )
+    self.assertEqual(model.batches_in_fit, [0, 1, 2, 3, 4])
+
+  def test_skip_batch_logs_end_to_end_real_keras_model(self):
+    inputs = keras.Input(shape=(1,), dtype="float32")
+    outputs = keras.layers.Dense(
+        1, kernel_initializer=keras.initializers.constant(1.0)
+    )(inputs)
+    model = keras.Model(inputs=inputs, outputs=outputs)
+    model.compile(
+        optimizer=keras.optimizers.SGD(0.01),
+        loss=keras.losses.MeanSquaredError(),
+    )
+    x = np.ones((2, 1), dtype=np.float32)
+    y = np.ones((2, 1), dtype=np.float32)
+    batches = [(x, y)] * 25
+    exported = []
+    trainer = _trainer(
+        self._tmpdir,
+        train_steps=20,
+        steps_per_loop=10,
+        skip_batch_logs=True,
+        distribution=keras.distribution.DataParallel(),
+    )
+    task = types.SimpleNamespace(
+        create_dataset=lambda training: (b for b in batches),
+        create_model=lambda: model,
+        export_model=lambda m, model_dir: exported.append((m, model_dir)),
+    )
+
+    with mock.patch.object(
+        python_utils, "pythonify_logs", wraps=python_utils.pythonify_logs
+    ) as pythonify:
+      history = trainer.train(task)
+
+    # 2 epochs x 10 steps/epoch (20 batches): `pythonify_logs` runs only at
+    # train/epoch boundaries and does not scale with steps (< 20 calls vs 46
+    # when per-step log conversion is active).
+    self.assertLess(pythonify.call_count, 20)
+    self.assertEqual(history.history["num_params/trainable"], [2, 2])
+    self.assertLen(history.history["loss"], 2)
+    self.assertTrue(os.listdir(os.path.join(self._tmpdir, "logs", "train")))
+    self.assertEqual(exported, [(model, self._tmpdir)])
 
 
 if __name__ == "__main__":
