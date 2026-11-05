@@ -158,6 +158,13 @@ def _get_sharding(x: jt.ArrayLike) -> jax.sharding.Sharding | None:
   return None
 
 
+def _has_non_manual_axes(
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh,
+) -> bool:
+  """Returns whether `mesh` has at least one non-manual axis."""
+  return not mesh.empty and len(mesh.manual_axes) < len(mesh.axis_names)
+
+
 def _token_shard_count(
     x: jt.Float[jt.Array, "... D"],
     mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None,
@@ -171,6 +178,8 @@ def _token_shard_count(
     mesh, spec = sharding.mesh, sharding.spec
   if mesh.empty:
     return None
+  if not _has_non_manual_axes(mesh):
+    return 1
 
   # A PartitionSpec may be shorter than `x.ndim`; trailing axes are unsharded.
   factor = 1
@@ -207,7 +216,7 @@ def _replicate_hidden_dim(
   sharding = _get_sharding(x)
   if isinstance(sharding, jax.sharding.NamedSharding):
     mesh = sharding.mesh
-    if not mesh.empty:
+    if _has_non_manual_axes(mesh):
       spec = sharding.spec
       new_spec_list = list(spec) + [None] * (x.ndim - len(spec))
       if new_spec_list:
@@ -706,10 +715,9 @@ def cut_binary_cross_entropy(
   # Prevent collective communications inside the loop by forcing replication of
   # weights.
   sharding = _get_sharding(embeddings)
-  if (
-      isinstance(sharding, jax.sharding.NamedSharding)
-      and not sharding.mesh.empty
-  ):
+  if isinstance(
+      sharding, jax.sharding.NamedSharding
+  ) and _has_non_manual_axes(sharding.mesh):
     replicated_sharding = jax.sharding.NamedSharding(
         sharding.mesh, jax.sharding.PartitionSpec()
     )
@@ -1595,7 +1603,7 @@ def _bce_bwd_sharded(
     emb_sharding = _get_sharding(embeddings)
     is_sharded = (
         isinstance(act_sharding, jax.sharding.NamedSharding)
-        and not act_sharding.mesh.empty
+        and _has_non_manual_axes(act_sharding.mesh)
         and isinstance(emb_sharding, jax.sharding.NamedSharding)
     )
     if is_sharded:
