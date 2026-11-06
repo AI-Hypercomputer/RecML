@@ -304,7 +304,7 @@ class KerasUtilsTest(parameterized.TestCase):
 
     checkpoint_dir = self.create_tempdir().full_path
     checkpoint_manager = keras_utils.KerasOrbaxCheckpointManagerV3(
-        checkpoint_dir, max_to_keep=5
+        checkpoint_dir, max_to_keep=None
     )
     checkpoint_manager.save_model_variables(model, 0)
     checkpoint_manager.wait_until_finished()

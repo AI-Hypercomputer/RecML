@@ -362,7 +362,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
   def __init__(
       self,
       checkpoint_dir: str,
-      max_to_keep: int = 5,
+      max_to_keep: int | None = 5,
       save_interval_epochs: int = 1,
       choose_store_cell: bool = True,
   ):
@@ -370,7 +370,8 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
 
     Args:
       checkpoint_dir: The directory to save checkpoints to.
-      max_to_keep: The maximum number of checkpoints to keep.
+      max_to_keep: The maximum number of checkpoints to keep, or None to keep
+        every checkpoint.
       save_interval_epochs: The interval (in epochs) to save checkpoints.
       choose_store_cell: Whether to dynamically select the CNS2 store cell.
     """
@@ -413,7 +414,8 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
       model: keras.Model,
       epoch: int,
       logs: Mapping[str, Any] | None = None,
-  ):
+      force: bool = False,
+  ) -> bool:
     """Saves the model variables and optimizer variables to a checkpoint."""
     _assert_variables_built(model)
     _assert_all_layers_built(model)
@@ -455,7 +457,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
     logging.info("SAVED shared_variable_map: %s", shared_variable_map)
 
     logging.info("Saving checkpoint for epoch %s...", epoch)
-    self.save(
+    return self.save(
         step=epoch,
         args=ocp.args.Composite(**{
             STATE_CHECKPOINT_KEY: ocp.args.PyTreeSave(state),
@@ -467,6 +469,7 @@ class KerasOrbaxCheckpointManagerV3(ocp.CheckpointManager):
             **sparsecore_checkpoint_utils.sparsecore_topology_save_args(model),
         }),
         metrics=logs,
+        force=force,
     )
 
   def restore_model_variables(self, model: keras.Model, epoch: int):
@@ -635,7 +638,7 @@ def _is_v3_checkpoint_path(checkpoint_path: str) -> bool:
     version_checkpointer.close()
 
 
-def _detect_checkpoint_version(checkpoint_path: str) -> CheckpointVersion:
+def detect_checkpoint_version(checkpoint_path: str) -> CheckpointVersion:
   """Detects the version of the checkpoint at the given path.
 
   Detection order and discriminator criteria:
@@ -649,6 +652,9 @@ def _detect_checkpoint_version(checkpoint_path: str) -> CheckpointVersion:
 
   Returns:
     The detected CheckpointVersion enum value.
+
+  Raises:
+    ValueError: If the checkpoint format at `checkpoint_path` is unrecognized.
   """
   # V1 uses the legacy 'default' directory layout.
   if _is_v1_checkpoint_path(checkpoint_path):
@@ -666,7 +672,7 @@ def _detect_checkpoint_version(checkpoint_path: str) -> CheckpointVersion:
 def is_v3_checkpoint(checkpoint_dir: str, epoch: int | None = None) -> bool:
   """Checks if a checkpoint is in V3 format."""
   checkpoint_path, _ = resolve_orbax_checkpoint_path(checkpoint_dir, epoch)
-  return _detect_checkpoint_version(checkpoint_path) == CheckpointVersion.V3
+  return detect_checkpoint_version(checkpoint_path) == CheckpointVersion.V3
 
 
 def _validate_v3_checkpoint(
@@ -897,7 +903,8 @@ def _prepare_v3_restore(
     checkpointer.close()
 
   # Load index path metadata for non-trainable and optimizer variables if
-  # needed.
+  # present in `abstract_state` (partial restore omits these keys, whereas full
+  # restore includes them even when the dict is empty `{}`).
   non_trainable_paths = None
   if model is not None and NON_TRAINABLE_VARIABLES_KEY in abstract_state:
     nt_path = epath.Path(checkpoint_path) / NON_TRAINABLE_PATHS_KEY
@@ -932,6 +939,8 @@ def _prepare_v3_restore(
   state_transforms = {}
 
   for key in keys:
+    # Keep empty dicts (e.g. `{}` when a model has no non-trainable variables)
+    # in `filtered_abstract_state` so the restored PyTree structure matches.
     if key not in abstract_state:
       continue
 
@@ -1215,7 +1224,7 @@ def restore_keras_checkpoint(
 
   checkpoint_path, epoch = resolve_orbax_checkpoint_path(checkpoint_dir, epoch)
 
-  version = _detect_checkpoint_version(checkpoint_path)
+  version = detect_checkpoint_version(checkpoint_path)
   if version == CheckpointVersion.V1:
     raise ValueError(
         f"The checkpoint in {checkpoint_dir} is in V1 format (list-based)"
@@ -1407,7 +1416,7 @@ def restore_partial_checkpoint(
   """
   checkpoint_path, _ = resolve_orbax_checkpoint_path(checkpoint_dir, epoch)
 
-  version = _detect_checkpoint_version(checkpoint_path)
+  version = detect_checkpoint_version(checkpoint_path)
   if version != CheckpointVersion.V3:
     raise ValueError(
         "restore_partial_checkpoint only supports V3 (dictionary-based)"
