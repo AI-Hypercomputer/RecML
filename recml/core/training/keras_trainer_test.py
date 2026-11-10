@@ -14,6 +14,7 @@
 """Tests for Jax training library."""
 
 import os
+from typing import Any
 from unittest import mock
 
 from absl import flags
@@ -50,6 +51,14 @@ class _KerasTask(keras_trainer.KerasTask):
         loss=keras.losses.MeanSquaredError(),
     )
     return model
+
+
+class _EvalOverrideKerasTask(_KerasTask):
+  """Overrides `create_model_for_eval` over a `create_model` with no kwargs."""
+
+  def create_model_for_eval(self, **kwargs: Any) -> keras.Model:
+    self.eval_model_kwargs = kwargs
+    return self.create_model(**kwargs)
 
 
 class _MarkerCallback(keras_utils.MetricsCallback):
@@ -246,6 +255,22 @@ class KerasTrainerTest(parameterized.TestCase):
     expected_log_dir = os.path.join(model_dir, "logs", eval_name)
     self.assertTrue(os.path.exists(expected_log_dir))
     self.assertEqual(experiment.task.last_eval_name, eval_name)
+
+  def test_eval_with_create_model_for_eval_override(self) -> None:
+    if keras.backend.backend() == "jax":
+      distribution = keras.distribution.DataParallel()
+    else:
+      distribution = None
+    trainer = keras_trainer.KerasTrainer(
+        distribution=distribution,
+        steps_per_eval=1,
+        model_dir=self.create_tempdir().full_path,
+    )
+    experiment = core.Experiment(_EvalOverrideKerasTask(), trainer)
+
+    core.run_experiment(experiment, core.Trainer.Mode.EVAL)
+
+    self.assertEqual(experiment.task.eval_model_kwargs, {})
 
   def test_legacy_checkpoint_format_deprecated(self):
     model_dir = self.create_tempdir().full_path

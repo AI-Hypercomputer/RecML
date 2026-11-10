@@ -328,26 +328,13 @@ class KerasTrainer(core.Trainer[KerasTask]):
     return kws
 
   def _maybe_get_model_kws(
-      self, task: KerasTask, dataset: tf.data.Dataset, *, val: bool
+      self, task: KerasTask, dataset: tf.data.Dataset
   ) -> Mapping[str, Any]:
     kws = {}
     if py_utils.has_argument(task.create_model, "input_shapes"):
       batch_spec = dataset.element_spec
       x, *_ = keras.utils.unpack_x_y_sample_weight(batch_spec)
       kws["input_shapes"] = keras.tree.map_structure(core.get_shape, x)
-
-    if (
-        val
-        and py_utils.has_argument(task.create_model_for_eval, "eval_name")
-        and (
-            py_utils.has_argument(task.create_model, "eval_name")
-            or task.create_model_for_eval.__func__
-            is not KerasTask.create_model_for_eval
-        )
-    ):
-      kws["eval_name"] = (
-          self.job_info.name if self.job_info is not None else "validation"
-      )
 
     return kws
 
@@ -377,9 +364,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     dataset = task.create_dataset(
         training=True, **self._maybe_get_dataset_kws(task)
     )
-    model = task.create_model(
-        **self._maybe_get_model_kws(task, dataset, val=False)
-    )
+    model = task.create_model(**self._maybe_get_model_kws(task, dataset))
 
     epochs = self._train_epochs + 1
     callbacks = self.train_callbacks
@@ -415,7 +400,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         training=False, **self._maybe_get_dataset_kws(task)
     )
     model = task.create_model_for_eval(
-        **self._maybe_get_model_kws(task, dataset, val=True)
+        **self._maybe_get_model_kws(task, dataset)
     )
 
     if keras.backend.backend() == "jax":
@@ -461,9 +446,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     if self._steps_per_eval is not None:
       eval_dataset = eval_dataset.take(self._steps_per_eval)
 
-    model = task.create_model(
-        **self._maybe_get_model_kws(task, train_dataset, val=False)
-    )
+    model = task.create_model(**self._maybe_get_model_kws(task, train_dataset))
 
     history = model.fit(
         train_dataset,
@@ -495,7 +478,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         training=False, **self._maybe_get_dataset_kws(task)
     )
     model = task.create_model_for_eval(
-        **self._maybe_get_model_kws(task, eval_dataset, val=True),
+        **self._maybe_get_model_kws(task, eval_dataset),
     )
 
     def timeout_fn() -> bool:
