@@ -672,10 +672,103 @@ def detect_checkpoint_version(checkpoint_path: str) -> CheckpointVersion:
 def is_v3_checkpoint(checkpoint_dir: str, epoch: int | None = None) -> bool:
   """Checks if a checkpoint is in V3 format."""
   checkpoint_path, _ = resolve_orbax_checkpoint_path(checkpoint_dir, epoch)
-  return detect_checkpoint_version(checkpoint_path) == CheckpointVersion.V3
+  return _is_v3_checkpoint_path(checkpoint_path)
 
 
-def _validate_v3_checkpoint(
+def _join_and_normalize_path(base_dir: str, subdir: str) -> str:
+  """Joins `base_dir` and `subdir` while preserving any URI scheme (`gs://`)."""
+  if not subdir:
+    return base_dir
+  if "://" in base_dir:
+    scheme, rest = base_dir.split("://", 1)
+    return f"{scheme}://{os.path.normpath(os.path.join(rest, subdir))}"
+  return os.path.normpath(os.path.join(base_dir, subdir))
+
+
+def resolve_checkpoint_in_subdirs(
+    checkpoint_dir: str,
+    epoch: int | None = None,
+    subdirs: Sequence[str] | None = None,
+    *,
+    require_v3: bool = False,
+) -> tuple[str, int | None] | None:
+  """Resolves an Orbax checkpoint step path across candidate subdirectories.
+
+  Searches `subdirs` relative to `checkpoint_dir` in order and returns the
+  first valid Orbax checkpoint step path and resolved epoch, or None if no
+  matching checkpoint is found. When `subdirs` is None, checks:
+    1. `checkpoints/v3` (migrated V3 checkpoint directory)
+    2. `v3` (base model directory containing `v3/<version>`)
+    3. `checkpoints` (training checkpoint directory, containing V3 or legacy V2
+       steps)
+    4. Sibling `../v3/<step>` when `checkpoint_dir` is `<parent>/<step>`
+    5. `""` (`checkpoint_dir` itself as a flat checkpoint or step container)
+
+  When `require_v3=True`, only Orbax V3 checkpoints match.
+
+  Args:
+    checkpoint_dir: Root model or checkpoint directory to search.
+    epoch: Optional epoch/step number to resolve. Defaults to the latest step.
+    subdirs: Candidate relative subdirectory paths to inspect in order. An empty
+      string `""` checks `checkpoint_dir` itself. Defaults to None, which uses
+      the standard V3-preferring candidate order above.
+    require_v3: If True, skips candidate checkpoints that are not in V3 format.
+
+  Returns:
+    A tuple of `(resolved_checkpoint_path, resolved_epoch)` for the first
+    matching candidate, or None if no matching checkpoint is found.
+  """
+  if subdirs is None:
+    normalized = checkpoint_dir.rstrip("/")
+    step = os.path.basename(normalized)
+    parent_name = os.path.basename(os.path.dirname(normalized))
+    candidate_subdirs = [
+        os.path.join("checkpoints", CheckpointVersion.V3),
+        CheckpointVersion.V3,
+        "checkpoints",
+    ]
+    # When a caller passes a versioned model path (e.g. `.../model/1`) or a
+    # specific V2 step directory (`.../checkpoints/1`), non-destructive V3
+    # migration writes to the sibling `<parent>/v3/<step>` directory rather than
+    # inside `<step>/`. Check `<checkpoint_dir>/checkpoints` before probing
+    # `../v3/<step>` so run directories ending in a numeric ID do not probe
+    # outside `checkpoint_dir`.
+    if step.isdigit() and parent_name != CheckpointVersion.V3:
+      target_step = str(epoch if epoch is not None else step)
+      candidate_subdirs.append(
+          os.path.join("..", CheckpointVersion.V3, target_step)
+      )
+    candidate_subdirs.append("")
+  else:
+    candidate_subdirs = list(subdirs)
+
+  for subdir in candidate_subdirs:
+    candidate = _join_and_normalize_path(checkpoint_dir, subdir)
+    if not epath.Path(candidate).exists():
+      continue
+    try:
+      checkpoint_path, resolved_epoch = resolve_orbax_checkpoint_path(
+          candidate, epoch
+      )
+      if require_v3 and not _is_v3_checkpoint_path(checkpoint_path):
+        logging.info(
+            "Skipping non-V3 checkpoint path %s while require_v3=True.",
+            checkpoint_path,
+        )
+        continue
+      resolved_path = os.fspath(epath.Path(checkpoint_path).absolute())
+      logging.info(
+          "Resolved Orbax checkpoint path %s from %s.",
+          resolved_path,
+          checkpoint_dir,
+      )
+      return resolved_path, resolved_epoch
+    except (ValueError, FileNotFoundError):
+      continue
+  return None
+
+
+def validate_v3_checkpoint(
     checkpoint_path: str,
     saved_state_metadata: Any | None = None,
 ) -> Any:
@@ -738,7 +831,33 @@ def _validate_v3_checkpoint(
   return saved_state_metadata
 
 
-def _find_stored_path(
+def load_v3_shared_variable_map(checkpoint_path: str) -> dict[str, str]:
+  """Loads the shared variable alias map from a resolved V3 checkpoint path.
+
+  Args:
+    checkpoint_path: Path to the resolved V3 checkpoint directory.
+
+  Returns:
+    Dictionary mapping alias variable paths to their canonical stored paths.
+
+  Raises:
+    FileNotFoundError: If the `shared_variable_map` checkpoint item does not
+      exist under `checkpoint_path`.
+    KeyError: If the restored JSON payload is missing `SHARED_VARIABLE_MAP_KEY`.
+  """
+  map_path = epath.Path(checkpoint_path) / SHARED_VARIABLE_MAP_KEY
+  checkpointer = ocp.Checkpointer(ocp.handlers.JsonCheckpointHandler())
+  try:
+    return dict(
+        checkpointer.restore(os.fspath(map_path), args=ocp.args.JsonRestore())[
+            SHARED_VARIABLE_MAP_KEY
+        ]
+    )
+  finally:
+    checkpointer.close()
+
+
+def find_stored_path(
     path: str,
     stored_paths: Container[str],
     shared_var_map: Mapping[str, str],
@@ -816,7 +935,7 @@ def _resolve_transform_source(
   prefix = f"{key}/"
   has_prefix = transform.original_key.startswith(prefix)
   source = transform.original_key.removeprefix(prefix)
-  stored = _find_stored_path(source, stored_paths, shared_var_map)
+  stored = find_stored_path(source, stored_paths, shared_var_map)
   if stored is None or stored == source:
     # Not an alias. Leave it for Orbax to resolve, or to reject if missing.
     return transform
@@ -890,17 +1009,10 @@ def _prepare_v3_restore(
     the Orbax restore call.
   """
   # Validate that underlying checkpoint is healthy and retrieve state metadata.
-  saved_state_metadata = _validate_v3_checkpoint(checkpoint_path)
+  saved_state_metadata = validate_v3_checkpoint(checkpoint_path)
 
   # The shared variable map is a required V3 item, checked above.
-  map_path = epath.Path(checkpoint_path) / SHARED_VARIABLE_MAP_KEY
-  checkpointer = ocp.Checkpointer(ocp.handlers.JsonCheckpointHandler())
-  try:
-    shared_var_map = checkpointer.restore(
-        os.fspath(map_path), args=ocp.args.JsonRestore()
-    )[SHARED_VARIABLE_MAP_KEY]
-  finally:
-    checkpointer.close()
+  shared_var_map = load_v3_shared_variable_map(checkpoint_path)
 
   # Load index path metadata for non-trainable and optimizer variables if
   # present in `abstract_state` (partial restore omits these keys, whereas full
@@ -993,7 +1105,7 @@ def _prepare_v3_restore(
       # Trainable variables are matched by path. Each target is restored from
       # the source a user transform names, else from its prefix-mapped path,
       # else from its own path; any of these may be an alias of a shared
-      # variable, resolved by _find_stored_path.
+      # variable, resolved by find_stored_path.
       missing_paths = []
       key_transforms = {}
       if transforms:
@@ -1027,9 +1139,7 @@ def _prepare_v3_restore(
         # obtained by swapping its longest matching prefix; the source may be
         # an alias of a shared variable.
         elif mapped_source is not None:
-          stored = _find_stored_path(
-              mapped_source, stored_paths, shared_var_map
-          )
+          stored = find_stored_path(mapped_source, stored_paths, shared_var_map)
           if stored is None:
             missing_paths.append(f"{target_path} (from {mapped_source})")
             continue
@@ -1042,7 +1152,7 @@ def _prepare_v3_restore(
         # Resolves target_path if it is an alias, synthesizing a Transform to
         # its canonical storage path.
         else:
-          stored = _find_stored_path(target_path, stored_paths, shared_var_map)
+          stored = find_stored_path(target_path, stored_paths, shared_var_map)
           if stored is None:
             missing_paths.append(target_path)
             continue

@@ -1544,7 +1544,7 @@ class KerasOrbaxCheckpointUtilsTest(absltest.TestCase):
         ValueError,
         "missing required state keys in checkpoint metadata",
     ):
-      keras_utils._validate_v3_checkpoint(step_dir, incomplete_metadata)
+      keras_utils.validate_v3_checkpoint(step_dir, incomplete_metadata)
 
   def test_extract_shared_variable_map(self):
     shared_dense = keras.layers.Dense(2, name="shared_dense")
@@ -2103,15 +2103,15 @@ class KerasOrbaxCheckpointUtilsTest(absltest.TestCase):
     stored = {"model/a/dense/kernel"}
     shared = {"model/b/dense/kernel": "model/a/dense/kernel"}
     self.assertEqual(
-        keras_utils._find_stored_path("model/b/dense/kernel", stored, shared),
+        keras_utils.find_stored_path("model/b/dense/kernel", stored, shared),
         "model/a/dense/kernel",
     )
     self.assertEqual(
-        keras_utils._find_stored_path("model/a/dense/kernel", stored, shared),
+        keras_utils.find_stored_path("model/a/dense/kernel", stored, shared),
         "model/a/dense/kernel",
     )
     self.assertIsNone(
-        keras_utils._find_stored_path("model/c/dense/kernel", stored, shared)
+        keras_utils.find_stored_path("model/c/dense/kernel", stored, shared)
     )
 
   def test_find_stored_path_prefers_direct_match_over_alias(self):
@@ -2120,8 +2120,131 @@ class KerasOrbaxCheckpointUtilsTest(absltest.TestCase):
     stored = {"model/a/kernel", "model/b/kernel"}
     shared = {"model/b/kernel": "model/a/kernel"}
     self.assertEqual(
-        keras_utils._find_stored_path("model/b/kernel", stored, shared),
+        keras_utils.find_stored_path("model/b/kernel", stored, shared),
         "model/b/kernel",
+    )
+
+  def test_public_v3_checkpoint_helpers(self):
+    model = self._save_multi_surface_dense_model()
+    resolved = keras_utils.resolve_checkpoint_in_subdirs(
+        self.checkpoint_dir,
+        subdirs=("checkpoints/v3", "checkpoints", "v3", ""),
+        require_v3=True,
+    )
+    self.assertIsNotNone(resolved)
+    resolved_path, resolved_epoch = resolved
+    self.assertEqual(resolved_epoch, 1)
+    self.assertEqual(
+        keras_utils.detect_checkpoint_version(resolved_path),
+        keras_utils.CheckpointVersion.V3,
+    )
+    metadata = keras_utils.validate_v3_checkpoint(resolved_path)
+    self.assertIn(keras_utils.TRAINABLE_VARIABLES_KEY, metadata)
+    shared_map = keras_utils.load_v3_shared_variable_map(resolved_path)
+    self.assertEqual(shared_map, keras_utils.extract_shared_variable_map(model))
+
+  def test_detect_checkpoint_version_all_formats(self):
+    v1_dir = self.create_tempdir().full_path
+    os.makedirs(os.path.join(v1_dir, keras_utils.ORBAX_CHECKPOINT_DEFAULT_KEY))
+    self.assertEqual(
+        keras_utils.detect_checkpoint_version(v1_dir),
+        keras_utils.CheckpointVersion.V1,
+    )
+    v2_dir = self.create_tempdir().full_path
+    os.makedirs(os.path.join(v2_dir, keras_utils.STATE_CHECKPOINT_KEY))
+    self.assertEqual(
+        keras_utils.detect_checkpoint_version(v2_dir),
+        keras_utils.CheckpointVersion.V2,
+    )
+    empty_dir = self.create_tempdir().full_path
+    with self.assertRaisesRegex(ValueError, "Unknown checkpoint format"):
+      keras_utils.detect_checkpoint_version(empty_dir)
+
+  def test_resolve_checkpoint_in_subdirs_default_candidates_and_uri(self):
+    root_dir = self.create_tempdir().full_path
+    xid_dir = os.path.join(root_dir, "297942442")
+    xid_ckpt_step = os.path.join(xid_dir, "checkpoints", "10")
+    os.makedirs(os.path.join(xid_ckpt_step, keras_utils.STATE_CHECKPOINT_KEY))
+
+    model = keras.Sequential(
+        [keras.layers.Dense(1, name="dense")], name="model"
+    )
+    model.compile(optimizer="sgd")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+    sibling_v3_mgr = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=os.path.join(root_dir, "v3"),
+        max_to_keep=1,
+        save_interval_epochs=1,
+    )
+    sibling_v3_mgr.save_model_variables(model, epoch=297942442)
+    sibling_v3_mgr.wait_until_finished()
+    sibling_v3_mgr.close()
+
+    # Numeric run dir `<id>` resolves `<id>/checkpoints` before a valid
+    # sibling `../v3/<id>` Orbax checkpoint.
+    self.assertEqual(
+        keras_utils.resolve_checkpoint_in_subdirs(xid_dir),
+        (xid_ckpt_step, 10),
+    )
+    self.assertEqual(
+        keras_utils._join_and_normalize_path(  # pylint: disable=protected-access
+            "gs://my-bucket/model/1", "../v3/1"
+        ),
+        "gs://my-bucket/model/v3/1",
+    )
+
+  def test_resolve_checkpoint_in_subdirs_skips_v2_when_require_v3(self):
+    root_dir = self.create_tempdir().full_path
+    v2_dir = os.path.join(root_dir, "checkpoints")
+    v3_dir = os.path.join(root_dir, "checkpoints", "v3")
+    model = keras.Sequential(
+        [keras.layers.Dense(1, name="dense")], name="model"
+    )
+    model.compile(optimizer="sgd")
+    model.build((1, 1))
+    model.optimizer.build(model.trainable_variables)
+
+    v2_mgr = keras_utils.KerasOrbaxCheckpointManagerV2(
+        checkpoint_dir=v2_dir, max_to_keep=1, save_interval_epochs=1
+    )
+    v2_mgr.save_model_variables(model, epoch=2)
+    v2_mgr.wait_until_finished()
+    v2_mgr.close()
+
+    self.assertIsNone(
+        keras_utils.resolve_checkpoint_in_subdirs(
+            root_dir,
+            subdirs=("checkpoints",),
+            require_v3=True,
+        )
+    )
+
+    v3_mgr = keras_utils.KerasOrbaxCheckpointManagerV3(
+        checkpoint_dir=v3_dir, max_to_keep=2, save_interval_epochs=1
+    )
+    v3_mgr.save_model_variables(model, epoch=2)
+    v3_mgr.save_model_variables(model, epoch=3)
+    v3_mgr.wait_until_finished()
+    v3_mgr.close()
+
+    # Default `subdirs=None` on a V2 step dir `checkpoints/2` resolves sibling
+    # `../v3/2` (`checkpoints/v3/2`).
+    self.assertEqual(
+        keras_utils.resolve_checkpoint_in_subdirs(os.path.join(v2_dir, "2")),
+        (os.path.join(v3_dir, "2"), None),
+    )
+
+    resolved = keras_utils.resolve_checkpoint_in_subdirs(
+        root_dir,
+        subdirs=("checkpoints", "checkpoints/v3"),
+        require_v3=True,
+    )
+    self.assertIsNotNone(resolved)
+    resolved_path, resolved_epoch = resolved
+    self.assertEqual(resolved_epoch, 3)
+    self.assertTrue(
+        resolved_path.endswith(os.path.join("checkpoints", "v3", "3"))
     )
 
   def test_restore_v3_checkpoint_missing_shared_variable_map_fails(self):
