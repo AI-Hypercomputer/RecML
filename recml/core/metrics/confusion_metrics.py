@@ -14,6 +14,7 @@
 """Confusion metrics."""
 
 from collections.abc import Sequence
+import math
 from typing import Any, Self
 
 import jax
@@ -509,6 +510,150 @@ def precision_at_recall(
   )
 
 
+def estimate_confusion_matrix_batched(
+    predictions: jax.Array,
+    labels: jax.Array,
+    weights_batch: jax.Array,
+    thresholds: Sequence[float] = (0.0,),
+    *,
+    sparse_positive_indices: jax.Array | None = None,
+    threshold_batch_size: int | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Estimates the confusion matrix of binary predictions across weight batches.
+
+  Args:
+    predictions: The predictions of shape [*sample_dims, *class_dims].
+    labels: The labels of shape [*sample_dims, *class_dims]. Ignored for
+      positive detection when sparse_positive_indices is provided (only shape
+      equality with predictions is checked).
+    weights_batch: A batch of sample weights of shape [K, *sample_dims].
+    thresholds: A 1D sequence of float threshold values.
+    sparse_positive_indices: Optional integer indices of positive classes of
+      shape [*sample_dims, L]. Negative or out-of-range padding IDs (< 0 or >=
+      num_classes) and duplicate IDs along axis=-1 are ignored.
+    threshold_batch_size: Optional batch size for threshold mapping. When None,
+      thresholds are chunked in batches of 25 automatically once
+      predictions.size * len(thresholds) >= 16_000_000, and evaluated in a
+      single jax.vmap on smaller tensors.
+
+  Returns:
+    A tuple of (tp, tn, fp, fn) arrays each of shape [K, len(thresholds)] in
+    float32.
+
+  Raises:
+    ValueError: If shapes of predictions, labels, weights_batch, or
+    sparse_positive_indices are incompatible.
+  """
+  if predictions.shape != labels.shape:
+    raise ValueError(
+        "Predictions and labels must have the same shape. Got"
+        f" {predictions.shape} and {labels.shape} respectively."
+    )
+  if weights_batch.ndim < 1:
+    raise ValueError(
+        "weights_batch must have at least 1 dimension. Got"
+        f" {weights_batch.ndim}."
+    )
+  sample_ndims = weights_batch.ndim - 1
+  if (
+      sample_ndims >= predictions.ndim
+      or weights_batch.shape[1:] != predictions.shape[:sample_ndims]
+  ):
+    raise ValueError(
+        "weights_batch spatial dimensions do not match predictions. Got "
+        f"{weights_batch.shape} and {predictions.shape}."
+    )
+
+  reduce_axes = tuple(range(sample_ndims, predictions.ndim))
+  num_classes_per_sample = math.prod(predictions.shape[sample_ndims:])
+  count_dtype = (
+      jnp.int32 if num_classes_per_sample < 2_000_000_000 else jnp.float32
+  )
+
+  if sparse_positive_indices is not None:
+    if (
+        sample_ndims != predictions.ndim - 1
+        or sparse_positive_indices.shape[:-1] != predictions.shape[:-1]
+    ):
+      raise ValueError(
+          "sparse_positive_indices shape mismatch. Got "
+          f"{sparse_positive_indices.shape} and {predictions.shape}."
+      )
+    num_classes = predictions.shape[-1]
+    idx_int = jnp.asarray(sparse_positive_indices, dtype=jnp.int32)
+    sorted_idx = jnp.sort(idx_int, axis=-1)
+    is_new = jnp.concatenate(
+        [
+            jnp.ones_like(sorted_idx[..., :1], dtype=jnp.bool_),
+            sorted_idx[..., 1:] != sorted_idx[..., :-1],
+        ],
+        axis=-1,
+    )
+    valid_unique = (sorted_idx >= 0) & (sorted_idx < num_classes) & is_new
+    safe_idx = jnp.where(valid_unique, sorted_idx, 0)
+    pos_preds = jnp.take_along_axis(predictions, safe_idx, axis=-1)
+    pos_counts = jnp.sum(valid_unique, axis=-1, dtype=count_dtype)
+
+    def _count_for_threshold(t):
+      pred_pos = jnp.sum(predictions > t, axis=-1, dtype=count_dtype)
+      tp_sample = jnp.sum(
+          (pos_preds > t) & valid_unique, axis=-1, dtype=count_dtype
+      )
+      return tp_sample, pred_pos
+
+  else:
+    y_true_pos = jnp.asarray(labels, dtype=jnp.bool_)
+    pos_counts = jnp.sum(y_true_pos, axis=reduce_axes, dtype=count_dtype)
+
+    def _count_for_threshold(t):
+      y_pred_pos = predictions > t
+      pred_pos = jnp.sum(y_pred_pos, axis=reduce_axes, dtype=count_dtype)
+      tp_sample = jnp.sum(
+          y_pred_pos & y_true_pos, axis=reduce_axes, dtype=count_dtype
+      )
+      return tp_sample, pred_pos
+
+  thresholds_arr = jnp.asarray(thresholds, dtype=jnp.float32)
+  if threshold_batch_size is not None:
+    effective_batch_size = threshold_batch_size
+  elif predictions.size * thresholds_arr.shape[0] >= 16_000_000:
+    effective_batch_size = 25
+  else:
+    effective_batch_size = None
+  if (
+      effective_batch_size is not None
+      and thresholds_arr.shape[0] > effective_batch_size
+  ):
+    tp_t, pred_pos_t = jax.lax.map(
+        _count_for_threshold, thresholds_arr, batch_size=effective_batch_size
+    )
+  else:
+    tp_t, pred_pos_t = jax.vmap(_count_for_threshold)(thresholds_arr)
+
+  fp_t = pred_pos_t - tp_t
+  fn_t = pos_counts[None, ...] - tp_t
+  tn_t = (num_classes_per_sample - pos_counts)[None, ...] - fp_t
+
+  k_slices = weights_batch.shape[0]
+  w_flat = jnp.asarray(weights_batch, dtype=jnp.float32).reshape(k_slices, -1)
+  t_len = thresholds_arr.shape[0]
+
+  all_counts = (
+      jnp.stack([tp_t, tn_t, fp_t, fn_t], axis=0)
+      .astype(jnp.float32)
+      .reshape(4 * t_len, -1)
+  )
+  contracted = jnp.matmul(
+      w_flat, all_counts.T, precision=jax.lax.Precision.HIGHEST
+  ).reshape(k_slices, 4, t_len)
+  return (
+      contracted[:, 0, :],
+      contracted[:, 1, :],
+      contracted[:, 2, :],
+      contracted[:, 3, :],
+  )
+
+
 def estimate_confusion_matrix(
     predictions: jt.Float[jt.Array, "* C"],
     labels: jt.Float[jt.Array, "* C"],
@@ -553,18 +698,24 @@ def estimate_confusion_matrix(
           f" following shapes for predictions: {predictions.shape} and weights:"
           f" {weights.shape}."
       )
-    # Broadcast weights to predictions shape and add an extra dimension for the
-    # thresholds.
-    weights = jax.lax.expand_dims(
-        weights, range(weights.ndim, predictions.ndim)
-    )
   elif weights is not None and predictions.shape != weights.shape:
     raise ValueError(
         "Predictions and weights must have the same shape. Got"
         f" {predictions.shape} and {weights.shape} respectively."
     )
 
-  y_true_pos = jnp.asarray(labels, dtype=jnp.bool)
+  if weights is None:
+    tp, tn, fp, fn = estimate_confusion_matrix_batched(
+        predictions, labels, jnp.ones((1,), dtype=jnp.float32), thresholds
+    )
+    return tp[0], tn[0], fp[0], fn[0]
+  if weights.ndim < predictions.ndim:
+    tp, tn, fp, fn = estimate_confusion_matrix_batched(
+        predictions, labels, jnp.expand_dims(weights, axis=0), thresholds
+    )
+    return tp[0], tn[0], fp[0], fn[0]
+
+  y_true_pos = jnp.asarray(labels, dtype=jnp.bool_)
   y_true_neg = jnp.logical_not(y_true_pos)
 
   def _estimate_confusion_matrix(thresholds: jt.Scalar) -> tuple[
@@ -573,11 +724,7 @@ def estimate_confusion_matrix(
       jt.Float[jt.Array, "* C"],
       jt.Float[jt.Array, "* C"],
   ]:
-    y_pred_pos = jnp.where(
-        predictions > thresholds,
-        jnp.ones_like(predictions),
-        jnp.zeros_like(predictions),
-    )
+    y_pred_pos = predictions > thresholds
     y_pred_neg = jnp.logical_not(y_pred_pos)
 
     tp = jnp.logical_and(y_pred_pos, y_true_pos)
@@ -585,11 +732,10 @@ def estimate_confusion_matrix(
     fp = jnp.logical_and(y_pred_pos, y_true_neg)
     fn = jnp.logical_and(y_pred_neg, y_true_pos)
 
-    if weights is not None:
-      tp = tp * weights
-      tn = tn * weights
-      fp = fp * weights
-      fn = fn * weights
+    tp = tp * weights
+    tn = tn * weights
+    fp = fp * weights
+    fn = fn * weights
 
     return jnp.sum(tp), jnp.sum(tn), jnp.sum(fp), jnp.sum(fn)
 
