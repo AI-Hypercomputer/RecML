@@ -26,6 +26,7 @@ from recml.core.training import batch_callbacks
 from recml.core.training import device_prefetch
 from recml.core.training import keras_trainer
 from recml.core.utils import keras_utils
+import tensorflow as tf
 
 
 def _trainer(tmpdir, **overrides):
@@ -66,6 +67,32 @@ class _DummyModel:
 
   def summary(self, print_fn=None):
     del print_fn
+
+
+class _StepModel(_DummyModel):
+  """A `_DummyModel` whose train function runs `train_step`, like Keras."""
+
+  built = True
+
+  def __init__(self):
+    super().__init__()
+    self.datasets_in_fit = []
+
+  def train_step(self, state, data):
+    return data, state
+
+  def _symbolic_build(self, iterator=None, data_batch=None):
+    del iterator, data_batch
+
+  def make_train_function(self, force=False):
+    if self.train_function is not None and not force:
+      return
+    train_step = self.train_step
+    self.train_function = lambda state, it: train_step(state, next(it))
+
+  def fit(self, dataset, **kwargs):
+    self.datasets_in_fit.append(dataset)
+    return super().fit(dataset, **kwargs)
 
 
 def _task(model, exported):
@@ -146,6 +173,97 @@ class KerasTrainerOptionsTest(absltest.TestCase):
       with self.assertRaisesRegex(RuntimeError, "stop"):
         trainer.train_and_evaluate(task)
     self.assertIn("device_prefetch_depth", logs.output[0])
+
+  def test_fold_batch_leaves_folds_the_dataset_and_unfolds_in_the_step(self):
+    features = {
+        "a": np.arange(40, dtype=np.float32).reshape([20, 2]),
+        "b": -np.arange(60, dtype=np.float32).reshape([20, 3]),
+    }
+    dataset = tf.data.Dataset.from_tensor_slices(features).batch(
+        2, drop_remainder=True
+    )
+    model = _StepModel()
+    task = types.SimpleNamespace(
+        create_dataset=lambda training: dataset,
+        create_model=lambda: model,
+        export_model=lambda m, model_dir: None,
+    )
+
+    _trainer(self._tmpdir, fold_batch_leaves=True).train(task)
+
+    # `fit` got 1 folded array per batch instead of the 2 leaves.
+    self.assertLen(model.datasets_in_fit, 1)
+    dataset_in_fit = model.datasets_in_fit[0]
+    folded_specs, other_specs = dataset_in_fit.element_spec
+    self.assertLen(folded_specs, 1)
+    self.assertEmpty(other_specs)
+    # The train step got the original batches.
+    self.assertLen(model.batches_in_fit, 5)
+    for step, batch in enumerate(model.batches_in_fit):
+      self.assertCountEqual(batch, ["a", "b"])
+      for key, value in batch.items():
+        np.testing.assert_array_equal(
+            value, features[key][2 * step : 2 * step + 2]
+        )
+    self.assertNotIn("train_step", vars(model))
+
+  def test_rejects_fold_batch_leaves_on_other_backends(self):
+    with mock.patch.object(keras.backend, "backend", return_value="tensorflow"):
+      with self.assertRaisesRegex(ValueError, "needs the JAX backend"):
+        _trainer(self._tmpdir, fold_batch_leaves=True)
+
+  def test_fold_batch_leaves_with_compiled_loss_and_metrics(self):
+    rng = np.random.default_rng(0)
+    x = rng.random((20, 4)).astype(np.float32)
+    y = rng.random((20, 1)).astype(np.float32)
+
+    def build_model():
+      keras.utils.set_random_seed(0)
+      inputs = keras.Input(shape=(4,), dtype="float32")
+      model = keras.Model(inputs=inputs, outputs=keras.layers.Dense(1)(inputs))
+      # The compiled loss and metrics stay unbuilt until the first batch.
+      model.compile(optimizer="sgd", loss="mse", metrics=["mae"])
+      return model
+
+    def train(model_dir, **options):
+      model = build_model()
+      os.makedirs(model_dir)
+      history = _trainer(
+          model_dir, train_steps=10, steps_per_loop=5, **options
+      ).train(
+          types.SimpleNamespace(
+              create_dataset=lambda training: tf.data.Dataset.from_tensor_slices(
+                  (x, y)
+              )
+              .batch(2, drop_remainder=True)
+              .repeat(),
+              create_model=lambda: model,
+              export_model=lambda m, model_dir: None,
+          )
+      )
+      return model, history.history
+
+    want_model, want_history = train(os.path.join(self._tmpdir, "plain"))
+    model, history = train(
+        os.path.join(self._tmpdir, "folded"), fold_batch_leaves=True
+    )
+
+    for actual, want in zip(
+        model.get_weights(), want_model.get_weights(), strict=True
+    ):
+      np.testing.assert_allclose(actual, want, rtol=1e-6)
+    self.assertCountEqual(history, want_history)
+    for key, values in want_history.items():
+      np.testing.assert_allclose(history[key], values, rtol=1e-6, err_msg=key)
+
+  def test_train_and_evaluate_warns_that_folding_is_not_applied(self):
+    trainer = _trainer(self._tmpdir, fold_batch_leaves=True)
+    task = mock.Mock()
+    task.create_dataset.side_effect = RuntimeError("stop")
+    with self.assertLogs(level="WARNING") as logs:
+      with self.assertRaisesRegex(RuntimeError, "stop"):
+        trainer.train_and_evaluate(task)
+    self.assertIn("fold_batch_leaves", logs.output[0])
 
   def test_train_and_evaluate_warns_that_skip_batch_logs_is_not_applied(self):
     trainer = _trainer(self._tmpdir, skip_batch_logs=True)
