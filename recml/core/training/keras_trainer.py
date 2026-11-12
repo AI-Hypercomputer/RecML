@@ -31,8 +31,10 @@ import jax
 import keras
 import orbax.checkpoint as ocp
 import psutil
+from recml.core.training import batch_folding
 from recml.core.training import core
 from recml.core.training import device_prefetch
+from recml.core.training import state_folding
 from recml.core.utils import py_utils
 import tensorflow as tf
 
@@ -130,6 +132,9 @@ class KerasTrainer(core.Trainer[KerasTask]):
       eval_callbacks: Sequence[keras.callbacks.Callback] = (),
       device_prefetch_depth: int = 0,
       skip_batch_logs: bool = False,
+      fold_batch_leaves: bool = False,
+      zero_copy_batches: bool = False,
+      fold_state_max_leaf_size: int = 0,
   ):
     """Initializes the instance.
 
@@ -165,13 +170,33 @@ class KerasTrainer(core.Trainer[KerasTask]):
         `train_and_evaluate`.
       skip_batch_logs: During `train`, always drop `ProgbarLogger` (`verbose=0`,
         which suppresses `Epoch N/M` and epoch-end stdout progress lines while
-        keeping TensorBoard summaries and checkpoint logs) and disable
-        the per-step hooks of exact `keras_utils.EpochSummaryCallback`
-        instances (custom subclasses are kept as-is), and also skip the
-        per-step conversion of `logs` to Python when no callback needs per-step
-        logs (see `batch_callbacks.ZeroSyncCallbackList`). Epoch-end summaries
-        and checkpoints are unchanged. Not applied in `train_and_evaluate`.
-        Defaults to False.
+        keeping TensorBoard summaries and checkpoint logs) and disable the
+        per-step hooks of exact `keras_utils.EpochSummaryCallback` instances
+        (custom subclasses are kept as-is), and also skip the per-step
+        conversion of `logs` to Python when no callback needs per-step logs (see
+        `batch_callbacks.ZeroSyncCallbackList`). Epoch-end summaries and
+        checkpoints are unchanged. Not applied in `train_and_evaluate`. Defaults
+        to False.
+      fold_batch_leaves: During `train`, concatenate the dense leaves of each
+        batch into one array per dtype and leading dimension in `tf.data`, and
+        split them back inside the jitted train step (see `batch_folding`).
+        Fewer arrays then cross to the device on each step, which reduces the
+        host time per step for batches with many leaves. The model sees the same
+        batches. Requires the JAX backend and a `tf.data.Dataset`. Not applied
+        in `train_and_evaluate`. Defaults to False.
+      zero_copy_batches: During `train` on the JAX backend, pass read-only
+        zero-copy NumPy views of dense integer, floating-point and boolean
+        `tf.Tensor` batch leaves to `model.fit` instead of copying every leaf
+        with `np.array` (see `zero_copy_batches`). Other leaves, including
+        bfloat16 and complex tensors, are still converted (and copied) as Keras
+        converts them. Requires a `tf.data.Dataset`. Not applied in
+        `train_and_evaluate`. Defaults to False.
+      fold_state_max_leaf_size: During `train` on the JAX backend, fold fully
+        replicated leaves of each of the 4 training state lists whose element
+        count is at most `fold_state_max_leaf_size` into one 1-D vector per
+        dtype across the `train_step` boundary (see `state_folding`). `0`
+        disables state folding. Not applied in `train_and_evaluate`. Defaults to
+        0.
       resume_training_launcher: Launcher to resume training.
       enable_xmanager_measurements: Whether to enable XManager measurements.
       enable_autoxprof: Whether to enable AutoXprof.
@@ -179,11 +204,22 @@ class KerasTrainer(core.Trainer[KerasTask]):
       s2_logging_settings: Settings for S2 logging.
 
     Raises:
-      ValueError: If `device_prefetch_depth` is negative.
+      ValueError: If `device_prefetch_depth` or `fold_state_max_leaf_size` is
+        negative, or if `fold_batch_leaves` is set on a backend other than JAX.
     """
     if device_prefetch_depth < 0:
       raise ValueError(
           f"device_prefetch_depth must be >= 0, got {device_prefetch_depth}."
+      )
+    if fold_batch_leaves and keras.backend.backend() != "jax":
+      raise ValueError(
+          "fold_batch_leaves needs the JAX backend, got"
+          f" {keras.backend.backend()!r}."
+      )
+    if fold_state_max_leaf_size < 0:
+      raise ValueError(
+          "fold_state_max_leaf_size must be >= 0, got"
+          f" {fold_state_max_leaf_size}."
       )
 
     keras.utils.set_random_seed(rng_seed)
@@ -209,6 +245,9 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._steps_per_loop = steps_per_loop
     self._device_prefetch_depth = device_prefetch_depth
     self._skip_batch_logs = skip_batch_logs
+    self._fold_batch_leaves = fold_batch_leaves
+    self._zero_copy_batches = zero_copy_batches
+    self._fold_state_max_leaf_size = fold_state_max_leaf_size
     self._marker_path = os.path.join(
         model_dir, core.TRAINING_COMPLETE_MARKER_FILE
     )
@@ -377,11 +416,35 @@ class KerasTrainer(core.Trainer[KerasTask]):
           steps=self._steps_per_loop,
           model=model,
       )
-    with device_prefetch.model_prefetch_scope(
-        model, depth=self._device_prefetch_depth
+    unfold = None
+    if self._fold_batch_leaves:
+      # `fit` builds the model, the compiled loss and metrics, and the
+      # optimizer from its first batch, which would be folded.
+      model._symbolic_build(data_batch=dataset.element_spec)  # pylint: disable=protected-access
+      dataset, unfold = batch_folding.fold_dataset(dataset)
+    fit_data: Any = dataset
+    if self._zero_copy_batches and keras.backend.backend() == "jax":
+      # Imported here: it needs private Keras modules that the Keras version
+      # pinned in requirements.txt does not have.
+      from recml.core.training import zero_copy_batches as zero_copy_batches_lib  # pylint: disable=g-import-not-at-top
+
+      fit_data = zero_copy_batches_lib.zero_copy_adapter(dataset)
+    with (
+        batch_folding.model_unfold_scope(model, unfold),
+        state_folding.model_state_folding_scope(
+            model,
+            max_leaf_size=(
+                self._fold_state_max_leaf_size
+                if keras.backend.backend() == "jax"
+                else 0
+            ),
+        ),
+        device_prefetch.model_prefetch_scope(
+            model, depth=self._device_prefetch_depth
+        ),
     ):
       history = model.fit(
-          dataset,
+          fit_data,
           epochs=epochs,
           steps_per_epoch=self._steps_per_loop,
           callbacks=callbacks,
@@ -431,10 +494,17 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
   def train_and_evaluate(self, task: KerasTask) -> core.Logs:
     """Trains and evaluates a Keras model."""
-    if self._device_prefetch_depth or self._skip_batch_logs:
+    if (
+        self._device_prefetch_depth
+        or self._skip_batch_logs
+        or self._fold_batch_leaves
+        or self._zero_copy_batches
+        or self._fold_state_max_leaf_size
+    ):
       logging.warning(
-          "device_prefetch_depth and skip_batch_logs only apply to `train`;"
-          " ignoring them in `train_and_evaluate`."
+          "device_prefetch_depth, skip_batch_logs, fold_batch_leaves,"
+          " zero_copy_batches and fold_state_max_leaf_size only apply to"
+          " `train`; ignoring them in `train_and_evaluate`."
       )
     train_dataset = task.create_dataset(
         training=True, **self._maybe_get_dataset_kws(task)
