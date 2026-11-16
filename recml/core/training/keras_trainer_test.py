@@ -256,6 +256,75 @@ class KerasTrainerTest(parameterized.TestCase):
     self.assertTrue(os.path.exists(expected_log_dir))
     self.assertEqual(experiment.task.last_eval_name, eval_name)
 
+  def test_continuous_eval_multiplexes_eval_names_with_single_restore(self):
+    if keras.backend.backend() != "jax":
+      self.skipTest("`continuous_eval` is only supported on the Jax backend.")
+
+    model_dir = self.create_tempdir().full_path
+    seen_eval_names: list[str] = []
+
+    class _TrackingTask(_KerasTask):
+
+      def create_dataset(
+          self, training: bool, eval_name: str | None = None
+      ) -> tf.data.Dataset:
+        if not training and eval_name is not None:
+          seen_eval_names.append(eval_name)
+        return super().create_dataset(training=training, eval_name=eval_name)
+
+    train_trainer = keras_trainer.KerasTrainer(
+        distribution=keras.distribution.DataParallel(),
+        train_steps=2,
+        steps_per_eval=1,
+        steps_per_loop=2,
+        model_dir=model_dir,
+        checkpoint_version="v3",
+    )
+    core.run_experiment(
+        core.Experiment(_TrackingTask(), train_trainer), core.Trainer.Mode.TRAIN
+    )
+    keras.backend.clear_session()
+
+    eval_names = (
+        "validation",
+        "validation_random_16",
+        "global_drop_15_validation_last_1",
+    )
+    eval_trainer = keras_trainer.KerasTrainer(
+        distribution=keras.distribution.DataParallel(),
+        steps_per_eval=1,
+        steps_per_loop=2,
+        model_dir=model_dir,
+        continuous_eval_timeout=1,
+        checkpoint_version="v3",
+    )
+    job_info_str = core.JobInfo(
+        name="validation",
+        mode=core.Trainer.Mode.CONTINUOUS_EVAL,
+        eval_names=eval_names,
+    ).to_string()
+    eval_trainer.set_job_info(job_info_str)
+    self.assertEqual(eval_trainer.job_info.eval_names, eval_names)
+
+    with mock.patch.object(
+        keras_utils,
+        "restore_keras_checkpoint",
+        wraps=keras_utils.restore_keras_checkpoint,
+    ) as mock_restore:
+      core.run_experiment(
+          core.Experiment(_TrackingTask(), eval_trainer),
+          core.Trainer.Mode.CONTINUOUS_EVAL,
+      )
+
+    self.assertEqual(seen_eval_names, list(eval_names))
+    # Checkpoint weights are restored once for the single checkpoint rather than
+    # once per multiplexed eval suite.
+    self.assertEqual(mock_restore.call_count, 1)
+    for suite_name in eval_names:
+      suite_log_dir = os.path.join(model_dir, "logs", suite_name)
+      self.assertTrue(os.path.isdir(suite_log_dir), msg=suite_log_dir)
+      self.assertNotEmpty(os.listdir(suite_log_dir), msg=suite_name)
+
   def test_eval_with_create_model_for_eval_override(self) -> None:
     if keras.backend.backend() == "jax":
       distribution = keras.distribution.DataParallel()

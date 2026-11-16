@@ -315,9 +315,10 @@ class KerasTrainer(core.Trainer[KerasTask]):
         ),
     ]
 
-  @functools.cached_property
-  def eval_callbacks(self) -> list[keras.callbacks.Callback]:
-    """Returns the evaluation callbacks."""
+  def _build_eval_callbacks_for_name(
+      self, eval_name: str
+  ) -> list[keras.callbacks.Callback]:
+    """Builds evaluation callbacks writing summaries under `logs/<eval_name>`."""
     if keras.backend.backend() == "jax":
       return [
           *self._custom_eval_callbacks,
@@ -326,11 +327,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
               steps_per_epoch=self._steps_per_loop,
               write_steps_per_second=False,
               # Allow eval jobs to have separate logging directories.
-              eval_subdir=(
-                  self.job_info.name
-                  if self.job_info is not None
-                  else "validation"
-              ),
+              eval_subdir=eval_name,
           ),
       ]
     return [
@@ -341,12 +338,25 @@ class KerasTrainer(core.Trainer[KerasTask]):
         ),
     ]
 
-  def _maybe_get_dataset_kws(self, task: KerasTask) -> Mapping[str, Any]:
+  @functools.cached_property
+  def eval_callbacks(self) -> list[keras.callbacks.Callback]:
+    """Returns the evaluation callbacks."""
+    eval_name = (
+        self.job_info.name if self.job_info is not None else "validation"
+    )
+    return self._build_eval_callbacks_for_name(eval_name)
+
+  def _maybe_get_dataset_kws(
+      self, task: KerasTask, eval_name: str | None = None
+  ) -> Mapping[str, Any]:
     kws = {}
     if py_utils.has_argument(task.create_dataset, "eval_name"):
-      kws["eval_name"] = (
-          self.job_info.name if self.job_info is not None else "validation"
-      )
+      if eval_name is not None:
+        kws["eval_name"] = eval_name
+      elif self.job_info is not None:
+        kws["eval_name"] = self.job_info.name
+      else:
+        kws["eval_name"] = "validation"
     if py_utils.has_argument(task.create_dataset, "model_dir"):
       kws["model_dir"] = self._model_dir
 
@@ -521,11 +531,38 @@ class KerasTrainer(core.Trainer[KerasTask]):
           "Continuous evaluation is only supported on the Jax backend."
       )
 
-    eval_dataset = task.create_dataset(
-        training=False, **self._maybe_get_dataset_kws(task)
+    if self.job_info is not None and self.job_info.eval_names:
+      eval_names = self.job_info.eval_names
+    elif self.job_info is not None:
+      eval_names = (self.job_info.name,)
+    else:
+      eval_names = ("validation",)
+
+    default_eval_name = (
+        self.job_info.name if self.job_info is not None else "validation"
     )
+    eval_suites = []
+    for idx, suite_name in enumerate(eval_names):
+      suite_dataset = task.create_dataset(
+          training=False,
+          **self._maybe_get_dataset_kws(task, eval_name=suite_name),
+      )
+      suite_callbacks = (
+          self.eval_callbacks
+          if len(eval_names) == 1 and suite_name == default_eval_name
+          else self._build_eval_callbacks_for_name(suite_name)
+      )
+      [suite_tb_cbk] = [
+          cbk
+          for cbk in suite_callbacks
+          if isinstance(cbk, keras_utils.EpochSummaryCallback)
+      ]
+      eval_suites.append(
+          (idx, suite_name, suite_dataset, suite_callbacks, suite_tb_cbk)
+      )
+
     model = task.create_model_for_eval(
-        **self._maybe_get_model_kws(task, eval_dataset),
+        **self._maybe_get_model_kws(task, eval_suites[0][2]),
     )
 
     def timeout_fn() -> bool:
@@ -573,43 +610,51 @@ class KerasTrainer(core.Trainer[KerasTask]):
         timeout_fn=timeout_fn,
     ):
       restore_callback = _RestoreCallback(self._checkpoint_dir, epoch)
-      [tb_cbk] = [
-          cbk
-          for cbk in self.eval_callbacks
-          if isinstance(cbk, keras_utils.EpochSummaryCallback)
-      ]
-      callbacks = [restore_callback, *self.eval_callbacks]
       try:
-        logging.info(f"eval | epoch: {epoch: 6d} | {steps_msg}")
-        epoch_start_time = time.time()
+        for (
+            idx,
+            suite_name,
+            suite_dataset,
+            suite_callbacks,
+            suite_tb_cbk,
+        ) in eval_suites:
+          callbacks = (
+              [restore_callback, *suite_callbacks]
+              if idx == 0
+              else list(suite_callbacks)
+          )
+          logging.info(
+              f"eval ({suite_name}) | epoch: {epoch: 6d} | {steps_msg}"
+          )
+          epoch_start_time = time.time()
 
-        logging.info(
-            "[Before] Memory usage:"
-            f" {psutil.Process().memory_info().rss / 1024 ** 2:.1f} MB"
-        )
-        history = model.evaluate(
-            eval_dataset,
-            steps=self._steps_per_eval,
-            callbacks=callbacks,
-            return_dict=True,
-        )
+          logging.info(
+              "[Before] Memory usage:"
+              f" {psutil.Process().memory_info().rss / 1024 ** 2:.1f} MB"
+          )
+          history = model.evaluate(
+              suite_dataset,
+              steps=self._steps_per_eval,
+              callbacks=callbacks,
+              return_dict=True,
+          )
 
-        logging.info(
-            "[After] Memory usage:"
-            f" {psutil.Process().memory_info().rss / 1024 ** 2:.1f} MB"
-        )
-        gc.collect()
-        logging.info(
-            "[After GC] Memory usage:"
-            f" {psutil.Process().memory_info().rss / 1024 ** 2:.1f} MB"
-        )
-        epoch_dt = time.time() - epoch_start_time
-        steps_per_second = self._steps_per_eval / epoch_dt  # pyrefly: ignore[unsupported-operation]
+          logging.info(
+              "[After] Memory usage:"
+              f" {psutil.Process().memory_info().rss / 1024 ** 2:.1f} MB"
+          )
+          gc.collect()
+          logging.info(
+              "[After GC] Memory usage:"
+              f" {psutil.Process().memory_info().rss / 1024 ** 2:.1f} MB"
+          )
+          epoch_dt = time.time() - epoch_start_time
+          steps_per_second = self._steps_per_eval / epoch_dt  # pyrefly: ignore[unsupported-operation]
 
-        tb_cbk.on_epoch_end(
-            epoch,
-            self._val_logs(history, self.eval_callbacks, steps_per_second),
-        )
+          suite_tb_cbk.on_epoch_end(
+              epoch,
+              self._val_logs(history, suite_callbacks, steps_per_second),
+          )
       except FileNotFoundError:
         logging.info("Checkpoint epoch: %s did not finish writing...", epoch)
 
