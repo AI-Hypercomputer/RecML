@@ -19,6 +19,7 @@ import functools
 import math
 import os
 import pprint
+import time
 from typing import Any, Generic, Protocol, Self, TypeVar
 
 from absl import logging
@@ -392,6 +393,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
       checkpoint_interval: int | None = None,
       max_checkpoints_to_keep: int = 5,
       continuous_eval_timeout: int = 30,
+      continuous_eval_max_idle_secs: float | None = None,
   ):
     """Initializes the instance.
 
@@ -425,11 +427,23 @@ class JaxTrainer(core.Trainer[JaxTask]):
         checkpoint before timing out during continuous evaluation. When a
         timeout happens, the job will check for a marker file on disk and if it
         exists, it will terminate successfully. Defaults to 30 seconds.
+      continuous_eval_max_idle_secs: Optional maximum seconds to wait without a
+        new checkpoint during `evaluate_continuously` before exiting cleanly
+        even if `marker.txt` has not been written. Must be > 0 when set.
+        Defaults to None.
     """
 
     if not isinstance(steps_per_loop, int) or steps_per_loop < 1:
       raise ValueError(
           f"`steps_per_loop` ({steps_per_loop}) must be a positive integer."
+      )
+    if (
+        continuous_eval_max_idle_secs is not None
+        and continuous_eval_max_idle_secs <= 0
+    ):
+      raise ValueError(
+          "`continuous_eval_max_idle_secs` must be > 0, got"
+          f" {continuous_eval_max_idle_secs}."
       )
 
     self._partitioner = partitioner or partitioning.NullPartitioner()
@@ -438,6 +452,7 @@ class JaxTrainer(core.Trainer[JaxTask]):
     self._steps_per_loop = steps_per_loop
     self._steps_per_eval = steps_per_eval
     self._continuous_eval_timeout = continuous_eval_timeout
+    self._continuous_eval_max_idle_secs = continuous_eval_max_idle_secs
     self._checkpoint_interval = checkpoint_interval or steps_per_loop
     self._max_checkpoints_to_keep = max_checkpoints_to_keep
 
@@ -795,10 +810,25 @@ class JaxTrainer(core.Trainer[JaxTask]):
     )
     eval_summary_writers = self._create_eval_summary_writers(eval_iters)
 
+    last_checkpoint_time = time.monotonic()
+
     def timeout_fn() -> bool:
-      return tf.io.gfile.exists(
+      if tf.io.gfile.exists(
           os.path.join(self._model_dir, core.TRAINING_COMPLETE_MARKER_FILE)
-      )
+      ):
+        return True
+      if self._continuous_eval_max_idle_secs is not None:
+        idle_secs = time.monotonic() - last_checkpoint_time
+        if idle_secs >= self._continuous_eval_max_idle_secs:
+          logging.warning(
+              "Stopping continuous_eval after %.1fs with no new checkpoints in"
+              " %s (continuous_eval_max_idle_secs=%s).",
+              idle_secs,
+              os.path.join(self._model_dir, core.CHECKPOINT_DIR),
+              self._continuous_eval_max_idle_secs,
+          )
+          return True
+      return False
 
     if self._steps_per_eval is not None:
       steps_msg = f"running {self._steps_per_eval} steps of evaluation..."
@@ -833,6 +863,8 @@ class JaxTrainer(core.Trainer[JaxTask]):
 
       except FileNotFoundError:
         logging.info("Checkpoint step: %s did not finish writing...", step)
+      finally:
+        last_checkpoint_time = time.monotonic()
 
     return metrics
 
