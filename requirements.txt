@@ -16,7 +16,7 @@ docstring-parser==0.16
 einops==0.8.1
 etils==1.12.2
 fiddle==0.3.0
-filelock==3.18.0
+filelock==3.20.3
 flatbuffers==25.2.10
 fsspec==2025.3.2
 gast==0.6.0
