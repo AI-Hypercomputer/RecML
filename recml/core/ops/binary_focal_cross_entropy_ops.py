@@ -36,6 +36,9 @@ _bce_bwd_scan_groups = (
     bce_ops._bce_bwd_scan_groups  # pylint: disable=protected-access
 )
 _local_tokens = bce_ops._local_tokens  # pylint: disable=protected-access
+_check_not_partially_manual = (
+    bce_ops._check_not_partially_manual  # pylint: disable=protected-access
+)
 _check_vocab_replicated_in_d = (
     bce_ops._check_vocab_replicated_in_d  # pylint: disable=protected-access
 )
@@ -43,6 +46,9 @@ _effective_block_v = (
     bce_ops._effective_block_v  # pylint: disable=protected-access
 )
 _get_sharding = bce_ops._get_sharding  # pylint: disable=protected-access
+_has_non_manual_axes = (
+    bce_ops._has_non_manual_axes  # pylint: disable=protected-access
+)
 _max_safe_block_v = bce_ops._max_safe_block_v  # pylint: disable=protected-access
 _max_safe_chunk_n = bce_ops._max_safe_chunk_n  # pylint: disable=protected-access
 _pallas_interpret = bce_ops._pallas_interpret  # pylint: disable=protected-access
@@ -447,6 +453,10 @@ def cut_binary_focal_cross_entropy(
   and above raise a `ValueError`. Reshape or vmap over the extra leading axes
   before calling this op.
 
+  When called inside an outer ``jax.shard_map`` with ``use_pallas=True``, the
+  outer ``shard_map`` must set ``check_vma=False`` because the backward Pallas
+  kernel declares ``ShapeDtypeStruct`` outputs without ``manual_axis_type``.
+
   Args:
     activations: Hidden-state outputs of shape ``[B, N, D]``, or ``[X, B, N,
       D]`` with a single extra leading axis.
@@ -496,6 +506,8 @@ def cut_binary_focal_cross_entropy(
   Raises:
     ValueError: If ``activations`` has rank 5 or above, or if ``weights`` does
       not exactly match the per-position loss shape.
+    NotImplementedError: If ``embeddings`` are sharded along hidden dim ``D``,
+      or if the active mesh mixes manual and non-manual axes.
   """
   # `_focal_bce_fwd_local` operates on a single `[B, N, D]` array and the
   # forward pass only vmaps over one extra leading axis, so ranks >= 5 are
@@ -521,11 +533,12 @@ def cut_binary_focal_cross_entropy(
         f" {tuple(weights.shape)}."
     )
 
+  _check_not_partially_manual(jax.sharding.get_abstract_mesh())
+
   sharding = _get_sharding(embeddings)
-  if (
-      isinstance(sharding, jax.sharding.NamedSharding)
-      and not sharding.mesh.empty
-  ):
+  if isinstance(
+      sharding, jax.sharding.NamedSharding
+  ) and _has_non_manual_axes(sharding.mesh):
     replicated_sharding = jax.sharding.NamedSharding(
         sharding.mesh, jax.sharding.PartitionSpec()
     )
@@ -1149,6 +1162,7 @@ def _focal_bce_bwd_sharded(
     jt.Float[jt.Array, "V D"],
 ]:
   """Sharding-aware dispatcher for Focal BCE backward."""
+  _check_not_partially_manual(jax.sharding.get_abstract_mesh())
   mesh = None
   act_spec = None
   emb_spec = None
@@ -1158,13 +1172,13 @@ def _focal_bce_bwd_sharded(
     act_spec = config.act_spec
     emb_spec = config.emb_spec or jax.sharding.PartitionSpec()
     act_sharding = jax.sharding.NamedSharding(mesh, act_spec)
-    is_sharded = True
+    is_sharded = _has_non_manual_axes(mesh)
   else:
     act_sharding = _get_sharding(activations)
     emb_sharding = _get_sharding(embeddings)
     is_sharded = (
         isinstance(act_sharding, jax.sharding.NamedSharding)
-        and not act_sharding.mesh.empty
+        and _has_non_manual_axes(act_sharding.mesh)
         and isinstance(emb_sharding, jax.sharding.NamedSharding)
     )
     if is_sharded:

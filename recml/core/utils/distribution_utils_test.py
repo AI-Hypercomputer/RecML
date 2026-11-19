@@ -13,26 +13,38 @@
 # limitations under the License.
 """Tests mesh and batch-axis resolution in distribution_utils."""
 
+import re
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+import jax.numpy as jnp
 import keras
-from keras.src.distribution import distribution_lib
+import numpy as np
 from recml.core.utils import distribution_utils
 
-_DEVICES = [f'cpu:{i}' for i in range(8)]
+# Virtual CPU devices for the test meshes. Must be even for the 2D meshes.
+_NUM_DEVICES = 8
+# Must run before JAX starts.
+jax.config.update('jax_num_cpu_devices', _NUM_DEVICES)
+_DEVICES = [f'cpu:{i}' for i in range(_NUM_DEVICES)]
 
 
 class _StubDistribution:
   """Minimal stand-in for a Keras distribution.
 
-  Real hybrid-FSDP distributions live outside this package, so the two
+  Real hybrid-FSDP distributions live outside this package, so the methods and
   attributes `distribution_utils` reads are stubbed here instead.
   """
 
   def __init__(self, device_mesh, batch_dim_name):
     self.device_mesh = device_mesh
     self.batch_dim_name = batch_dim_name
+
+  def get_variable_layout(self, variable):
+    return keras.distribution.TensorLayout(
+        (None,) * len(variable.shape), self.device_mesh
+    )
 
 
 def _abstract_mesh(
@@ -43,6 +55,16 @@ def _abstract_mesh(
       axis_names=axis_names,
       axis_types=tuple(jax.sharding.AxisType.Auto for _ in axis_names),
   )
+
+
+def _all_reduced_elements(hlo_text: str, shape: str) -> int:
+  """Counts all-reduced arrays of `shape` (e.g. 'f32[24,8]') in HLO text."""
+  count = 0
+  for line in hlo_text.splitlines():
+    match = re.search(r'=\s*(.*?)\s+all-reduce(?:-start)?\(', line)
+    if match:
+      count += match.group(1).count(shape)
+  return count
 
 
 class DistributionUtilsTest(parameterized.TestCase):
@@ -82,8 +104,8 @@ class DistributionUtilsTest(parameterized.TestCase):
     self.assertIsNone(distribution_utils.resolve_batch_axis(None))
 
   def test_resolve_batch_axis_prefers_distribution_over_mesh(self):
-    device_mesh = distribution_lib.DeviceMesh(
-        (2, 4), ('replica', 'fsdp'), _DEVICES
+    device_mesh = keras.distribution.DeviceMesh(
+        (2, _NUM_DEVICES // 2), ('replica', 'fsdp'), _DEVICES
     )
     keras.distribution.set_distribution(
         _StubDistribution(device_mesh, ('replica', 'fsdp'))
@@ -95,7 +117,9 @@ class DistributionUtilsTest(parameterized.TestCase):
     )
 
   def test_resolve_batch_axis_from_data_parallel_distribution(self):
-    device_mesh = distribution_lib.DeviceMesh((8,), ('batch',), _DEVICES)
+    device_mesh = keras.distribution.DeviceMesh(
+        (_NUM_DEVICES,), ('batch',), _DEVICES
+    )
     keras.distribution.set_distribution(
         keras.distribution.DataParallel(device_mesh=device_mesh)
     )
@@ -115,8 +139,8 @@ class DistributionUtilsTest(parameterized.TestCase):
     self.assertEqual(abstract_mesh.axis_names, ('data',))
 
   def test_get_abstract_mesh_from_distribution(self):
-    device_mesh = distribution_lib.DeviceMesh(
-        (2, 4), ('replica', 'fsdp'), _DEVICES
+    device_mesh = keras.distribution.DeviceMesh(
+        (2, _NUM_DEVICES // 2), ('replica', 'fsdp'), _DEVICES
     )
     keras.distribution.set_distribution(_StubDistribution(device_mesh, None))
 
@@ -124,13 +148,260 @@ class DistributionUtilsTest(parameterized.TestCase):
 
     self.assertIsNotNone(mesh)
     self.assertEqual(mesh.axis_names, ('replica', 'fsdp'))
-    self.assertEqual(mesh.axis_sizes, (2, 4))
+    self.assertEqual(mesh.axis_sizes, (2, _NUM_DEVICES // 2))
     # Regression: `axis_types` must have one entry per axis. Passing a bare
     # `AxisType` raises `ValueError` on a mesh with more than one axis.
     self.assertEqual(
         mesh.axis_types,
         (jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
     )
+
+
+# TODO(jinchi): Add sharded-table (FSDP) tests once fused table gradients
+# support FSDP.
+class FusedTableGradTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    keras.distribution.set_distribution(None)
+    self.addCleanup(keras.distribution.set_distribution, None)
+
+  def test_fuse_table_grads_disabled_without_distribution(self):
+    self.assertFalse(distribution_utils.fuse_table_grads_enabled())
+
+  def test_fused_table_grad_data_parallel_opts_in(self):
+    device_mesh = keras.distribution.DeviceMesh(
+        (_NUM_DEVICES,), ('batch',), _DEVICES
+    )
+    keras.distribution.set_distribution(
+        distribution_utils.FusedTableGradDataParallel(device_mesh=device_mesh)
+    )
+    self.assertTrue(distribution_utils.fuse_table_grads_enabled())
+
+  def test_fused_table_grad_call_under_data_parallel(self):
+    """Several reads of one replicated table, as in GUM."""
+    device_mesh = keras.distribution.DeviceMesh(
+        (_NUM_DEVICES,), ('batch',), _DEVICES
+    )
+    keras.distribution.set_distribution(
+        distribution_utils.FusedTableGradDataParallel(device_mesh=device_mesh)
+    )
+    vocab, dim, batch, tokens = 16, 8, _NUM_DEVICES, 3
+    rng = np.random.default_rng(0)
+    table = keras.Variable(
+        rng.normal(size=(vocab, dim)).astype(np.float32), name='table'
+    )
+    ids = [
+        rng.integers(0, vocab, size=(batch, tokens), dtype=np.int32)
+        for _ in range(3)
+    ]
+    h = rng.normal(size=(batch, dim)).astype(np.float32)
+    out_weights = rng.normal(size=(batch, 3 * dim + vocab)).astype(np.float32)
+
+    def lookup(full_table, ids):
+      return jnp.take(full_table, ids, axis=0).sum(axis=1)
+
+    def tied_logits(full_table, h):
+      return h @ full_table.T
+
+    def loss_fn(table_value, h, fuse_grads):
+      with keras.StatelessScope(state_mapping=[(table, table_value)]):
+        outs = []
+        for token_ids in ids:
+          if fuse_grads:
+            outs.append(
+                distribution_utils.fused_table_grad_call(
+                    lookup, table, token_ids
+                )
+            )
+          else:
+            outs.append(lookup(keras.ops.convert_to_tensor(table), token_ids))
+        if fuse_grads:
+          outs.append(
+              distribution_utils.fused_table_grad_call(tied_logits, table, h)
+          )
+        else:
+          outs.append(tied_logits(keras.ops.convert_to_tensor(table), h))
+      return jnp.sum(jnp.concatenate(outs, axis=-1) * out_weights)
+
+    grad_fn = jax.jit(
+        jax.value_and_grad(loss_fn, argnums=(0, 1)), static_argnums=2
+    )
+    expected_loss, expected_grads = grad_fn(table.value, h, False)
+    loss, grads = grad_fn(table.value, h, True)
+
+    np.testing.assert_allclose(loss, expected_loss, rtol=1e-5)
+    for grad, expected_grad in zip(grads, expected_grads, strict=True):
+      np.testing.assert_allclose(grad, expected_grad, rtol=1e-5, atol=1e-5)
+
+  def test_fused_table_grad_call_reduces_replicated_table_once(self):
+    """All reads of a replicated table share one gradient all-reduce."""
+    device_mesh = keras.distribution.DeviceMesh(
+        (_NUM_DEVICES,), ('batch',), _DEVICES
+    )
+    keras.distribution.set_distribution(
+        distribution_utils.FusedTableGradDataParallel(device_mesh=device_mesh)
+    )
+    vocab, dim, batch, tokens = 24, 8, _NUM_DEVICES, 3
+    rng = np.random.default_rng(0)
+    table = keras.Variable(
+        rng.normal(size=(vocab, dim)).astype(np.float32), name='table'
+    )
+    ids = [
+        rng.integers(0, vocab, size=(batch, tokens), dtype=np.int32)
+        for _ in range(3)
+    ]
+    h = rng.normal(size=(batch, dim)).astype(np.float32)
+
+    def lookup(full_table, ids):
+      return jnp.take(full_table, ids, axis=0).sum(axis=1)
+
+    def tied_logits(full_table, h):
+      return h @ full_table.T
+
+    def loss_fn(table_value, h):
+      with keras.StatelessScope(state_mapping=[(table, table_value)]):
+        outs = [
+            distribution_utils.fused_table_grad_call(lookup, table, token_ids)
+            for token_ids in ids
+        ]
+        outs.append(
+            distribution_utils.fused_table_grad_call(tied_logits, table, h)
+        )
+      return sum(jnp.sum(out) for out in outs)
+
+    hlo = (
+        jax.jit(jax.grad(loss_fn, argnums=(0, 1)))
+        .lower(table.value, h)
+        .compile()
+        .as_text()
+    )
+
+    # 4 calls read the table, but its gradient is all-reduced once.
+    self.assertEqual(_all_reduced_elements(hlo, f'f32[{vocab},{dim}]'), 1)
+
+  def test_fused_table_grad_call_in_separate_traces(self):
+    """Each trace makes its own table copies."""
+    device_mesh = keras.distribution.DeviceMesh(
+        (_NUM_DEVICES,), ('batch',), _DEVICES
+    )
+    keras.distribution.set_distribution(
+        distribution_utils.FusedTableGradDataParallel(device_mesh=device_mesh)
+    )
+    vocab, dim, batch = 16, 8, _NUM_DEVICES
+    rng = np.random.default_rng(0)
+    table = keras.Variable(
+        rng.normal(size=(vocab, dim)).astype(np.float32), name='table'
+    )
+    h = rng.normal(size=(batch, dim)).astype(np.float32)
+
+    def tied_logits(full_table, h):
+      return h @ full_table.T
+
+    def loss_fn(table_value, h):
+      with keras.StatelessScope(state_mapping=[(table, table_value)]):
+        logits = distribution_utils.fused_table_grad_call(tied_logits, table, h)
+      return jnp.sum(jnp.square(logits))
+
+    # Reusing the first trace's copies would raise an escaped-tracer error.
+    loss = jax.jit(loss_fn)(table.value, h)
+    table_grad, _ = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))(table.value, h)
+
+    logits = h @ np.asarray(table.value).T
+    np.testing.assert_allclose(loss, np.sum(np.square(logits)), rtol=1e-5)
+    np.testing.assert_allclose(
+        table_grad, 2 * logits.T @ h, rtol=1e-4, atol=1e-4
+    )
+
+  @parameterized.named_parameters(('off', False), ('on', True))
+  def test_fuse_table_grads_reads_distribution(self, value):
+    device_mesh = keras.distribution.DeviceMesh(
+        (_NUM_DEVICES,), ('batch',), _DEVICES
+    )
+    distribution = keras.distribution.DataParallel(device_mesh=device_mesh)
+    distribution.fuse_table_grads = value
+    keras.distribution.set_distribution(distribution)
+    self.assertEqual(distribution_utils.fuse_table_grads_enabled(), value)
+
+  def test_fused_table_grad_call_raises_without_distribution(self):
+    table = keras.Variable(np.ones((4, 2), dtype=np.float32), name='table')
+    inputs = jnp.ones((_NUM_DEVICES, 2), dtype=jnp.float32)
+    with self.assertRaisesRegex(ValueError, 'active Keras distribution'):
+      distribution_utils.fused_table_grad_call(
+          lambda full_table, local_inputs: local_inputs @ full_table.T,
+          table,
+          inputs,
+      )
+
+  def test_fused_table_grad_call_raises_without_batch_axis(self):
+    device_mesh = keras.distribution.DeviceMesh(
+        (_NUM_DEVICES,), ('batch',), _DEVICES
+    )
+    keras.distribution.set_distribution(_StubDistribution(device_mesh, ()))
+    table = keras.Variable(np.ones((4, 2), dtype=np.float32), name='table')
+    inputs = jnp.ones((_NUM_DEVICES, 2), dtype=jnp.float32)
+    with self.assertRaisesRegex(ValueError, 'Could not determine batch axis'):
+      distribution_utils.fused_table_grad_call(
+          lambda full_table, local_inputs: local_inputs @ full_table.T,
+          table,
+          inputs,
+      )
+
+  def test_fused_table_grad_call_eager_and_mixed_precision(self):
+    """Covers eager calls and bf16 autocast with fp32 table gradients."""
+    device_mesh = keras.distribution.DeviceMesh(
+        (_NUM_DEVICES,), ('batch',), _DEVICES
+    )
+    keras.distribution.set_distribution(
+        distribution_utils.FusedTableGradDataParallel(device_mesh=device_mesh)
+    )
+    vocab, dim = 8, 4
+    rng = np.random.default_rng(1)
+    table = keras.Variable(
+        rng.normal(size=(vocab, dim)).astype(np.float32), name='table'
+    )
+    batch_sharding = jax.sharding.NamedSharding(
+        device_mesh.backend_mesh, jax.P('batch')
+    )
+    inputs = jax.device_put(
+        rng.normal(size=(_NUM_DEVICES, dim)).astype(np.float32),
+        batch_sharding,
+    )
+
+    eager_logits = distribution_utils.fused_table_grad_call(
+        lambda full_table, local_inputs: local_inputs @ full_table.T,
+        table,
+        inputs,
+    )
+    np.testing.assert_allclose(
+        eager_logits,
+        np.asarray(inputs) @ np.asarray(table.value).T,
+        rtol=1e-5,
+    )
+
+    seen_dtypes = []
+
+    class _MixedPrecisionLayer(keras.Layer):
+
+      def call(self, batch_inputs):
+        def proj(full_table, local_inputs):
+          seen_dtypes.append(full_table.dtype)
+          return local_inputs.astype(full_table.dtype) @ full_table.T
+
+        return distribution_utils.fused_table_grad_call(
+            proj, table, batch_inputs
+        )
+
+    layer = _MixedPrecisionLayer(dtype='mixed_bfloat16')
+
+    def loss_fn(table_value, batch_inputs):
+      with keras.StatelessScope(state_mapping=[(table, table_value)]):
+        logits = layer(batch_inputs)
+      return jnp.sum(logits.astype(jnp.float32))
+
+    table_grad = jax.jit(jax.grad(loss_fn))(table.value, inputs)
+    self.assertEqual(seen_dtypes, [jnp.bfloat16])
+    self.assertEqual(table_grad.dtype, jnp.float32)
 
 
 if __name__ == '__main__':
