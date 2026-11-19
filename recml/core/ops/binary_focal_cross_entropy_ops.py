@@ -43,6 +43,9 @@ _effective_block_v = (
     bce_ops._effective_block_v  # pylint: disable=protected-access
 )
 _get_sharding = bce_ops._get_sharding  # pylint: disable=protected-access
+_has_non_manual_axes = (
+    bce_ops._has_non_manual_axes  # pylint: disable=protected-access
+)
 _max_safe_block_v = bce_ops._max_safe_block_v  # pylint: disable=protected-access
 _max_safe_chunk_n = bce_ops._max_safe_chunk_n  # pylint: disable=protected-access
 _pallas_interpret = bce_ops._pallas_interpret  # pylint: disable=protected-access
@@ -522,10 +525,9 @@ def cut_binary_focal_cross_entropy(
     )
 
   sharding = _get_sharding(embeddings)
-  if (
-      isinstance(sharding, jax.sharding.NamedSharding)
-      and not sharding.mesh.empty
-  ):
+  if isinstance(
+      sharding, jax.sharding.NamedSharding
+  ) and _has_non_manual_axes(sharding.mesh):
     replicated_sharding = jax.sharding.NamedSharding(
         sharding.mesh, jax.sharding.PartitionSpec()
     )
@@ -1164,7 +1166,7 @@ def _focal_bce_bwd_sharded(
     emb_sharding = _get_sharding(embeddings)
     is_sharded = (
         isinstance(act_sharding, jax.sharding.NamedSharding)
-        and not act_sharding.mesh.empty
+        and _has_non_manual_axes(act_sharding.mesh)
         and isinstance(emb_sharding, jax.sharding.NamedSharding)
     )
     if is_sharded:
