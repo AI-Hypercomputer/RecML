@@ -24,6 +24,279 @@ from recml.core.metrics import confusion_metrics
 
 class ConfusionMetricsTest(parameterized.TestCase):
 
+  def test_estimate_confusion_matrix_batched(self) -> None:
+    predictions = np.array(
+        [
+            [0.9, 0.2, 0.8, 0.1],
+            [0.2, 0.9, 0.7, 0.6],
+            [0.1, 0.2, 0.4, 0.3],
+            [0.0, 1.0, 0.7, 0.3],
+        ],
+        dtype=np.float32,
+    )
+    labels = np.array(
+        [
+            [0, 1, 1, 0],
+            [1, 0, 0, 0],
+            [0, 0, 0, 0],
+            [1, 1, 1, 1],
+        ],
+        dtype=np.float32,
+    )
+    weights_batch = np.array(
+        [
+            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.5, 0.0, -1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    thresholds = [0.15, 0.5, 0.85, 0.95, 1.0]
+
+    tp_b, tn_b, fp_b, fn_b = (
+        confusion_metrics.estimate_confusion_matrix_batched(
+            predictions,
+            labels,
+            weights_batch,
+            thresholds,
+            threshold_batch_size=2,
+        )
+    )
+
+    # Hand-computed literal arrays for weights_batch[0] (all ones)
+    expected_tp_0 = np.array([6.0, 3.0, 1.0, 1.0, 0.0])
+    expected_tn_0 = np.array([2.0, 5.0, 7.0, 9.0, 9.0])
+    expected_fp_0 = np.array([7.0, 4.0, 2.0, 0.0, 0.0])
+    expected_fn_0 = np.array([1.0, 4.0, 6.0, 6.0, 7.0])
+
+    np.testing.assert_allclose(tp_b[0], expected_tp_0, rtol=1e-5)
+    np.testing.assert_allclose(tn_b[0], expected_tn_0, rtol=1e-5)
+    np.testing.assert_allclose(fp_b[0], expected_fp_0, rtol=1e-5)
+    np.testing.assert_allclose(fn_b[0], expected_fn_0, rtol=1e-5)
+
+    # Compare with estimate_confusion_matrix called with full-rank weights
+    w_0_exp = np.broadcast_to(weights_batch[0][:, None], predictions.shape)
+    tp_0_ind, tn_0_ind, fp_0_ind, fn_0_ind = (
+        confusion_metrics.estimate_confusion_matrix(
+            predictions, labels, w_0_exp, thresholds
+        )
+    )
+    np.testing.assert_allclose(tp_b[0], tp_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(tn_b[0], tn_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(fp_b[0], fp_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(fn_b[0], fn_0_ind, rtol=1e-5)
+
+    w_1_exp = np.broadcast_to(weights_batch[1][:, None], predictions.shape)
+    tp_1_ind, tn_1_ind, fp_1_ind, fn_1_ind = (
+        confusion_metrics.estimate_confusion_matrix(
+            predictions, labels, w_1_exp, thresholds
+        )
+    )
+    np.testing.assert_allclose(tp_b[1], tp_1_ind, rtol=1e-5)
+    np.testing.assert_allclose(tn_b[1], tn_1_ind, rtol=1e-5)
+    np.testing.assert_allclose(fp_b[1], fp_1_ind, rtol=1e-5)
+    np.testing.assert_allclose(fn_b[1], fn_1_ind, rtol=1e-5)
+
+  def test_estimate_confusion_matrix_batched_t150(self) -> None:
+    predictions = np.zeros((4, 4), dtype=np.float32)
+    labels = np.zeros((4, 4), dtype=np.float32)
+    weights_batch = np.ones((1, 4), dtype=np.float32)
+    thresholds = np.linspace(0.0, 1.0, 150).tolist()
+    tp_b, tn_b, fp_b, fn_b = (
+        confusion_metrics.estimate_confusion_matrix_batched(
+            predictions,
+            labels,
+            weights_batch,
+            thresholds,
+            threshold_batch_size=2,
+        )
+    )
+    w_0_exp = np.broadcast_to(weights_batch[0][:, None], predictions.shape)
+    tp_0_ind, tn_0_ind, fp_0_ind, fn_0_ind = (
+        confusion_metrics.estimate_confusion_matrix(
+            predictions, labels, w_0_exp, thresholds
+        )
+    )
+    np.testing.assert_allclose(tp_b[0], tp_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(tn_b[0], tn_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(fp_b[0], fp_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(fn_b[0], fn_0_ind, rtol=1e-5)
+
+  def test_estimate_confusion_matrix_batched_sparse(self) -> None:
+    predictions = np.array(
+        [
+            [0.9, 0.2, 0.8, 0.1],
+            [0.2, 0.9, 0.7, 0.6],
+            [0.1, 0.2, 0.4, 0.3],
+            [0.0, 1.0, 0.7, 0.3],
+        ],
+        dtype=np.float32,
+    )
+    labels = np.array(
+        [
+            [0, 1, 1, 0],
+            [1, 0, 0, 0],
+            [0, 0, 0, 0],
+            [1, 1, 1, 1],
+        ],
+        dtype=np.float32,
+    )
+    weights_batch = np.array(
+        [
+            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.5, 0.0, -1.0],
+        ],
+        dtype=np.float32,
+    )
+    thresholds = [0.15, 0.5, 0.85, 0.95, 1.0]
+    sparse_positive_indices = np.array(
+        [
+            [1, 2, 2, 1],
+            [0, -1, -1, -1],
+            [-1, -1, -1, -1],
+            [0, 1, 2, 3],
+        ],
+        dtype=np.int32,
+    )
+    predictions_bf16 = jax.numpy.array(predictions, dtype=jax.numpy.bfloat16)
+    tp_b_sp, tn_b_sp, fp_b_sp, fn_b_sp = (
+        confusion_metrics.estimate_confusion_matrix_batched(
+            predictions_bf16,
+            labels,
+            weights_batch,
+            thresholds,
+            sparse_positive_indices=sparse_positive_indices,
+        )
+    )
+
+    w_0_exp = np.broadcast_to(weights_batch[0][:, None], predictions_bf16.shape)
+    tp_0_ind, tn_0_ind, fp_0_ind, fn_0_ind = (
+        confusion_metrics.estimate_confusion_matrix(
+            predictions_bf16, labels, w_0_exp, thresholds
+        )
+    )
+    np.testing.assert_allclose(tp_b_sp[0], tp_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(tn_b_sp[0], tn_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(fp_b_sp[0], fp_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(fn_b_sp[0], fn_0_ind, rtol=1e-5)
+
+    w_1_exp = np.broadcast_to(weights_batch[1][:, None], predictions_bf16.shape)
+    tp_1_ind, tn_1_ind, fp_1_ind, fn_1_ind = (
+        confusion_metrics.estimate_confusion_matrix(
+            predictions_bf16, labels, w_1_exp, thresholds
+        )
+    )
+    np.testing.assert_allclose(tp_b_sp[1], tp_1_ind, rtol=1e-5)
+    np.testing.assert_allclose(tn_b_sp[1], tn_1_ind, rtol=1e-5)
+    np.testing.assert_allclose(fp_b_sp[1], fp_1_ind, rtol=1e-5)
+    np.testing.assert_allclose(fn_b_sp[1], fn_1_ind, rtol=1e-5)
+
+  def test_estimate_confusion_matrix_batched_auto_chunking(self) -> None:
+    predictions = np.zeros((80_000, 1), dtype=np.float32)
+    predictions[0, 0] = 0.9
+    predictions[1, 0] = 0.2
+    labels = np.zeros((80_000, 1), dtype=np.float32)
+    labels[0, 0] = 1.0
+    labels[2, 0] = 1.0
+    weights_batch = np.ones((2, 80_000), dtype=np.float32)
+    weights_batch[1, 1] = 2.5
+    thresholds = np.linspace(0.0, 1.0, 200).tolist()
+    tp_b, tn_b, fp_b, fn_b = (
+        confusion_metrics.estimate_confusion_matrix_batched(
+            predictions,
+            labels,
+            weights_batch,
+            thresholds,
+            threshold_batch_size=None,
+        )
+    )
+    w_0_exp = np.broadcast_to(weights_batch[0][:, None], predictions.shape)
+    tp_0_ind, tn_0_ind, fp_0_ind, fn_0_ind = (
+        confusion_metrics.estimate_confusion_matrix(
+            predictions, labels, w_0_exp, thresholds
+        )
+    )
+    np.testing.assert_allclose(tp_b[0], tp_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(tn_b[0], tn_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(fp_b[0], fp_0_ind, rtol=1e-5)
+    np.testing.assert_allclose(fn_b[0], fn_0_ind, rtol=1e-5)
+
+    w_1_exp = np.broadcast_to(weights_batch[1][:, None], predictions.shape)
+    tp_1_ind, tn_1_ind, fp_1_ind, fn_1_ind = (
+        confusion_metrics.estimate_confusion_matrix(
+            predictions, labels, w_1_exp, thresholds
+        )
+    )
+    np.testing.assert_allclose(tp_b[1], tp_1_ind, rtol=1e-5)
+    np.testing.assert_allclose(tn_b[1], tn_1_ind, rtol=1e-5)
+    np.testing.assert_allclose(fp_b[1], fp_1_ind, rtol=1e-5)
+    np.testing.assert_allclose(fn_b[1], fn_1_ind, rtol=1e-5)
+
+    np.testing.assert_allclose(tp_b[1, 0], 1.0, rtol=1e-5)
+    np.testing.assert_allclose(tn_b[1, 0], 79997.0, rtol=1e-5)
+    np.testing.assert_allclose(fp_b[1, 0], 2.5, rtol=1e-5)
+    np.testing.assert_allclose(fn_b[1, 0], 1.0, rtol=1e-5)
+
+    np.testing.assert_allclose(tp_b[1, 100], 1.0, rtol=1e-5)
+    np.testing.assert_allclose(tn_b[1, 100], 79999.5, rtol=1e-5)
+    np.testing.assert_allclose(fp_b[1, 100], 0.0, rtol=1e-5)
+    np.testing.assert_allclose(fn_b[1, 100], 1.0, rtol=1e-5)
+
+  def test_estimate_confusion_matrix_batched_jit(self) -> None:
+    predictions = np.array([[0.9, 0.2], [0.2, 0.9]], dtype=np.float32)
+    labels = np.array([[0, 1], [1, 0]], dtype=np.float32)
+    weights_batch = np.array([[1.0, 1.0]], dtype=np.float32)
+    thresholds = tuple([0.5])
+
+    @jax.jit
+    def _jit_dense(p, l, w):
+      return confusion_metrics.estimate_confusion_matrix_batched(
+          p, l, w, thresholds
+      )
+
+    tp_d, tn_d, fp_d, fn_d = _jit_dense(predictions, labels, weights_batch)
+
+    sparse_ids = np.array([[1, -1], [0, -1]], dtype=np.int32)
+
+    @jax.jit
+    def _jit_sparse(p, l, w, sp):
+      return confusion_metrics.estimate_confusion_matrix_batched(
+          p, l, w, thresholds, sparse_positive_indices=sp
+      )
+
+    tp_s, tn_s, fp_s, fn_s = _jit_sparse(
+        predictions, labels, weights_batch, sparse_ids
+    )
+
+    np.testing.assert_allclose(tp_d, tp_s, rtol=1e-5)
+    np.testing.assert_allclose(tn_d, tn_s, rtol=1e-5)
+    np.testing.assert_allclose(fp_d, fp_s, rtol=1e-5)
+    np.testing.assert_allclose(fn_d, fn_s, rtol=1e-5)
+
+  def test_estimate_confusion_matrix_batched_value_errors(self) -> None:
+    predictions = np.zeros((4, 4), dtype=np.float32)
+    labels = np.zeros((4, 4), dtype=np.float32)
+    weights_batch = np.ones((1, 4), dtype=np.float32)
+    thresholds = [0.0]
+    sparse_positive_indices = np.zeros((4, 2), dtype=np.int32)
+
+    with self.assertRaises(ValueError):
+      confusion_metrics.estimate_confusion_matrix_batched(
+          predictions, labels[1:], weights_batch, thresholds
+      )
+    with self.assertRaises(ValueError):
+      confusion_metrics.estimate_confusion_matrix_batched(
+          predictions, labels, weights_batch[..., :2], thresholds
+      )
+    with self.assertRaises(ValueError):
+      confusion_metrics.estimate_confusion_matrix_batched(
+          predictions,
+          labels,
+          weights_batch,
+          thresholds,
+          sparse_positive_indices=sparse_positive_indices[1:],
+      )
+
   @parameterized.named_parameters(
       {
           'testcase_name': 'unweighted',
