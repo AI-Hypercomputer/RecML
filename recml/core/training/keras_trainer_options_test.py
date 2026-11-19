@@ -25,6 +25,7 @@ import numpy as np
 from recml.core.training import batch_callbacks
 from recml.core.training import device_prefetch
 from recml.core.training import keras_trainer
+from recml.core.training import zero_copy_batches
 from recml.core.utils import keras_utils
 import tensorflow as tf
 
@@ -59,7 +60,10 @@ class _DummyModel:
     self.make_train_function()
     fn = self.train_function
     self.seen_in_fit.append((fn, callbacks))
-    it = iter(dataset)
+    if isinstance(dataset, zero_copy_batches._ZeroCopyAdapter):
+      it = dataset.get_jax_iterator()
+    else:
+      it = iter(dataset)
     for _ in range(steps_per_epoch):
       batch, _ = fn(None, it)
       self.batches_in_fit.append(batch)
@@ -264,6 +268,67 @@ class KerasTrainerOptionsTest(absltest.TestCase):
       with self.assertRaisesRegex(RuntimeError, "stop"):
         trainer.train_and_evaluate(task)
     self.assertIn("fold_batch_leaves", logs.output[0])
+
+  def test_zero_copy_batches_wraps_the_dataset_in_a_zero_copy_adapter(self):
+    features = np.arange(20, dtype=np.float32).reshape([10, 2])
+    dataset = tf.data.Dataset.from_tensor_slices(features).batch(
+        2, drop_remainder=True
+    )
+    model = _StepModel()
+    task = types.SimpleNamespace(
+        create_dataset=lambda training: dataset,
+        create_model=lambda: model,
+        export_model=lambda m, model_dir: None,
+    )
+
+    _trainer(self._tmpdir, zero_copy_batches=True).train(task)
+
+    self.assertLen(model.datasets_in_fit, 1)
+    self.assertIsInstance(
+        model.datasets_in_fit[0], zero_copy_batches._ZeroCopyAdapter
+    )
+    self.assertLen(model.batches_in_fit, 5)
+    self.assertFalse(model.batches_in_fit[0].flags.owndata)
+
+  def test_zero_copy_batches_with_fold_batch_leaves(self):
+    features = {
+        "a": np.arange(40, dtype=np.float32).reshape([20, 2]),
+        "b": -np.arange(60, dtype=np.float32).reshape([20, 3]),
+    }
+    dataset = tf.data.Dataset.from_tensor_slices(features).batch(
+        2, drop_remainder=True
+    )
+    model = _StepModel()
+    task = types.SimpleNamespace(
+        create_dataset=lambda training: dataset,
+        create_model=lambda: model,
+        export_model=lambda m, model_dir: None,
+    )
+
+    _trainer(
+        self._tmpdir, fold_batch_leaves=True, zero_copy_batches=True
+    ).train(task)
+
+    self.assertLen(model.datasets_in_fit, 1)
+    self.assertIsInstance(
+        model.datasets_in_fit[0], zero_copy_batches._ZeroCopyAdapter
+    )
+    self.assertLen(model.batches_in_fit, 5)
+    for step, batch in enumerate(model.batches_in_fit):
+      self.assertCountEqual(batch, ["a", "b"])
+      for key, value in batch.items():
+        np.testing.assert_array_equal(
+            value, features[key][2 * step : 2 * step + 2]
+        )
+
+  def test_train_and_evaluate_warns_that_zero_copy_batches_is_not_applied(self):
+    trainer = _trainer(self._tmpdir, zero_copy_batches=True)
+    task = mock.Mock()
+    task.create_dataset.side_effect = RuntimeError("stop")
+    with self.assertLogs(level="WARNING") as logs:
+      with self.assertRaisesRegex(RuntimeError, "stop"):
+        trainer.train_and_evaluate(task)
+    self.assertIn("zero_copy_batches", logs.output[0])
 
   def test_train_and_evaluate_warns_that_skip_batch_logs_is_not_applied(self):
     trainer = _trainer(self._tmpdir, skip_batch_logs=True)

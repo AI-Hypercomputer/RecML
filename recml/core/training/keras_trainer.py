@@ -132,6 +132,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       device_prefetch_depth: int = 0,
       skip_batch_logs: bool = False,
       fold_batch_leaves: bool = False,
+      zero_copy_batches: bool = False,
   ):
     """Initializes the instance.
 
@@ -181,6 +182,13 @@ class KerasTrainer(core.Trainer[KerasTask]):
         host time per step for batches with many leaves. The model sees the same
         batches. Requires the JAX backend and a `tf.data.Dataset`. Not applied
         in `train_and_evaluate`. Defaults to False.
+      zero_copy_batches: During `train` on the JAX backend, pass read-only
+        zero-copy NumPy views of dense integer, floating-point and boolean
+        `tf.Tensor` batch leaves to `model.fit` instead of copying every leaf
+        with `np.array` (see `zero_copy_batches`). Other leaves, including
+        bfloat16 and complex tensors, are still converted (and copied) as Keras
+        converts them. Requires a `tf.data.Dataset`. Not applied in
+        `train_and_evaluate`. Defaults to False.
       resume_training_launcher: Launcher to resume training.
       enable_xmanager_measurements: Whether to enable XManager measurements.
       enable_autoxprof: Whether to enable AutoXprof.
@@ -225,6 +233,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._device_prefetch_depth = device_prefetch_depth
     self._skip_batch_logs = skip_batch_logs
     self._fold_batch_leaves = fold_batch_leaves
+    self._zero_copy_batches = zero_copy_batches
     self._marker_path = os.path.join(
         model_dir, core.TRAINING_COMPLETE_MARKER_FILE
     )
@@ -399,6 +408,13 @@ class KerasTrainer(core.Trainer[KerasTask]):
       # optimizer from its first batch, which would be folded.
       model._symbolic_build(data_batch=dataset.element_spec)  # pylint: disable=protected-access
       dataset, unfold = batch_folding.fold_dataset(dataset)
+    fit_data: Any = dataset
+    if self._zero_copy_batches and keras.backend.backend() == "jax":
+      # Imported here: it needs private Keras modules that the Keras version
+      # pinned in requirements.txt does not have.
+      from recml.core.training import zero_copy_batches as zero_copy_batches_lib  # pylint: disable=g-import-not-at-top
+
+      fit_data = zero_copy_batches_lib.zero_copy_adapter(dataset)
     with (
         batch_folding.model_unfold_scope(model, unfold),
         device_prefetch.model_prefetch_scope(
@@ -406,7 +422,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         ),
     ):
       history = model.fit(
-          dataset,
+          fit_data,
           epochs=epochs,
           steps_per_epoch=self._steps_per_loop,
           callbacks=callbacks,
@@ -460,10 +476,12 @@ class KerasTrainer(core.Trainer[KerasTask]):
         self._device_prefetch_depth
         or self._skip_batch_logs
         or self._fold_batch_leaves
+        or self._zero_copy_batches
     ):
       logging.warning(
-          "device_prefetch_depth, skip_batch_logs and fold_batch_leaves only"
-          " apply to `train`; ignoring them in `train_and_evaluate`."
+          "device_prefetch_depth, skip_batch_logs, fold_batch_leaves and"
+          " zero_copy_batches only apply to `train`; ignoring them in"
+          " `train_and_evaluate`."
       )
     train_dataset = task.create_dataset(
         training=True, **self._maybe_get_dataset_kws(task)
