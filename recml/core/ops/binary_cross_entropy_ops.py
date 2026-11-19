@@ -89,11 +89,14 @@ _BYTES_IN_MB = 1024 * 1024
 
 _RESERVE_MB: float = 16.0
 _TARGET_RATIO: float = 0.8
+_MEDIUM_TARGET_RATIO: float = 0.65
 _BLOCK_N: int = 128
 _VOCAB_VMEM_TILES: int = 5
 _LOGIT_VMEM_TILES: int = 4
+_FOCAL_LOGIT_VMEM_TILES: int = 8
 _TOKEN_VMEM_TILES: int = 3
 _VOCAB_VMEM_SHARE: float = 0.5
+_MEDIUM_VMEM_SHARE: float = 0.42
 _SMALL_VMEM_SHARE: float = 0.3
 _MIN_CHUNK_TILES: int = 4
 
@@ -815,25 +818,27 @@ def _vocab_bytes_per_block_v(
     padded_d: int,
     block_n: int,
     dtype: jax.typing.DTypeLike = jnp.float32,
+    logit_vmem_tiles: int = _LOGIT_VMEM_TILES,
 ) -> int:
   """VMEM bytes the backward kernel needs per unit of `block_v`.
 
   Every extra vocabulary column adds `_VOCAB_VMEM_TILES` rows of width
   `padded_d` (embeddings, gradients, accumulator and staging buffers) plus
-  `_LOGIT_VMEM_TILES` columns of height `block_n` (the logits intermediate and
+  `logit_vmem_tiles` columns of height `block_n` (the logits intermediate and
   the temporaries derived from it).
 
   Args:
     padded_d: Hidden size padded up to the vector lane width.
     block_n: Token-axis tile size of the kernel's inner loop.
     dtype: Element type of the activations and embeddings.
+    logit_vmem_tiles: Number of live `[block_n, block_v]` tiles in VMEM.
 
   Returns:
     The number of VMEM bytes consumed by one vocabulary column.
   """
   bytes_per_element = jnp.dtype(dtype).itemsize
   return (
-      _VOCAB_VMEM_TILES * padded_d + _LOGIT_VMEM_TILES * block_n
+      _VOCAB_VMEM_TILES * padded_d + logit_vmem_tiles * block_n
   ) * bytes_per_element
 
 
@@ -842,6 +847,7 @@ def _max_safe_block_v(
     padded_d: int,
     block_n: int = _BLOCK_N,
     dtype: jax.typing.DTypeLike = jnp.float32,
+    logit_vmem_tiles: int = _LOGIT_VMEM_TILES,
 ) -> int:
   """Returns maximum safe block_v to prevent VMEM OOM.
 
@@ -855,19 +861,21 @@ def _max_safe_block_v(
     padded_d: Hidden size padded up to the vector lane width.
     block_n: Token-axis tile size of the kernel's inner loop.
     dtype: Element type of the activations and embeddings.
+    logit_vmem_tiles: Number of live `[block_n, block_v]` tiles in VMEM.
 
   Returns:
     The largest MXU-aligned `block_v` that fits the budget.
   """
-  share = (
-      _SMALL_VMEM_SHARE
-      if vmem_budget <= 32 * _BYTES_IN_MB
-      else _VOCAB_VMEM_SHARE
-  )
+  if vmem_budget <= 32 * _BYTES_IN_MB:
+    share = _SMALL_VMEM_SHARE
+  elif vmem_budget <= 48 * _BYTES_IN_MB:
+    share = _MEDIUM_VMEM_SHARE
+  else:
+    share = _VOCAB_VMEM_SHARE
 
   # NOMUTANTS -- max_safe is calculated based on VMEM budget.
   max_safe = int(vmem_budget * share) // _vocab_bytes_per_block_v(
-      padded_d, block_n, dtype
+      padded_d, block_n, dtype, logit_vmem_tiles=logit_vmem_tiles
   )
 
   # Round down to a multiple of the MXU systolic dimension. `pl.align_to`
@@ -877,7 +885,10 @@ def _max_safe_block_v(
 
 
 def _effective_block_v(
-    config: BCEConfig, hidden: int, vocab: int
+    config: BCEConfig,
+    hidden: int,
+    vocab: int,
+    logit_vmem_tiles: int = _LOGIT_VMEM_TILES,
 ) -> tuple[int, int]:
   """Resolves the padded hidden size and the block_v the kernel will run with.
 
@@ -888,6 +899,7 @@ def _effective_block_v(
     config: Backward-pass configuration supplying the requested `block_v`.
     hidden: Unpadded hidden size ``D`` of the activations.
     vocab: Shard-local vocabulary size ``V``.
+    logit_vmem_tiles: Number of live `[block_n, block_v]` tiles in VMEM.
 
   Returns:
     A ``(padded_d, block_v)`` pair, both aligned to the hardware tiling.
@@ -897,7 +909,12 @@ def _effective_block_v(
   if config.force_bwd_block_v:
     block_v = pl.align_to(min(config.block_v, vocab), lane)
     return padded_d, min(block_v, pl.align_to(vocab, lane))
-  max_safe = _max_safe_block_v(_pallas_vmem_budget(), padded_d, config.block_n)
+  max_safe = _max_safe_block_v(
+      _pallas_vmem_budget(),
+      padded_d,
+      config.block_n,
+      logit_vmem_tiles=logit_vmem_tiles,
+  )
   block_v = pl.align_to(min(config.block_v, vocab, max_safe), lane)
   return padded_d, min(block_v, pl.align_to(vocab, lane), max_safe)
 
@@ -967,10 +984,16 @@ def _bce_bwd_kernel(
     )
     probs = jax.nn.sigmoid(logits)
 
-    # Target matching across labels: (block_n, block_v)
+    # Target matching across labels: (block_n, block_v). Accumulate label-by-
+    # label in 2D instead of broadcasting `tgt_val[:, :, None]` to a 3D
+    # `(labels, block_n, block_v)` tensor in VMEM.
     if labels > 0:
-      tgt_val = tgt_ref[:labels, pl.ds(n_idx * block_n, block_n)]
-      y_true_chunk = jnp.any(tgt_val[:, :, None] == chunk_indices_local, axis=0)
+      tgt_val = tgt_ref[:, pl.ds(n_idx * block_n, block_n)]
+      y_true_chunk = jnp.zeros((block_n, block_v), dtype=jnp.bool_)
+      for l_idx in range(labels):
+        y_true_chunk = y_true_chunk | (
+            tgt_val[l_idx : l_idx + 1, :].T == chunk_indices_local
+        )
       g = probs - y_true_chunk.astype(probs.dtype)
     else:
       g = probs
@@ -1222,6 +1245,7 @@ def _max_safe_chunk_n(
     block_n: int = _BLOCK_N,
     target_ratio: float | None = None,
     dtype: jax.typing.DTypeLike = jnp.float32,
+    logit_vmem_tiles: int = _LOGIT_VMEM_TILES,
 ) -> int:
   """Returns maximum safe chunk_n to prevent VMEM OOM.
 
@@ -1238,20 +1262,27 @@ def _max_safe_chunk_n(
     block_n: Token-axis tile size of the kernel's inner loop.
     target_ratio: Fraction of `vmem_budget` the backward pass may claim.
     dtype: Element type of the activations and embeddings.
+    logit_vmem_tiles: Number of live `[block_n, block_v]` tiles in VMEM.
 
   Returns:
     The largest lane-aligned token chunk that fits alongside the vocabulary
     working set.
   """
-  if target_ratio is None:
-    target_ratio = _TARGET_RATIO
   bytes_per_element = jnp.dtype(dtype).itemsize
-  share = (
-      _SMALL_VMEM_SHARE if vmem_budget <= 32 * _BYTES_IN_MB else target_ratio
-  )
+  if vmem_budget <= 32 * _BYTES_IN_MB:
+    share = _SMALL_VMEM_SHARE
+  elif vmem_budget <= 48 * _BYTES_IN_MB:
+    share = _MEDIUM_TARGET_RATIO if target_ratio is None else target_ratio
+  else:
+    share = _TARGET_RATIO if target_ratio is None else target_ratio
 
   # NOMUTANTS -- max_safe is calculated based on VMEM budget.
-  vocab_bytes = _vocab_bytes_per_block_v(padded_d, block_n, dtype) * block_v
+  vocab_bytes = (
+      _vocab_bytes_per_block_v(
+          padded_d, block_n, dtype, logit_vmem_tiles=logit_vmem_tiles
+      )
+      * block_v
+  )
   available = max(0, int(vmem_budget * share) - vocab_bytes)
 
   # Conservative VMEM usage approx: chunk_n * padded_d * bytes_per_element * 3.
