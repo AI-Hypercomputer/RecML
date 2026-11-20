@@ -2855,6 +2855,15 @@ class TrainThroughputCallbackTest(absltest.TestCase):
 
     self.assertTrue(callback.async_safe)
 
+  def test_does_not_require_batch_logs(self):
+    # Otherwise `ZeroSyncCallbackList` (`skip_batch_logs=True`) converts the
+    # step logs to Python floats on every step.
+    train_cb = _throughput_callback(keras_utils.TrainThroughputCallback)
+    eval_cb = _throughput_callback(keras_utils.EvalThroughputCallback)
+
+    self.assertFalse(train_cb.requires_batch_logs)
+    self.assertFalse(eval_cb.requires_batch_logs)
+
   def test_step_count_comes_from_keras_end_step(self):
     # One batch end with end step 99 means that 100 steps completed. This is
     # what happens when `steps_per_execution` is more than one.
