@@ -2150,14 +2150,17 @@ class _TokenThroughputCallback(MetricsCallback):
   startup or upon recovery after a preemption) therefore includes JIT
   compilation time and reads lower than steady-state windows.
 
-  The callback never reads `logs` in its batch hooks and sets `async_safe`.
-  Thus Keras can keep dispatching batch callbacks asynchronously. Without
-  `async_safe`, one callback with a batch hook makes Keras convert all the
-  step logs to Python floats on the main thread on every step, which blocks
-  the accelerator.
+  The callback never reads `logs` in its batch hooks and sets `async_safe` and
+  `requires_batch_logs = False`. Thus Keras can keep dispatching batch callbacks
+  asynchronously, and `KerasTrainer(skip_batch_logs=True)` continues to skip
+  per-step host conversions of `logs`. Without `async_safe`, one callback with a
+  batch hook makes Keras convert all the step logs to Python floats on the main
+  thread on every step, which blocks the accelerator.
 
   Subclasses select the Keras hooks that open and close the window.
   """
+
+  requires_batch_logs: bool = False
 
   def __init__(
       self,
