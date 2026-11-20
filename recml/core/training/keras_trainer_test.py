@@ -272,6 +272,48 @@ class KerasTrainerTest(parameterized.TestCase):
 
     self.assertEqual(experiment.task.eval_model_kwargs, {})
 
+  def test_continuous_eval_exits_on_max_idle_secs_without_marker(self):
+    if keras.backend.backend() != "jax":
+      self.skipTest("Continuous eval is only supported on the Jax backend.")
+
+    model_dir = self.create_tempdir().full_path
+    train_trainer = keras_trainer.KerasTrainer(
+        distribution=keras.distribution.DataParallel(),
+        train_steps=2,
+        steps_per_eval=1,
+        steps_per_loop=2,
+        model_dir=model_dir,
+    )
+    core.run_experiment(
+        core.Experiment(_KerasTask(), train_trainer), core.Trainer.Mode.TRAIN
+    )
+    # Simulate a PARTIALLY_FAILED trainer crash where marker.txt was never
+    # written after the last checkpoint.
+    marker_path = os.path.join(model_dir, core.TRAINING_COMPLETE_MARKER_FILE)
+    os.remove(marker_path)
+    self.assertFalse(os.path.exists(marker_path))
+    keras.backend.clear_session()
+
+    eval_trainer = keras_trainer.KerasTrainer(
+        distribution=keras.distribution.DataParallel(),
+        steps_per_eval=1,
+        steps_per_loop=2,
+        model_dir=model_dir,
+        continuous_eval_timeout=1,
+        continuous_eval_max_idle_secs=0.5,
+    )
+    with self.assertLogs(level="WARNING") as log:
+      history = core.run_experiment(
+          core.Experiment(_KerasTask(), eval_trainer),
+          core.Trainer.Mode.CONTINUOUS_EVAL,
+      )
+    self.assertIsNotNone(history)
+    self.assertIn("loss", history)
+    self.assertTrue(
+        any("continuous_eval_max_idle_secs" in entry for entry in log.output),
+        msg=f"Expected idle-timeout warning in logs, got {log.output}",
+    )
+
   def test_legacy_checkpoint_format_deprecated(self):
     model_dir = self.create_tempdir().full_path
 

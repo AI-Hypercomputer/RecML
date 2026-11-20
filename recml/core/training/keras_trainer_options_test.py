@@ -119,6 +119,13 @@ class KerasTrainerOptionsTest(absltest.TestCase):
     ):
       _trainer(self._tmpdir, device_prefetch_depth=-1)
 
+  def test_rejects_non_positive_continuous_eval_max_idle_secs(self):
+    for bad_val in (0, -5.0):
+      with self.assertRaisesRegex(
+          ValueError, "continuous_eval_max_idle_secs must be > 0"
+      ):
+        _trainer(self._tmpdir, continuous_eval_max_idle_secs=bad_val)
+
   def test_default_leaves_the_model_unchanged(self):
     trainer = _trainer(self._tmpdir)
     model = _DummyModel()
