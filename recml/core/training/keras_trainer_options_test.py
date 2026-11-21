@@ -55,8 +55,17 @@ class _DummyModel:
       return
     self.train_function = lambda state, it: (next(it), state)
 
-  def fit(self, dataset, epochs, steps_per_epoch, callbacks, initial_epoch):
-    del epochs, initial_epoch
+  def fit(
+      self,
+      dataset,
+      epochs,
+      steps_per_epoch,
+      callbacks,
+      initial_epoch,
+      validation_data=None,
+      validation_steps=None,
+  ):
+    del epochs, initial_epoch, validation_data, validation_steps
     self.make_train_function()
     fn = self.train_function
     self.seen_in_fit.append((fn, callbacks))
@@ -338,6 +347,36 @@ class KerasTrainerOptionsTest(absltest.TestCase):
       with self.assertRaisesRegex(RuntimeError, "stop"):
         trainer.train_and_evaluate(task)
     self.assertIn("skip_batch_logs", logs.output[0])
+
+  def test_train_and_evaluate_skips_train_throughput_callback_with_warning(
+      self,
+  ):
+    throughput_cb = keras_utils.TrainThroughputCallback(
+        global_batch_size=8,
+        padded_seq_len=1024,
+        valid_seq_len_key="labels/count_seq_len",
+        device_count=1,
+    )
+    other_cb = keras.callbacks.Callback()
+    trainer = _trainer(
+        self._tmpdir,
+        train_callbacks=[throughput_cb, other_cb],
+    )
+    model = _DummyModel()
+    task = _task(model, [])
+    task.create_dataset = lambda training: tf.data.Dataset.from_tensor_slices(
+        np.zeros((10, 1), dtype=np.float32)
+    )
+
+    with self.assertLogs(level="WARNING") as logs:
+      trainer.train_and_evaluate(task)
+
+    self.assertTrue(
+        any("TrainThroughputCallback" in msg for msg in logs.output)
+    )
+    _, callbacks_in_fit = model.seen_in_fit[0]
+    self.assertNotIn(throughput_cb, callbacks_in_fit)
+    self.assertIn(other_cb, callbacks_in_fit)
 
   def test_skip_batch_logs_uses_the_zero_sync_list(self):
     trainer = _trainer(self._tmpdir, skip_batch_logs=True)

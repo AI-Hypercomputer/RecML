@@ -2130,12 +2130,14 @@ class _TokenThroughputCallback(MetricsCallback):
   In unpacked runs each row holds one example (`examples_per_row = 1`), so
   `examples_per_step == global_batch_size` and `valid_row_seq_len ==
   valid_seq_len`. In batch-packed runs, `global_batch_size` is the number of
-  packed sequence rows per step while `valid_seq_len_key` is still normalized
-  per example (user); pass `examples_per_row` (or `examples_per_step_key` when
-  the packed example count varies per step) so `examples_per_sec_per_device`,
-  `k_valid_tokens_per_sec_per_device`, and `packing_efficiency_pct` reflect the
-  packed examples while `k_tokens_per_sec_per_device` reflects the emitted
-  padded rows.
+  packed sequence rows per step; pass `examples_per_row` (or
+  `examples_per_step_key` when the packed example count varies per step) so
+  `examples_per_sec_per_device` reflects the packed examples while
+  `k_tokens_per_sec_per_device` reflects the emitted padded rows. When the
+  number of examples packed per row varies across steps, pass a per-row valid
+  token metric with `valid_seq_len_per_row=True` so `valid_row_seq_len` is read
+  directly instead of multiplying a per-example mean by `examples_per_step`
+  (which suffers ratio-of-means inflation when row counts vary).
 
   `k_valid / k_tokens == packing_efficiency_pct / 100` by construction. So the
   token and packing metrics have only two degrees of freedom, and the fact that
@@ -2150,14 +2152,19 @@ class _TokenThroughputCallback(MetricsCallback):
   startup or upon recovery after a preemption) therefore includes JIT
   compilation time and reads lower than steady-state windows.
 
-  The callback never reads `logs` in its batch hooks and sets `async_safe`.
-  Thus Keras can keep dispatching batch callbacks asynchronously. Without
-  `async_safe`, one callback with a batch hook makes Keras convert all the
-  step logs to Python floats on the main thread on every step, which blocks
+  The callback never reads `logs` in its batch hooks and sets `async_safe` and
+  `requires_batch_logs = False`. Thus standard Keras `CallbackList` can keep
+  dispatching batch callbacks asynchronously, and
+  `KerasTrainer(skip_batch_logs=True)` continues to skip per-step host
+  conversions of `logs` (running batch hooks synchronously with `logs=None`).
+  Without `async_safe`, one callback with a batch hook makes Keras convert all
+  the step logs to Python floats on the main thread on every step, which blocks
   the accelerator.
 
   Subclasses select the Keras hooks that open and close the window.
   """
+
+  requires_batch_logs: bool = False
 
   def __init__(
       self,
@@ -2168,6 +2175,7 @@ class _TokenThroughputCallback(MetricsCallback):
       device_count: int | None = None,
       examples_per_row: int = 1,
       examples_per_step_key: str | None = None,
+      valid_seq_len_per_row: bool = False,
   ):
     """Initializes the callback.
 
@@ -2176,7 +2184,8 @@ class _TokenThroughputCallback(MetricsCallback):
         (equals examples per step when `examples_per_row == 1`).
       padded_seq_len: Padded sequence length of one row.
       valid_seq_len_key: Key of the model metric that holds the mean number of
-        non-padding tokens per example. A per-batch sum gives wrong values. If
+        non-padding tokens per example (or per sequence row when
+        `valid_seq_len_per_row=True`). A per-batch sum gives wrong values. If
         the result is out of range, the token metrics are skipped and an error
         is logged.
       device_count: Global accelerator count. If None, it is read from
@@ -2188,6 +2197,10 @@ class _TokenThroughputCallback(MetricsCallback):
       examples_per_step_key: Optional key in `logs` holding the mean number of
         examples processed per step over the window (for dynamic batch packing
         that drops or carries over examples).
+      valid_seq_len_per_row: Whether `valid_seq_len_key` already measures the
+        mean valid tokens per sequence row instead of per example. Set to True
+        for dynamic batch packing where the number of examples per row varies
+        across steps.
     """
     super().__init__()
     self.async_safe = True
@@ -2205,6 +2218,7 @@ class _TokenThroughputCallback(MetricsCallback):
         "examples_per_row", examples_per_row
     )
     self._examples_per_step_key = examples_per_step_key
+    self._valid_seq_len_per_row = valid_seq_len_per_row
     self._window_start = 0.0
     self._steps = 0
     self._warned_missing_key = False
@@ -2264,20 +2278,25 @@ class _TokenThroughputCallback(MetricsCallback):
       examples_per_step = float(
           self._global_batch_size * self._examples_per_row
       )
-    valid_row_seq_len = (
-        valid_seq_len * examples_per_step / self._global_batch_size
-    )
+    if self._valid_seq_len_per_row:
+      valid_row_seq_len = valid_seq_len
+    else:
+      valid_row_seq_len = (
+          valid_seq_len * examples_per_step / self._global_batch_size
+      )
     packing_efficiency_pct = valid_row_seq_len / self._padded_seq_len * 100.0
     if not 0.0 <= packing_efficiency_pct <= 100.0:
       # Do not stop a long training job because of a logging metric, and do
       # not write values that are wrong by a factor of the batch size.
+      unit = "per-row" if self._valid_seq_len_per_row else "per-example"
       logging.error(
           "%s: packing_efficiency_pct=%.1f is not in [0, 100]. %s is probably"
-          " a per-batch sum, not a per-example mean. Throughput metrics are"
+          " a per-batch sum, not a %s mean. Throughput metrics are"
           " skipped.",
           type(self).__name__,
           packing_efficiency_pct,
           self._valid_seq_len_key,
+          unit,
       )
       return
     # This metric has no time term, so record it even without a step rate.
@@ -2305,7 +2324,7 @@ class _TokenThroughputCallback(MetricsCallback):
     self._record(
         logs,
         "throughput/k_valid_tokens_per_sec_per_device",
-        examples_per_sec_per_device * valid_seq_len / 1000.0,
+        rows_per_sec_per_device * valid_row_seq_len / 1000.0,
     )
     self._record(
         logs,
@@ -2319,14 +2338,15 @@ class TrainThroughputCallback(_TokenThroughputCallback):
 
   The window starts in `on_epoch_begin` and ends in `on_epoch_end`, i.e. it
   covers `steps_per_loop` steps. In-fit validation (`model.fit(
-  validation_data=...)` or `KerasTrainer.train_and_evaluate`) is not supported
-  and raises a `ValueError`: production runs train and evaluate in separate
-  jobs, and the JAX `fit` loop does not wait for pending train steps before
-  validation starts, so the window could not exclude validation time.
+  validation_data=...)`) is not supported and raises a `ValueError`: production
+  runs train and evaluate in separate jobs, and the JAX `fit` loop does not
+  wait for pending train steps before validation starts, so the window could
+  not exclude validation time. `KerasTrainer.train_and_evaluate` skips this
+  callback with a warning.
 
   See `_TokenThroughputCallback.__init__` for constructor arguments
   (`global_batch_size`, `padded_seq_len`, `valid_seq_len_key`, `device_count`,
-  `examples_per_row`, `examples_per_step_key`).
+  `examples_per_row`, `examples_per_step_key`, `valid_seq_len_per_row`).
   """
 
   def on_epoch_begin(
@@ -2362,7 +2382,7 @@ class EvalThroughputCallback(_TokenThroughputCallback):
 
   See `_TokenThroughputCallback.__init__` for constructor arguments
   (`global_batch_size`, `padded_seq_len`, `valid_seq_len_key`, `device_count`,
-  `examples_per_row`, `examples_per_step_key`).
+  `examples_per_row`, `examples_per_step_key`, `valid_seq_len_per_row`).
   """
 
   def on_test_begin(self, logs: dict[str, Any] | None = None) -> None:

@@ -495,6 +495,17 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
     model = task.create_model(**self._maybe_get_model_kws(task, train_dataset))
 
+    callbacks = [
+        cbk
+        for cbk in self.train_callbacks
+        if not isinstance(cbk, keras_utils.TrainThroughputCallback)
+    ]
+    if len(callbacks) != len(self.train_callbacks):
+      logging.warning(
+          "TrainThroughputCallback only applies to `train`; skipping it in"
+          " `train_and_evaluate`."
+      )
+
     history = model.fit(
         train_dataset,
         validation_data=eval_dataset,
@@ -502,7 +513,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
         steps_per_epoch=self._steps_per_loop,
         # Explicitly set to None for deterministic evaluation.
         validation_steps=None,
-        callbacks=self.train_callbacks,
+        callbacks=callbacks,
         initial_epoch=1,
     )
     model.summary(print_fn=logging.info)

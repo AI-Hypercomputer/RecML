@@ -2711,17 +2711,20 @@ def _throughput_callback(
     *,
     global_batch_size: int = _GLOBAL_BATCH_SIZE,
     padded_seq_len: int = _PADDED_SEQ_LEN,
+    valid_seq_len_key: str = _SEQ_LEN_KEY,
     device_count: int | None = _DEVICE_COUNT,
     examples_per_row: int = 1,
     examples_per_step_key: str | None = None,
+    valid_seq_len_per_row: bool = False,
 ):
   return callback_cls(
       global_batch_size=global_batch_size,
       padded_seq_len=padded_seq_len,
-      valid_seq_len_key=_SEQ_LEN_KEY,
+      valid_seq_len_key=valid_seq_len_key,
       device_count=device_count,
       examples_per_row=examples_per_row,
       examples_per_step_key=examples_per_step_key,
+      valid_seq_len_per_row=valid_seq_len_per_row,
   )
 
 
@@ -2854,6 +2857,60 @@ class TrainThroughputCallbackTest(absltest.TestCase):
     callback = _throughput_callback(keras_utils.TrainThroughputCallback)
 
     self.assertTrue(callback.async_safe)
+
+  def test_does_not_require_batch_logs(self):
+    # Otherwise `ZeroSyncCallbackList` (`skip_batch_logs=True`) converts the
+    # step logs to Python floats on every step during training.
+    callback = _throughput_callback(keras_utils.TrainThroughputCallback)
+
+    self.assertFalse(callback.requires_batch_logs)
+
+  def test_valid_seq_len_per_row_with_dynamic_examples_per_step(self):
+    # 8 packed rows/step of length 24 across 4 devices, 10 steps in 5s =
+    # 4 rows/sec/device. Dynamic packing placed 28 examples/step (14 examples/
+    # sec/device) while filling 100% of each row (24 valid tokens/row).
+    logs = {
+        "packing/row_seq_len": 24.0,
+        "packing/users_placed": 28.0,
+    }
+    callback = _throughput_callback(
+        keras_utils.TrainThroughputCallback,
+        global_batch_size=8,
+        padded_seq_len=24,
+        valid_seq_len_key="packing/row_seq_len",
+        device_count=4,
+        examples_per_row=4,
+        examples_per_step_key="packing/users_placed",
+        valid_seq_len_per_row=True,
+    )
+
+    _run_train_epoch(callback, logs)
+
+    self.assertAlmostEqual(logs["throughput/examples_per_sec_per_device"], 14.0)
+    self.assertAlmostEqual(
+        logs["throughput/k_valid_tokens_per_sec_per_device"], 0.096
+    )
+    self.assertAlmostEqual(
+        logs["throughput/k_tokens_per_sec_per_device"], 0.096
+    )
+    self.assertAlmostEqual(logs["throughput/packing_efficiency_pct"], 100.0)
+
+  def test_valid_seq_len_per_row_skips_out_of_range_values(self):
+    logs = {"packing/row_seq_len": 48.0}
+    callback = _throughput_callback(
+        keras_utils.TrainThroughputCallback,
+        global_batch_size=8,
+        padded_seq_len=24,
+        valid_seq_len_key="packing/row_seq_len",
+        device_count=4,
+        valid_seq_len_per_row=True,
+    )
+
+    with self.assertLogs(level="ERROR") as log:
+      _run_train_epoch(callback, logs)
+
+    self.assertIn("per-row mean", log.output[0])
+    self.assertEmpty(callback.latest_metrics)
 
   def test_step_count_comes_from_keras_end_step(self):
     # One batch end with end step 99 means that 100 steps completed. This is

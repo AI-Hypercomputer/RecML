@@ -183,6 +183,55 @@ class BatchCallbacksTest(absltest.TestCase):
     custom = _CustomSummary(log_dir=self._tmpdir, steps_per_epoch=1)
     self.assertEqual(batch_callbacks.without_batch_hooks([custom]), [custom])
 
+  def test_zero_sync_list_skips_pythonify_logs_for_train_throughput_callback(
+      self,
+  ):
+    throughput_cb = keras_utils.TrainThroughputCallback(
+        global_batch_size=8,
+        padded_seq_len=1024,
+        valid_seq_len_key="labels/count_seq_len",
+        device_count=4,
+    )
+    trainer_callbacks = [
+        throughput_cb,
+        *batch_callbacks.without_batch_hooks(_train_callbacks(self._tmpdir)),
+    ]
+    with self.assertNoLogs(level="INFO"):
+      cb_list = batch_callbacks.ZeroSyncCallbackList(
+          trainer_callbacks,
+          add_history=True,
+          add_progbar=True,
+          verbose=1,
+      )
+
+    epoch_logs = {"labels/count_seq_len": 512.0}
+    with mock.patch.object(
+        keras_utils.time, "time", autospec=True, side_effect=[0.0, 2.0]
+    ):
+      throughput_cb.on_epoch_begin(0)
+      with mock.patch.object(
+          python_utils,
+          "pythonify_logs",
+          autospec=True,
+          wraps=python_utils.pythonify_logs,
+      ) as pythonify:
+        cb_list.on_train_batch_end(0, logs={"loss": 1.0})
+        cb_list.on_train_batch_end(4, logs={"loss": 1.0})
+      pythonify.assert_not_called()
+      throughput_cb.on_epoch_end(0, logs=epoch_logs)
+
+    # 5 steps / 2.0 s / 4 devices = 0.625 steps/s/device -> 5 examples/s/device
+    # -> 2.56k valid tokens/s/device and 50% packing efficiency.
+    self.assertAlmostEqual(
+        throughput_cb.latest_metrics[
+            "throughput/k_valid_tokens_per_sec_per_device"
+        ],
+        2.56,
+    )
+    self.assertAlmostEqual(
+        throughput_cb.latest_metrics["throughput/packing_efficiency_pct"], 50.0
+    )
+
 
 if __name__ == "__main__":
   absltest.main()
