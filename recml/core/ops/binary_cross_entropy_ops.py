@@ -89,11 +89,16 @@ _BYTES_IN_MB = 1024 * 1024
 
 _RESERVE_MB: float = 16.0
 _TARGET_RATIO: float = 0.8
+_MEDIUM_TARGET_RATIO: float = 0.65
 _BLOCK_N: int = 128
+_FWD_MAX_CHUNK_N: int = 2048
+_MAX_SMEM_POS_ENTRIES: int = 163_840
+_MAX_PACKED_DIM: int = 32_768
 _VOCAB_VMEM_TILES: int = 5
 _LOGIT_VMEM_TILES: int = 4
 _TOKEN_VMEM_TILES: int = 3
 _VOCAB_VMEM_SHARE: float = 0.5
+_MEDIUM_VOCAB_VMEM_SHARE: float = 0.42
 _SMALL_VMEM_SHARE: float = 0.3
 _MIN_CHUNK_TILES: int = 4
 
@@ -360,6 +365,316 @@ def _bce_fwd_chunk(
   return loss_sum, logits, targets_chunk, valid_mask
 
 
+def _select_fwd_block_n(chunk_n: int, lane: int) -> int:
+  """Picks a pipelined token sub-block dividing `chunk_n` for forward MXU util."""
+  for candidate in (512, 256):
+    if candidate >= lane and chunk_n >= candidate and chunk_n % candidate == 0:
+      return candidate
+  return min(chunk_n, lane)
+
+
+def _bce_fwd_kernel(
+    act_ref: jax.Ref,  # [chunk_n, padded_d] VMEM
+    emb_ref: jax.Ref,  # [block_v, padded_d] VMEM
+    tgt_ref: jax.Ref | None,  # [l_padded, chunk_n] VMEM or None
+    loss_out_ref: jax.Ref,  # [num_sublanes, chunk_n] VMEM output
+    tp_out_ref: jax.Ref | None,
+    fp_out_ref: jax.Ref | None,
+    fn_out_ref: jax.Ref | None,
+    tn_out_ref: jax.Ref | None,
+    loss_scratch: jax.Ref,  # [num_sublanes, chunk_n] VMEM scratch
+    tp_scratch: jax.Ref | None,
+    fp_scratch: jax.Ref | None,
+    fn_scratch: jax.Ref | None,
+    tn_scratch: jax.Ref | None,
+    *,
+    chunk_n: int,
+    fwd_block_n: int,
+    block_v: int,
+    v_blocks: int,
+    vocab: int,
+    labels: int,
+    compute_metrics: bool,
+) -> None:
+  """2D-tiled Pallas TPU forward kernel with full-block MXU/VPU pipelining."""
+  j = pl.program_id(1)
+  num_sublanes = loss_scratch.shape[0]
+
+  @pl.when(j == 0)
+  def _init_accumulators():
+    z = jnp.zeros(loss_scratch.shape, jnp.float32)
+    loss_scratch[...] = z
+    if compute_metrics:
+      assert fp_scratch is not None
+      fp_scratch[...] = z
+      if labels > 0:
+        assert (
+            tp_scratch is not None
+            and fn_scratch is not None
+            and tn_scratch is not None
+        )
+        tp_scratch[...] = z
+        fn_scratch[...] = z
+        tn_scratch[...] = z
+
+  n_sub_blocks = chunk_n // fwd_block_n
+  col_ids = j * block_v + jax.lax.broadcasted_iota(jnp.int32, (1, block_v), 1)
+  valid_v = col_ids < vocab if vocab % block_v != 0 else None
+  emb_block = (
+      jnp.where(valid_v.T, emb_ref[...], 0.0)
+      if valid_v is not None
+      else emb_ref[...]
+  )
+
+  def n_loop_body(nc: jax.Array, _: None) -> None:
+    n_slice = pl.ds(nc * fwd_block_n, fwd_block_n)
+    act_sub = act_ref[n_slice, :]
+    logits = jax.lax.dot(
+        act_sub,
+        emb_block,
+        dimension_numbers=(((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+        precision=jax.lax.Precision.DEFAULT,
+    )
+    loss_chunk = jnp.maximum(logits, 0.0) + jnp.log1p(jnp.exp(-jnp.abs(logits)))
+
+    y_true = None
+    if labels > 0:
+      assert tgt_ref is not None
+      tgt_sub = tgt_ref[:, n_slice]
+      y_true = jnp.zeros((fwd_block_n, block_v), dtype=jnp.bool_)
+      for l_idx in range(labels):
+        y_true = y_true | (tgt_sub[l_idx : l_idx + 1, :].T == col_ids)
+      loss_chunk = loss_chunk - jnp.where(y_true, logits, 0.0)
+
+    if valid_v is not None:
+      loss_chunk = jnp.where(valid_v, loss_chunk, 0.0)
+
+    loss_1d = jnp.sum(loss_chunk, axis=-1)
+    loss_scratch[:, n_slice] = loss_scratch[:, n_slice] + jnp.broadcast_to(
+        loss_1d[None, :], (num_sublanes, fwd_block_n)
+    )
+    if not compute_metrics:
+      return
+
+    preds = logits > 0.0
+    if valid_v is not None:
+      preds = preds & valid_v
+    assert fp_scratch is not None
+    if labels == 0:
+      fp_1d = jnp.sum(preds, axis=-1).astype(jnp.float32)
+      fp_scratch[:, n_slice] = fp_scratch[:, n_slice] + jnp.broadcast_to(
+          fp_1d[None, :], (num_sublanes, fwd_block_n)
+      )
+      return
+
+    assert (
+        y_true is not None
+        and tp_scratch is not None
+        and fn_scratch is not None
+        and tn_scratch is not None
+    )
+    tgt_masked = y_true & valid_v if valid_v is not None else y_true
+    tp_chunk = tgt_masked & preds
+    fp_chunk = preds ^ tp_chunk
+    fn_chunk = tgt_masked ^ tp_chunk
+    tn_unmasked = ~(tgt_masked | preds)
+    tn_chunk = tn_unmasked & valid_v if valid_v is not None else tn_unmasked
+
+    tp_1d = jnp.sum(tp_chunk, axis=-1).astype(jnp.float32)
+    fp_1d = jnp.sum(fp_chunk, axis=-1).astype(jnp.float32)
+    fn_1d = jnp.sum(fn_chunk, axis=-1).astype(jnp.float32)
+    tn_1d = jnp.sum(tn_chunk, axis=-1).astype(jnp.float32)
+    tp_scratch[:, n_slice] = tp_scratch[:, n_slice] + jnp.broadcast_to(
+        tp_1d[None, :], (num_sublanes, fwd_block_n)
+    )
+    fp_scratch[:, n_slice] = fp_scratch[:, n_slice] + jnp.broadcast_to(
+        fp_1d[None, :], (num_sublanes, fwd_block_n)
+    )
+    fn_scratch[:, n_slice] = fn_scratch[:, n_slice] + jnp.broadcast_to(
+        fn_1d[None, :], (num_sublanes, fwd_block_n)
+    )
+    tn_scratch[:, n_slice] = tn_scratch[:, n_slice] + jnp.broadcast_to(
+        tn_1d[None, :], (num_sublanes, fwd_block_n)
+    )
+
+  if n_sub_blocks == 1:
+    n_loop_body(jnp.int32(0), None)
+  else:
+    jax.lax.fori_loop(0, n_sub_blocks, n_loop_body, None)
+
+  @pl.when(j == v_blocks - 1)
+  def _store_outputs():
+    loss_out_ref[...] = loss_scratch[...]
+    if compute_metrics:
+      assert fp_out_ref is not None and fp_scratch is not None
+      fp_out_ref[...] = fp_scratch[...]
+      if labels > 0:
+        assert (
+            tp_out_ref is not None
+            and fn_out_ref is not None
+            and tn_out_ref is not None
+            and tp_scratch is not None
+            and fn_scratch is not None
+            and tn_scratch is not None
+        )
+        tp_out_ref[...] = tp_scratch[...]
+        fn_out_ref[...] = fn_scratch[...]
+        tn_out_ref[...] = tn_scratch[...]
+
+
+def _bce_fwd_pallas(
+    config: BCEConfig,
+    activations: jt.Float[jt.Array, "B N D"],
+    embeddings: jt.Float[jt.Array, "V D"],
+    targets: jt.Int[jt.Array, "B N L"],
+) -> (
+    tuple[
+        jt.Float[jt.Array, "B N"],
+        jt.Float[jt.Array, "B N"],
+        jt.Float[jt.Array, "B N"],
+        jt.Float[jt.Array, "B N"],
+        jt.Float[jt.Array, "B N"],
+    ]
+    | jt.Float[jt.Array, "B N"]
+):
+  """Computes forward BCE loss and optional metrics using a 2D Pallas kernel."""
+  batch, seq_len, hidden = activations.shape
+  vocab = embeddings.shape[0]
+  n = batch * seq_len
+  lane = _pallas_lane()
+  num_sublanes = _pallas_sublane()
+
+  if n <= _FWD_MAX_CHUNK_N:
+    chunk_n = pl.align_to(max(n, lane), lane)
+  else:
+    chunk_n = _balanced_chunk_n(n, _FWD_MAX_CHUNK_N)
+  n_outer = (n + chunk_n - 1) // chunk_n
+  padded_n = n_outer * chunk_n
+  fwd_block_n = _select_fwd_block_n(chunk_n, lane)
+
+  fwd_cfg = dataclasses.replace(config, block_n=fwd_block_n)
+  padded_d, block_v = _effective_block_v(fwd_cfg, hidden, vocab)
+  v_blocks = (vocab + block_v - 1) // block_v
+  vocab_hbm = (
+      v_blocks * block_v
+      if _pallas_interpret()
+      else max(pl.align_to(vocab, num_sublanes), block_v)
+  )
+
+  labels = 0 if config.optimize_large_l else targets.shape[-1]
+  activations_2d = jnp.reshape(activations, (n, hidden))
+  targets_2d = jnp.reshape(targets, (n, -1))
+
+  if padded_n > n or padded_d > hidden:
+    activations_padded = jnp.pad(
+        activations_2d, ((0, padded_n - n), (0, padded_d - hidden))
+    )
+  else:
+    activations_padded = activations_2d
+
+  if vocab_hbm > vocab or padded_d > hidden:
+    embeddings_padded = jnp.pad(
+        embeddings, ((0, vocab_hbm - vocab), (0, padded_d - hidden))
+    )
+  else:
+    embeddings_padded = embeddings
+
+  if labels > 0:
+    l_padded = max(num_sublanes, pl.align_to(labels, num_sublanes))
+    targets_t = jnp.transpose(targets_2d[:, :labels], (1, 0))
+    if l_padded > labels or padded_n > n:
+      targets_padded = jnp.pad(
+          targets_t,
+          ((0, l_padded - labels), (0, padded_n - n)),
+          constant_values=-1,
+      ).astype(jnp.int32)
+    else:
+      targets_padded = targets_t.astype(jnp.int32)
+    tgt_spec = pl.BlockSpec((l_padded, chunk_n), lambda i, j: (0, i))
+  else:
+    targets_padded = None
+    tgt_spec = None
+
+  vec_shape = jax.ShapeDtypeStruct((num_sublanes, padded_n), jnp.float32)
+  vec_spec = pl.BlockSpec((num_sublanes, chunk_n), lambda i, j: (0, i))
+  vec_vmem = pltpu.VMEM((num_sublanes, chunk_n), jnp.float32)
+
+  if not config.compute_metrics:
+    out_shape = [vec_shape, None, None, None, None]
+    out_specs = [vec_spec, None, None, None, None]
+    scratch_shapes = [vec_vmem, None, None, None, None]
+  elif labels == 0:
+    out_shape = [vec_shape, None, vec_shape, None, None]
+    out_specs = [vec_spec, None, vec_spec, None, None]
+    scratch_shapes = [vec_vmem, None, vec_vmem, None, None]
+  else:
+    out_shape = [vec_shape, vec_shape, vec_shape, vec_shape, vec_shape]
+    out_specs = [vec_spec, vec_spec, vec_spec, vec_spec, vec_spec]
+    scratch_shapes = [vec_vmem, vec_vmem, vec_vmem, vec_vmem, vec_vmem]
+
+  loss_out, tp_out, fp_out, fn_out, tn_out = pl.pallas_call(
+      functools.partial(
+          _bce_fwd_kernel,
+          chunk_n=chunk_n,
+          fwd_block_n=fwd_block_n,
+          block_v=block_v,
+          v_blocks=v_blocks,
+          vocab=vocab,
+          labels=labels,
+          compute_metrics=config.compute_metrics,
+      ),
+      out_shape=out_shape,
+      grid=(n_outer, v_blocks),
+      in_specs=[
+          pl.BlockSpec((chunk_n, padded_d), lambda i, j: (i, 0)),
+          pl.BlockSpec((block_v, padded_d), lambda i, j: (j, 0)),
+          tgt_spec,
+      ],
+      out_specs=out_specs,
+      scratch_shapes=scratch_shapes,
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel", "arbitrary"),
+          vmem_limit_bytes=_pallas_vmem_budget(),
+      ),
+      interpret=_pallas_interpret(),
+  )(activations_padded, embeddings_padded, targets_padded)
+
+  loss_final = loss_out[0, :n]
+  if not config.compute_metrics:
+    if config.optimize_large_l:
+      loss_final = (
+          loss_final
+          + _fwd_pos_correction(activations_2d, embeddings, targets_2d)[0]
+      )
+    return jnp.reshape(loss_final, (batch, seq_len))
+
+  assert fp_out is not None
+  fp_final = fp_out[0, :n]
+  if labels == 0:
+    delta_loss, tp_final, num_pos = _fwd_pos_correction(
+        activations_2d, embeddings, targets_2d
+    )
+    loss_final = loss_final + delta_loss
+    tn_zero = float(vocab) - fp_final
+    fp_final = fp_final - tp_final
+    fn_final = num_pos - tp_final
+    tn_final = tn_zero - fn_final
+  else:
+    assert tp_out is not None and fn_out is not None and tn_out is not None
+    tp_final = tp_out[0, :n]
+    fn_final = fn_out[0, :n]
+    tn_final = tn_out[0, :n]
+
+  return (
+      jnp.reshape(loss_final, (batch, seq_len)),
+      jnp.reshape(tp_final, (batch, seq_len)),
+      jnp.reshape(fp_final, (batch, seq_len)),
+      jnp.reshape(fn_final, (batch, seq_len)),
+      jnp.reshape(tn_final, (batch, seq_len)),
+  )
+
+
 def _bce_fwd_local(
     config: BCEConfig,
     activations: jt.Float[jt.Array, "B N D"],
@@ -376,6 +691,9 @@ def _bce_fwd_local(
     | jt.Float[jt.Array, "B N"]
 ):
   """Computes the sum of Loss(x_v, target_v) over all V block-wise, and metrics."""
+  if config.use_pallas and not _pallas_interpret():
+    return _bce_fwd_pallas(config, activations, embeddings, targets)
+
   block_v = config.block_v
   batch, seq_len, hidden = activations.shape
   vocab = embeddings.shape[0]
@@ -489,6 +807,113 @@ def _cut_binary_cross_entropy(
   return outputs
 
 
+def _run_fwd_unsharded(
+    config: BCEConfig,
+    activations: jt.Float[jt.Array, "... B N D"],
+    embeddings: jt.Float[jt.Array, "V D"],
+    targets: jt.Int[jt.Array, "... B N L"],
+) -> (
+    tuple[
+        jt.Float[jt.Array, "... B N"],
+        jt.Float[jt.Array, "... B N"],
+        jt.Float[jt.Array, "... B N"],
+        jt.Float[jt.Array, "... B N"],
+        jt.Float[jt.Array, "... B N"],
+    ]
+    | jt.Float[jt.Array, "... B N"]
+):
+  """Runs `_bce_fwd_local` on per-shard 3D or 4D inputs."""
+  if activations.ndim == 4:
+    targets_in_axis = None if targets.ndim == 3 else 0
+    fwd_vmap = jax.vmap(
+        functools.partial(_bce_fwd_local, config),
+        in_axes=(0, None, targets_in_axis),
+    )
+    return fwd_vmap(activations, embeddings, targets)
+  return _bce_fwd_local(config, activations, embeddings, targets)
+
+
+def _bce_fwd_sharded(
+    config: BCEConfig,
+    replicated_activations: jt.Float[jt.Array, "... B N D"],
+    embeddings: jt.Float[jt.Array, "V D"],
+    targets: jt.Int[jt.Array, "... B N L"],
+) -> (
+    tuple[
+        jt.Float[jt.Array, "... B N"],
+        jt.Float[jt.Array, "... B N"],
+        jt.Float[jt.Array, "... B N"],
+        jt.Float[jt.Array, "... B N"],
+        jt.Float[jt.Array, "... B N"],
+    ]
+    | jt.Float[jt.Array, "... B N"]
+):
+  """Sharding-aware dispatcher wrapping Pallas forward in `jax.shard_map`."""
+  if not config.use_pallas or _pallas_interpret():
+    return _run_fwd_unsharded(
+        config, replicated_activations, embeddings, targets
+    )
+
+  mesh = None
+  act_spec = None
+  if config.mesh is not None and config.act_spec is not None:
+    mesh = config.mesh
+    act_spec = config.act_spec
+    is_sharded = not mesh.empty
+  else:
+    act_sharding = _get_sharding(replicated_activations)
+    emb_sharding = _get_sharding(embeddings)
+    if (
+        isinstance(act_sharding, jax.sharding.NamedSharding)
+        and not act_sharding.mesh.empty
+    ):
+      mesh = act_sharding.mesh
+      act_spec = act_sharding.spec
+      is_sharded = True
+    elif (
+        isinstance(emb_sharding, jax.sharding.NamedSharding)
+        and not emb_sharding.mesh.empty
+    ):
+      mesh = emb_sharding.mesh
+      act_spec = jax.sharding.PartitionSpec()
+      is_sharded = True
+    else:
+      is_sharded = False
+
+  if not is_sharded:
+    return _run_fwd_unsharded(
+        config, replicated_activations, embeddings, targets
+    )
+
+  assert mesh is not None and act_spec is not None
+  full_act_spec = tuple(act_spec) + (None,) * (
+      replicated_activations.ndim - len(act_spec)
+  )
+  local_act_spec = jax.sharding.PartitionSpec(*(full_act_spec[:-1] + (None,)))
+  if targets.ndim == replicated_activations.ndim:
+    local_tgt_spec = local_act_spec
+  else:
+    local_tgt_spec = jax.sharding.PartitionSpec(*local_act_spec[1:])
+
+  replicated_emb_spec = jax.sharding.PartitionSpec()
+  embeddings_rep = jax.lax.with_sharding_constraint(
+      embeddings, jax.sharding.NamedSharding(mesh, replicated_emb_spec)
+  )
+  pos_out_spec = jax.sharding.PartitionSpec(*local_act_spec[:-1])
+  out_specs = (
+      (pos_out_spec, pos_out_spec, pos_out_spec, pos_out_spec, pos_out_spec)
+      if config.compute_metrics
+      else pos_out_spec
+  )
+  return jax.shard_map(
+      functools.partial(_run_fwd_unsharded, config),
+      mesh=mesh,
+      in_specs=(local_act_spec, replicated_emb_spec, local_tgt_spec),
+      out_specs=out_specs,
+      check_vma=False,
+  )(replicated_activations, embeddings_rep, targets)
+
+
 def _cut_binary_cross_entropy_fwd(
     config: BCEConfig,
     activations: jt.Float[jt.Array, "B N D"],
@@ -511,29 +936,7 @@ def _cut_binary_cross_entropy_fwd(
 ]:
   """Computes forward mode of cut BCE loss."""
   replicated_activations = _replicate_hidden_dim(activations)
-  # `_bce_fwd_local` is written against a 3D `[B, N, D]` array: it unpacks
-  # exactly three dims and flattens `[B, N]` into the `N` rows of the blocked
-  # matmul. 4D `[X, B, N, D]` inputs are therefore mapped rather than reshaped
-  # to `[X * B, N, D]`, which keeps the shared-targets case (3D `[B, N, L]`
-  # alongside 4D activations) a plain `in_axes=None` instead of an explicit
-  # broadcast. The two spellings cost the same memory: vmap vectorizes, so one
-  # chunk of logits is a single `[X, B * N, block_v]` buffer rather than `X`
-  # separate `[B * N, block_v]` tiles, exactly as a reshape to `[X * B, N, D]`
-  # would give `[X * B * N, block_v]`. `block_v` is budgeted against those
-  # `X * B * N` rows (see `_local_tokens`); vmap does not sequence the `X`
-  # slices.
-  if activations.ndim == 4:
-    if targets.ndim == 3:
-      targets_in_axis = None
-    else:
-      targets_in_axis = 0
-    fwd_vmap = jax.vmap(
-        functools.partial(_bce_fwd_local, config),
-        in_axes=(0, None, targets_in_axis),
-    )
-    res = fwd_vmap(replicated_activations, embeddings, targets)
-  else:
-    res = _bce_fwd_local(config, replicated_activations, embeddings, targets)
+  res = _bce_fwd_sharded(config, replicated_activations, embeddings, targets)
   vocab_size = embeddings.shape[0]
   if isinstance(res, tuple):
     loss_y0, tp, fp, fn, tn = res
@@ -811,29 +1214,49 @@ def _pallas_sublane() -> int:
   return 8
 
 
+def _balanced_block_v(
+    vocab: int, max_block_v: int, alignment: int | None = None
+) -> int:
+  """Spreads `vocab` evenly over the fewest aligned blocks <= `max_block_v`."""
+  if vocab <= max_block_v:
+    return vocab
+  if alignment is None:
+    alignment = _pallas_lane()
+  v_blocks = (vocab + max_block_v - 1) // max_block_v
+  if vocab % alignment == 0:
+    tiles = vocab // alignment
+    for k in range(v_blocks, v_blocks + 4):
+      if tiles % k == 0 and (tiles // k) * alignment <= max_block_v:
+        return (tiles // k) * alignment
+  balanced = pl.align_to((vocab + v_blocks - 1) // v_blocks, alignment)
+  return min(max_block_v, balanced)
+
+
 def _vocab_bytes_per_block_v(
     padded_d: int,
     block_n: int,
     dtype: jax.typing.DTypeLike = jnp.float32,
+    logit_vmem_tiles: int = _LOGIT_VMEM_TILES,
 ) -> int:
   """VMEM bytes the backward kernel needs per unit of `block_v`.
 
   Every extra vocabulary column adds `_VOCAB_VMEM_TILES` rows of width
   `padded_d` (embeddings, gradients, accumulator and staging buffers) plus
-  `_LOGIT_VMEM_TILES` columns of height `block_n` (the logits intermediate and
+  `logit_vmem_tiles` columns of height `block_n` (the logits intermediate and
   the temporaries derived from it).
 
   Args:
     padded_d: Hidden size padded up to the vector lane width.
     block_n: Token-axis tile size of the kernel's inner loop.
     dtype: Element type of the activations and embeddings.
+    logit_vmem_tiles: Number of live `[block_n, block_v]` tiles in VMEM.
 
   Returns:
     The number of VMEM bytes consumed by one vocabulary column.
   """
   bytes_per_element = jnp.dtype(dtype).itemsize
   return (
-      _VOCAB_VMEM_TILES * padded_d + _LOGIT_VMEM_TILES * block_n
+      _VOCAB_VMEM_TILES * padded_d + logit_vmem_tiles * block_n
   ) * bytes_per_element
 
 
@@ -842,6 +1265,7 @@ def _max_safe_block_v(
     padded_d: int,
     block_n: int = _BLOCK_N,
     dtype: jax.typing.DTypeLike = jnp.float32,
+    logit_vmem_tiles: int = _LOGIT_VMEM_TILES,
 ) -> int:
   """Returns maximum safe block_v to prevent VMEM OOM.
 
@@ -855,19 +1279,21 @@ def _max_safe_block_v(
     padded_d: Hidden size padded up to the vector lane width.
     block_n: Token-axis tile size of the kernel's inner loop.
     dtype: Element type of the activations and embeddings.
+    logit_vmem_tiles: Number of live `[block_n, block_v]` tiles in VMEM.
 
   Returns:
     The largest MXU-aligned `block_v` that fits the budget.
   """
-  share = (
-      _SMALL_VMEM_SHARE
-      if vmem_budget <= 32 * _BYTES_IN_MB
-      else _VOCAB_VMEM_SHARE
-  )
+  if vmem_budget <= 32 * _BYTES_IN_MB:
+    share = _SMALL_VMEM_SHARE
+  elif vmem_budget <= 48 * _BYTES_IN_MB:
+    share = _MEDIUM_VOCAB_VMEM_SHARE
+  else:
+    share = _VOCAB_VMEM_SHARE
 
   # NOMUTANTS -- max_safe is calculated based on VMEM budget.
   max_safe = int(vmem_budget * share) // _vocab_bytes_per_block_v(
-      padded_d, block_n, dtype
+      padded_d, block_n, dtype, logit_vmem_tiles=logit_vmem_tiles
   )
 
   # Round down to a multiple of the MXU systolic dimension. `pl.align_to`
@@ -877,17 +1303,22 @@ def _max_safe_block_v(
 
 
 def _effective_block_v(
-    config: BCEConfig, hidden: int, vocab: int
+    config: BCEConfig,
+    hidden: int,
+    vocab: int,
+    logit_vmem_tiles: int = _LOGIT_VMEM_TILES,
 ) -> tuple[int, int]:
   """Resolves the padded hidden size and the block_v the kernel will run with.
 
-  Shared by `_bce_bwd_pallas` and `_bce_bwd_pallas_chunked_n` so that the token
-  chunking is sized against the same vocabulary tile the kernel actually uses.
+  Shared by `_bce_fwd_pallas`, `_bce_bwd_pallas`, and
+  `_bce_bwd_pallas_chunked_n` so that the token chunking is sized against the
+  same vocabulary tile the kernel actually uses.
 
   Args:
-    config: Backward-pass configuration supplying the requested `block_v`.
+    config: Configuration supplying the requested `block_v`.
     hidden: Unpadded hidden size ``D`` of the activations.
     vocab: Shard-local vocabulary size ``V``.
+    logit_vmem_tiles: Number of live `[block_n, block_v]` tiles in VMEM.
 
   Returns:
     A ``(padded_d, block_v)`` pair, both aligned to the hardware tiling.
@@ -897,8 +1328,21 @@ def _effective_block_v(
   if config.force_bwd_block_v:
     block_v = pl.align_to(min(config.block_v, vocab), lane)
     return padded_d, min(block_v, pl.align_to(vocab, lane))
-  max_safe = _max_safe_block_v(_pallas_vmem_budget(), padded_d, config.block_n)
-  block_v = pl.align_to(min(config.block_v, vocab, max_safe), lane)
+  max_safe = _max_safe_block_v(
+      _pallas_vmem_budget(),
+      padded_d,
+      config.block_n,
+      logit_vmem_tiles=logit_vmem_tiles,
+  )
+  capped_v = min(config.block_v, vocab, max_safe)
+  if config.block_v > max_safe or (
+      vocab > capped_v and vocab % lane == 0 and vocab % capped_v != 0
+  ):
+    limit_v = capped_v if config.block_v <= max_safe else max_safe
+    balanced_v = _balanced_block_v(vocab, limit_v, lane)
+  else:
+    balanced_v = capped_v
+  block_v = pl.align_to(balanced_v, lane)
   return padded_d, min(block_v, pl.align_to(vocab, lane), max_safe)
 
 
@@ -917,99 +1361,296 @@ def _check_vocab_replicated_in_d(
     )
 
 
+def _build_bwd_pos_buckets(
+    targets_2d: jt.Int[jt.Array, "N L"],
+    vocab: int,
+    block_v: int,
+    v_blocks: int,
+) -> tuple[jt.Int[jt.Array, "B"], jt.Int[jt.Array, "M"]]:
+  """Sorts and buckets unique in-bounds positive targets per v_block tile."""
+  n, num_l = targets_2d.shape
+  safe_t, valid_pos = _unique_valid_targets(targets_2d, vocab)
+  flat_t = jnp.reshape(jnp.where(valid_pos, safe_t, vocab), (-1,)).astype(
+      jnp.int32
+  )
+  flat_tok = jnp.reshape(
+      jax.lax.broadcasted_iota(jnp.int32, (n, num_l), 0), (-1,)
+  )
+  sorted_t, sorted_tok = jax.lax.sort([flat_t, flat_tok], num_keys=1)
+  boundaries = jnp.minimum(
+      jnp.arange(v_blocks + 1, dtype=jnp.int32) * block_v, vocab
+  )
+  offsets = jnp.searchsorted(sorted_t, boundaries, side="left").astype(
+      jnp.int32
+  )
+  local_v = jnp.where(
+      sorted_t < vocab, jnp.remainder(sorted_t, block_v), 0
+  ).astype(jnp.int32)
+  packed = jnp.bitwise_or(jnp.left_shift(local_v, 16), sorted_tok).astype(
+      jnp.int32
+  )
+  padded_packed = jnp.pad(packed, (0, 16), constant_values=0)
+  return offsets, padded_packed
+
+
 def _bce_bwd_kernel(
     emb_ref: jax.Ref,  # [block_v, padded_d] VMEM
     act_ref: jax.Ref,  # [padded_n, padded_d] VMEM, resident across the grid
-    tgt_ref: jax.Ref,  # [l_padded, padded_n] VMEM, resident across the grid
+    tgt_ref: jax.Ref | None,  # [l_padded, padded_n] VMEM or None
     dloss_ref: jax.Ref,  # [1, padded_n] VMEM, resident across the grid
+    pos_offsets_ref: jax.Ref | None,  # [v_blocks + 1] SMEM or None
+    pos_packed_ref: jax.Ref | None,  # [m_pos + 4] SMEM or None
+    pos_scale_ref: jax.Ref | None,  # [padded_n] SMEM or None
     d_emb_ref: jax.Ref,  # [block_v, padded_d] VMEM output block
-    d_act_partials_ref: jax.Ref,  # [1, padded_n, padded_d] VMEM output block
+    d_act_ref: jax.Ref,  # [padded_n, padded_d] VMEM output accumulated across v
     d_emb_scratch: jax.Ref,  # [block_v, padded_d] VMEM scratch
+    d_act_scratch: jax.Ref,  # [padded_n, padded_d] VMEM scratch
+    d_emb_b1: jax.Ref | None,
+    d_emb_b2: jax.Ref | None,
+    d_emb_b3: jax.Ref | None,
+    d_act_b1: jax.Ref | None,
+    d_act_b2: jax.Ref | None,
+    d_act_b3: jax.Ref | None,
     *,
-    block_v: int,
     block_n: int,
+    block_v: int,
+    padded_d: int,
+    num_sublanes: int,
     n_blocks: int,
+    v_blocks: int,
     vocab: int,
     labels: int,
     n_real: int,
+    padded_n: int,
     global_vocab: int,
+    fuse_pos: bool,
+    pos_banks: int,
 ):
-  """Pallas TPU per-shard chunked backward for BCE."""
+  """Pipelined Pallas TPU backward kernel with VMEM d_act & sparse pos fusion."""
   v_idx = pl.program_id(0)
 
-  # Initialize accumulators in VMEM to 0
-  d_emb_scratch[...] = jnp.zeros(d_emb_scratch.shape, jnp.float32)
+  @pl.when(v_idx == 0)
+  def _init_d_act():
+    z_act = jnp.zeros(d_act_scratch.shape, jnp.float32)
+    d_act_scratch[...] = z_act
+    if fuse_pos and pos_banks == 4:
+      assert (
+          d_act_b1 is not None and d_act_b2 is not None and d_act_b3 is not None
+      )
+      d_act_b1[...] = z_act
+      d_act_b2[...] = z_act
+      d_act_b3[...] = z_act
 
-  # Valid vocab mask and local vocab ids: (1, block_v)
-  chunk_indices_local = v_idx * block_v + jnp.arange(block_v)[None, :]
-  valid_vocab_mask = chunk_indices_local < vocab
-  valid_vocab_mask_t = valid_vocab_mask.T
+  z_emb = jnp.zeros(d_emb_scratch.shape, jnp.float32)
+  d_emb_scratch[...] = z_emb
+  if fuse_pos and pos_banks == 4:
+    assert (
+        d_emb_b1 is not None and d_emb_b2 is not None and d_emb_b3 is not None
+    )
+    d_emb_b1[...] = z_emb
+    d_emb_b2[...] = z_emb
+    d_emb_b3[...] = z_emb
 
-  # Load inputs from VMEM
-  emb = emb_ref[...]
-  emb = jnp.where(valid_vocab_mask_t, emb, 0.0)
-
-  # `vocab` is shard-local; the forward normalizes by the global vocab size.
   inv_vocab = 1.0 / global_vocab
-  local_n_iota = jnp.arange(block_n)[:, None]
+  col_ids = v_idx * block_v + jax.lax.broadcasted_iota(
+      jnp.int32, (1, block_v), 1
+  )
+  valid_v = col_ids < vocab if vocab % block_v != 0 else None
+  emb_block = (
+      jnp.where(valid_v.T, emb_ref[...], 0.0)
+      if valid_v is not None
+      else emb_ref[...]
+  )
+  local_n_iota = jax.lax.broadcasted_iota(jnp.int32, (block_n, 1), 0)
 
-  def loop_body(n_idx, _):
-    act = act_ref[pl.ds(n_idx * block_n, block_n), :]
-    dloss_val = dloss_ref[0, pl.ds(n_idx * block_n, block_n)]  # (block_n,)
+  def n_loop_body(nc: jax.Array, _: None) -> None:
+    n_slice = pl.ds(nc * block_n, block_n)
+    act_sub = act_ref[n_slice, :]
+    dloss_val = dloss_ref[0, n_slice]
+    raw_scale = (dloss_val * inv_vocab)[:, None]
+    if padded_n > n_real:
+      batch_ids = nc * block_n + local_n_iota
+      scale = jnp.where(batch_ids < n_real, raw_scale, 0.0)
+    else:
+      scale = raw_scale
 
-    # Compute logits: (block_n, block_v)
     logits = jax.lax.dot(
-        act,
-        emb,
+        act_sub,
+        emb_block,
         dimension_numbers=(((1,), (1,)), ((), ())),
         precision=jax.lax.Precision.DEFAULT,
         preferred_element_type=jnp.float32,
     )
     probs = jax.nn.sigmoid(logits)
 
-    # Target matching across labels: (block_n, block_v)
     if labels > 0:
-      tgt_val = tgt_ref[:labels, pl.ds(n_idx * block_n, block_n)]
-      y_true_chunk = jnp.any(tgt_val[:, :, None] == chunk_indices_local, axis=0)
-      g = probs - y_true_chunk.astype(probs.dtype)
+      assert tgt_ref is not None
+      tgt_sub = tgt_ref[:, n_slice]
+      y_true = jnp.zeros((block_n, block_v), dtype=jnp.bool_)
+      for l_idx in range(labels):
+        y_true = y_true | (tgt_sub[l_idx : l_idx + 1, :].T == col_ids)
+      g = probs - y_true.astype(probs.dtype)
     else:
       g = probs
 
-    # Valid batch mask for this loop step: (block_n, 1)
-    batch_indices_local = n_idx * block_n + local_n_iota
-    valid_batch_mask = batch_indices_local < n_real
+    if valid_v is not None:
+      g = jnp.where(valid_v, g, 0.0)
 
-    # Gradients w.r.t logits, masked: (block_n, block_v)
-    scale = jnp.where(valid_batch_mask, (dloss_val * inv_vocab)[:, None], 0.0)
     deriv = scale * g
 
-    # Accumulate d_emb
     d_emb_contrib = jax.lax.dot(
-        deriv.astype(act.dtype),
-        act,
+        deriv.astype(act_sub.dtype),
+        act_sub,
         dimension_numbers=(((0,), (0,)), ((), ())),
         precision=jax.lax.Precision.DEFAULT,
         preferred_element_type=jnp.float32,
     )
     d_emb_scratch[...] = d_emb_scratch[...] + d_emb_contrib
 
-    # Compute d_act and write directly to HBM
     d_act_contrib = jax.lax.dot(
-        deriv.astype(emb.dtype),
-        emb,
+        deriv.astype(emb_block.dtype),
+        emb_block,
         dimension_numbers=(((1,), (0,)), ((), ())),
         precision=jax.lax.Precision.DEFAULT,
         preferred_element_type=jnp.float32,
     )
-    d_act_partials_ref[0, pl.ds(n_idx * block_n, block_n), :] = d_act_contrib
+    d_act_scratch[n_slice, :] = d_act_scratch[n_slice, :] + d_act_contrib
 
-    return None
+  if n_blocks == 1:
+    n_loop_body(jnp.int32(0), None)
+  else:
+    jax.lax.fori_loop(0, n_blocks, n_loop_body, None)
 
-  # Run reduction loop over n_blocks
-  jax.lax.fori_loop(0, n_blocks, loop_body, None)
+  if fuse_pos:
+    assert (
+        pos_offsets_ref is not None
+        and pos_packed_ref is not None
+        and pos_scale_ref is not None
+    )
+    start = pos_offsets_ref[v_idx]
+    end = pos_offsets_ref[v_idx + 1]
+    sub_iota = jax.lax.broadcasted_iota(jnp.int32, (num_sublanes, 1), 0)
+    if pos_banks == 4:
+      de_banks = (d_emb_scratch, d_emb_b1, d_emb_b2, d_emb_b3)
+      da_banks = (d_act_scratch, d_act_b1, d_act_b2, d_act_b3)
+      num_groups = (end - start + 15) // 16
 
-  # Store accumulated results to HBM
-  d_emb_ref[...] = d_emb_scratch[...]
+      def pos_group_body(g_idx: jax.Array, _: None) -> None:
+        base = start + g_idx * 16
+        for u in range(16):
+          idx = base + u
+          valid = idx < end
+          p = pos_packed_ref[idx]
+          local_v = jnp.right_shift(p, 16)
+          tok = jnp.bitwise_and(p, 0xFFFF)
+          s = jnp.where(valid, pos_scale_ref[tok], 0.0)
+          v_tile = pl.multiple_of(
+              (local_v // num_sublanes) * num_sublanes, num_sublanes
+          )
+          v_sub = local_v % num_sublanes
+          t_tile = pl.multiple_of(
+              (tok // num_sublanes) * num_sublanes, num_sublanes
+          )
+          t_sub = tok % num_sublanes
+          v_sl = pl.ds(v_tile, num_sublanes)
+          t_sl = pl.ds(t_tile, num_sublanes)
+          act_sub = act_ref[t_sl, :].astype(jnp.float32)
+          emb_sub = emb_ref[v_sl, :].astype(jnp.float32)
+          act_row = jnp.broadcast_to(
+              jnp.sum(
+                  jnp.where(valid & (sub_iota == t_sub), act_sub, 0.0),
+                  axis=0,
+                  keepdims=True,
+              ),
+              (num_sublanes, padded_d),
+          )
+          emb_row = jnp.broadcast_to(
+              jnp.sum(
+                  jnp.where(valid & (sub_iota == v_sub), emb_sub, 0.0),
+                  axis=0,
+                  keepdims=True,
+              ),
+              (num_sublanes, padded_d),
+          )
+          bank_idx = u & 3
+          de_b = de_banks[bank_idx]
+          da_b = da_banks[bank_idx]
+          assert de_b is not None and da_b is not None
+          de_b[v_sl, :] = de_b[v_sl, :] + jnp.where(
+              sub_iota == v_sub, s * act_row, 0.0
+          )
+          da_b[t_sl, :] = da_b[t_sl, :] + jnp.where(
+              sub_iota == t_sub, s * emb_row, 0.0
+          )
+
+      jax.lax.fori_loop(0, num_groups, pos_group_body, None)
+    else:
+
+      def pos_single_body(k: jax.Array, _: None) -> None:
+        p = pos_packed_ref[k]
+        local_v = jnp.right_shift(p, 16)
+        tok = jnp.bitwise_and(p, 0xFFFF)
+        s = pos_scale_ref[tok]
+        v_tile = pl.multiple_of(
+            (local_v // num_sublanes) * num_sublanes, num_sublanes
+        )
+        v_sub = local_v % num_sublanes
+        t_tile = pl.multiple_of(
+            (tok // num_sublanes) * num_sublanes, num_sublanes
+        )
+        t_sub = tok % num_sublanes
+        v_sl = pl.ds(v_tile, num_sublanes)
+        t_sl = pl.ds(t_tile, num_sublanes)
+        act_sub = act_ref[t_sl, :].astype(jnp.float32)
+        emb_sub = emb_ref[v_sl, :].astype(jnp.float32)
+        act_row = jnp.broadcast_to(
+            jnp.sum(
+                jnp.where(sub_iota == t_sub, act_sub, 0.0),
+                axis=0,
+                keepdims=True,
+            ),
+            (num_sublanes, padded_d),
+        )
+        emb_row = jnp.broadcast_to(
+            jnp.sum(
+                jnp.where(sub_iota == v_sub, emb_sub, 0.0),
+                axis=0,
+                keepdims=True,
+            ),
+            (num_sublanes, padded_d),
+        )
+        d_emb_scratch[v_sl, :] = d_emb_scratch[v_sl, :] + jnp.where(
+            sub_iota == v_sub, s * act_row, 0.0
+        )
+        d_act_scratch[t_sl, :] = d_act_scratch[t_sl, :] + jnp.where(
+            sub_iota == t_sub, s * emb_row, 0.0
+        )
+
+      jax.lax.fori_loop(start, end, pos_single_body, None)
+
+  if fuse_pos and pos_banks == 4:
+    assert (
+        d_emb_b1 is not None and d_emb_b2 is not None and d_emb_b3 is not None
+    )
+    total_d_emb = (d_emb_scratch[...] + d_emb_b1[...]) + (
+        d_emb_b2[...] + d_emb_b3[...]
+    )
+    d_emb_ref[...] = total_d_emb.astype(d_emb_ref.dtype)
+  else:
+    d_emb_ref[...] = d_emb_scratch[...].astype(d_emb_ref.dtype)
+
+  @pl.when(v_idx == v_blocks - 1)
+  def _store_d_act():
+    if fuse_pos and pos_banks == 4:
+      assert (
+          d_act_b1 is not None and d_act_b2 is not None and d_act_b3 is not None
+      )
+      total_d_act = (d_act_scratch[...] + d_act_b1[...]) + (
+          d_act_b2[...] + d_act_b3[...]
+      )
+      d_act_ref[...] = total_d_act.astype(d_act_ref.dtype)
+    else:
+      d_act_ref[...] = d_act_scratch[...].astype(d_act_ref.dtype)
 
 
 def _apply_bwd_pos_correction(
@@ -1072,7 +1713,9 @@ def _bce_bwd_pallas(
     jt.Float[jt.Array, "V D"],
 ]:
   """Pallas TPU per-shard chunked backward for BCE."""
-  block_n = config.block_n
+  lane = _pallas_lane()
+  num_sublanes = _pallas_sublane()
+  block_n = pl.align_to(config.block_n, lane)
   batch, seq_len, hidden = activations.shape
   vocab = embeddings.shape[0]
   padded_d, block_v = _effective_block_v(config, hidden, vocab)
@@ -1080,8 +1723,13 @@ def _bce_bwd_pallas(
   n = batch * seq_len
   n_blocks = (n + block_n - 1) // block_n
   v_blocks = (vocab + block_v - 1) // block_v
-  vocab_padded = v_blocks * block_v
-  labels = 0 if config.optimize_large_l else targets.shape[-1]
+  vocab_hbm = (
+      v_blocks * block_v
+      if _pallas_interpret()
+      else max(pl.align_to(vocab, num_sublanes), block_v)
+  )
+  raw_labels = targets.shape[-1]
+  labels = 0 if config.optimize_large_l else raw_labels
 
   # Rebase global target ids onto this shard's local rows here rather than
   # inside the kernel: under vocab sharding `vocab_offset` is a tracer, and a
@@ -1089,24 +1737,36 @@ def _bce_bwd_pallas(
   # belonging to other shards land outside [0, vocab) and simply never match.
   targets = targets - vocab_offset
 
-  # Pad activations, targets, d_loss to multiples of block_n if necessary
   padded_n = n_blocks * block_n
+  vmem_budget = _pallas_vmem_budget()
+  fuse_pos = (
+      config.optimize_large_l
+      and not _pallas_interpret()
+      and raw_labels > 0
+      and block_v <= _MAX_PACKED_DIM
+      and padded_n <= _MAX_PACKED_DIM
+      and (n * raw_labels) <= _MAX_SMEM_POS_ENTRIES
+  )
+  base_vmem_bytes = (
+      _vocab_bytes_per_block_v(padded_d, block_n, embeddings.dtype) * block_v
+      + _TOKEN_VMEM_TILES * padded_n * padded_d * 4
+  )
+  extra_4bank_bytes = 3 * (block_v + padded_n) * padded_d * 4
+  fits_4banks = fuse_pos and (base_vmem_bytes + extra_4bank_bytes) <= int(
+      vmem_budget * 0.88
+  )
+  pos_banks = 4 if fits_4banks else 1
+
   if padded_n > n:
     pad_len = padded_n - n
     activations_2d = jnp.pad(
         jnp.reshape(activations, (n, hidden)), ((0, pad_len), (0, 0))
     )
     dloss_2d = jnp.pad(jnp.reshape(d_loss, (n, 1)), ((0, pad_len), (0, 0)))
-    targets_2d = jnp.pad(
-        jnp.reshape(targets[..., :labels], (n, labels)),
-        ((0, pad_len), (0, 0)),
-        constant_values=-1,
-    )
   else:
     activations_2d = jnp.reshape(activations, (n, hidden))
     dloss_2d = jnp.reshape(d_loss, (n, 1))
-    targets_2d = jnp.reshape(targets[..., :labels], (n, labels))
-  # Pad activations and embeddings to padded_d columns
+
   if padded_d > hidden:
     activations_padded = jnp.pad(
         activations_2d, ((0, 0), (0, padded_d - hidden))
@@ -1114,70 +1774,104 @@ def _bce_bwd_pallas(
   else:
     activations_padded = activations_2d
 
-  if vocab_padded > vocab or padded_d > hidden:
+  if vocab_hbm > vocab or padded_d > hidden:
     embeddings_padded = jnp.pad(
-        embeddings, ((0, vocab_padded - vocab), (0, padded_d - hidden))
+        embeddings, ((0, vocab_hbm - vocab), (0, padded_d - hidden))
     )
   else:
     embeddings_padded = embeddings
 
-  # Transpose and pad targets: (n, labels) -> (labels, n) ->
-  # (l_padded, padded_n)
-  num_sublanes = _pallas_sublane()
-  l_padded = max(num_sublanes, pl.align_to(labels, num_sublanes))
-  targets_t = jnp.transpose(targets_2d, (1, 0))
-  if l_padded > labels or padded_n > n:
-    targets_padded = jnp.pad(
-        targets_t,
-        ((0, l_padded - labels), (0, padded_n - n)),
-        constant_values=-1,
-    ).astype(jnp.int32)
+  if labels > 0:
+    l_padded = max(num_sublanes, pl.align_to(labels, num_sublanes))
+    targets_2d = jnp.reshape(targets[..., :labels], (n, labels))
+    targets_t = jnp.transpose(targets_2d, (1, 0))
+    if l_padded > labels or padded_n > n:
+      targets_padded = jnp.pad(
+          targets_t,
+          ((0, l_padded - labels), (0, padded_n - n)),
+          constant_values=-1,
+      ).astype(jnp.int32)
+    else:
+      targets_padded = targets_t.astype(jnp.int32)
+    tgt_spec = pl.BlockSpec((l_padded, padded_n), lambda v: (0, 0))
   else:
-    targets_padded = targets_t.astype(jnp.int32)
+    targets_padded = None
+    tgt_spec = None
 
-  # Transpose and pad dloss: (n, 1) -> (1, n) -> (1, padded_n)
-  dloss_t = jnp.transpose(dloss_2d, (1, 0))
-  if padded_n > n:
-    dloss_padded = jnp.pad(dloss_t, ((0, 0), (0, padded_n - n))).astype(
-        embeddings.dtype
+  if fuse_pos:
+    pos_offsets, pos_packed = _build_bwd_pos_buckets(
+        jnp.reshape(targets, (n, -1)), vocab, block_v, v_blocks
+    )
+    pos_scale = (-dloss_2d[:, 0] * (1.0 / global_vocab)).astype(jnp.float32)
+    pos_offsets_spec = pl.BlockSpec(
+        pos_offsets.shape, lambda v: (0,), memory_space=pltpu.SMEM
+    )
+    pos_packed_spec = pl.BlockSpec(
+        pos_packed.shape, lambda v: (0,), memory_space=pltpu.SMEM
+    )
+    pos_scale_spec = pl.BlockSpec(
+        pos_scale.shape, lambda v: (0,), memory_space=pltpu.SMEM
     )
   else:
-    dloss_padded = dloss_t.astype(embeddings.dtype)
+    pos_offsets = None
+    pos_packed = None
+    pos_scale = None
+    pos_offsets_spec = None
+    pos_packed_spec = None
+    pos_scale_spec = None
 
-  d_emb_padded, d_act_partials = pl.pallas_call(
+  dloss_padded = jnp.transpose(dloss_2d, (1, 0)).astype(embeddings.dtype)
+  emb_vmem = pltpu.VMEM((block_v, padded_d), jnp.float32)
+  act_vmem = pltpu.VMEM((padded_n, padded_d), jnp.float32)
+  extra_scratches = (
+      [emb_vmem, emb_vmem, emb_vmem, act_vmem, act_vmem, act_vmem]
+      if (fuse_pos and pos_banks == 4)
+      else [None, None, None, None, None, None]
+  )
+
+  d_emb_padded, d_act_padded = pl.pallas_call(
       functools.partial(
           _bce_bwd_kernel,
-          block_v=block_v,
           block_n=block_n,
+          block_v=block_v,
+          padded_d=padded_d,
+          num_sublanes=num_sublanes,
           n_blocks=n_blocks,
+          v_blocks=v_blocks,
           vocab=vocab,
           labels=labels,
           n_real=n,
+          padded_n=padded_n,
           global_vocab=global_vocab,
+          fuse_pos=fuse_pos,
+          pos_banks=pos_banks,
       ),
       out_shape=[
-          jax.ShapeDtypeStruct((vocab_padded, padded_d), embeddings.dtype),
-          jax.ShapeDtypeStruct(
-              (v_blocks, padded_n, padded_d), activations.dtype
-          ),
+          jax.ShapeDtypeStruct((vocab_hbm, padded_d), embeddings.dtype),
+          jax.ShapeDtypeStruct((padded_n, padded_d), activations.dtype),
       ],
       grid=(v_blocks,),
       in_specs=[
           pl.BlockSpec((block_v, padded_d), lambda v: (v, 0)),  # emb
           pl.BlockSpec((padded_n, padded_d), lambda v: (0, 0)),  # act
-          pl.BlockSpec((l_padded, padded_n), lambda v: (0, 0)),  # tgt
+          tgt_spec,  # tgt (None when optimize_large_l=True)
           pl.BlockSpec((1, padded_n), lambda v: (0, 0)),  # dloss
+          pos_offsets_spec,
+          pos_packed_spec,
+          pos_scale_spec,
       ],
       out_specs=[
           pl.BlockSpec((block_v, padded_d), lambda v: (v, 0)),  # d_emb
-          pl.BlockSpec((1, padded_n, padded_d), lambda v: (v, 0, 0)),  # d_act
+          pl.BlockSpec((padded_n, padded_d), lambda v: (0, 0)),  # d_act
       ],
       scratch_shapes=[
-          pltpu.VMEM((block_v, padded_d), jnp.float32),  # d_emb_scratch
-      ],
+          emb_vmem,  # d_emb_scratch
+          act_vmem,  # d_act_scratch
+      ]
+      + extra_scratches,
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("arbitrary",),
-          vmem_limit_bytes=_pallas_vmem_budget(),
+          vmem_limit_bytes=vmem_budget,
       ),
       interpret=_pallas_interpret(),
   )(
@@ -1185,22 +1879,22 @@ def _bce_bwd_pallas(
       activations_padded,
       targets_padded,
       dloss_padded,
+      pos_offsets,
+      pos_packed,
+      pos_scale,
   )
 
-  if vocab < vocab_padded or hidden < padded_d:
+  if vocab < vocab_hbm or hidden < padded_d:
     d_emb = d_emb_padded[:vocab, :hidden]
   else:
     d_emb = d_emb_padded
 
-  if hidden < padded_d:
-    d_act_2d = jnp.sum(d_act_partials[:, :, :hidden], axis=0)
+  if padded_n > n or hidden < padded_d:
+    d_act_2d = d_act_padded[:n, :hidden]
   else:
-    d_act_2d = jnp.sum(d_act_partials, axis=0)
+    d_act_2d = d_act_padded
 
-  if padded_n > n:
-    d_act_2d = d_act_2d[:n, :]
-
-  if config.optimize_large_l:
+  if config.optimize_large_l and not fuse_pos:
     d_act_2d, d_emb = _apply_bwd_pos_correction(
         d_act_2d,
         d_emb,
@@ -1222,6 +1916,7 @@ def _max_safe_chunk_n(
     block_n: int = _BLOCK_N,
     target_ratio: float | None = None,
     dtype: jax.typing.DTypeLike = jnp.float32,
+    logit_vmem_tiles: int = _LOGIT_VMEM_TILES,
 ) -> int:
   """Returns maximum safe chunk_n to prevent VMEM OOM.
 
@@ -1238,20 +1933,32 @@ def _max_safe_chunk_n(
     block_n: Token-axis tile size of the kernel's inner loop.
     target_ratio: Fraction of `vmem_budget` the backward pass may claim.
     dtype: Element type of the activations and embeddings.
+    logit_vmem_tiles: Number of live `[block_n, block_v]` tiles in VMEM.
 
   Returns:
     The largest lane-aligned token chunk that fits alongside the vocabulary
     working set.
   """
   if target_ratio is None:
-    target_ratio = _TARGET_RATIO
+    if vmem_budget <= 32 * _BYTES_IN_MB:
+      share = _SMALL_VMEM_SHARE
+    elif vmem_budget <= 48 * _BYTES_IN_MB:
+      share = _MEDIUM_TARGET_RATIO
+    else:
+      share = _TARGET_RATIO
+  else:
+    share = (
+        _SMALL_VMEM_SHARE if vmem_budget <= 32 * _BYTES_IN_MB else target_ratio
+    )
   bytes_per_element = jnp.dtype(dtype).itemsize
-  share = (
-      _SMALL_VMEM_SHARE if vmem_budget <= 32 * _BYTES_IN_MB else target_ratio
-  )
 
   # NOMUTANTS -- max_safe is calculated based on VMEM budget.
-  vocab_bytes = _vocab_bytes_per_block_v(padded_d, block_n, dtype) * block_v
+  vocab_bytes = (
+      _vocab_bytes_per_block_v(
+          padded_d, block_n, dtype, logit_vmem_tiles=logit_vmem_tiles
+      )
+      * block_v
+  )
   available = max(0, int(vmem_budget * share) - vocab_bytes)
 
   # Conservative VMEM usage approx: chunk_n * padded_d * bytes_per_element * 3.
