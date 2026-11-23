@@ -65,6 +65,13 @@ class JobInfo:
 
   name: str
   mode: Any
+  eval_names: tuple[str, ...] | None = None
+
+  def __post_init__(self):
+    if self.eval_names is not None and not isinstance(self.eval_names, tuple):
+      object.__setattr__(
+          self, "eval_names", tuple(str(n) for n in self.eval_names)
+      )
 
   @classmethod
   def from_string(cls, job_info: str) -> Self:
@@ -73,7 +80,10 @@ class JobInfo:
 
   def to_string(self) -> str:
     """Converts the JobInfo to a string."""
-    return json.dumps(dataclasses.asdict(self))
+    payload = dataclasses.asdict(self)
+    if payload.get("eval_names") is None:
+      payload.pop("eval_names", None)
+    return json.dumps(payload)
 
 
 class Trainer(abc.ABC, Generic[TaskT]):
