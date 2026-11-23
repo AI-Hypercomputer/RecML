@@ -121,6 +121,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       train_steps: int = 0,
       steps_per_eval: int | None = None,
       continuous_eval_timeout: int = 30,
+      continuous_eval_max_idle_secs: float | None = None,
       steps_per_loop: int = 1_000,
       max_checkpoints_to_keep: int = 5,
       checkpoint_save_interval_epochs: int = 1,
@@ -142,6 +143,11 @@ class KerasTrainer(core.Trainer[KerasTask]):
       train_steps: Total number of training steps.
       steps_per_eval: Number of steps between evaluations.
       continuous_eval_timeout: Timeout for continuous evaluation.
+      continuous_eval_max_idle_secs: Optional maximum seconds to wait without a
+        new checkpoint during `evaluate_continuously` before exiting cleanly
+        even if `marker.txt` has not been written (for example, when the
+        training job aborts in a `PARTIALLY_FAILED` work unit). Must be > 0 when
+        set. Defaults to None (wait until `marker.txt` appears).
       steps_per_loop: Number of steps per training loop.
       max_checkpoints_to_keep: Maximum number of checkpoints to keep.
       checkpoint_save_interval_epochs: Interval in epochs to save checkpoints.
@@ -208,6 +214,14 @@ class KerasTrainer(core.Trainer[KerasTask]):
           "fold_batch_leaves needs the JAX backend, got"
           f" {keras.backend.backend()!r}."
       )
+    if (
+        continuous_eval_max_idle_secs is not None
+        and continuous_eval_max_idle_secs <= 0
+    ):
+      raise ValueError(
+          "continuous_eval_max_idle_secs must be > 0, got"
+          f" {continuous_eval_max_idle_secs}."
+      )
 
     keras.utils.set_random_seed(rng_seed)
 
@@ -229,6 +243,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._train_epochs = train_steps // steps_per_loop
     self._steps_per_eval = steps_per_eval
     self._continuous_eval_timeout = continuous_eval_timeout
+    self._continuous_eval_max_idle_secs = continuous_eval_max_idle_secs
     self._steps_per_loop = steps_per_loop
     self._device_prefetch_depth = device_prefetch_depth
     self._skip_batch_logs = skip_batch_logs
@@ -539,8 +554,23 @@ class KerasTrainer(core.Trainer[KerasTask]):
         **self._maybe_get_model_kws(task, eval_dataset),
     )
 
+    last_checkpoint_time = time.monotonic()
+
     def timeout_fn() -> bool:
-      return tf.io.gfile.exists(self._marker_path)
+      if tf.io.gfile.exists(self._marker_path):
+        return True
+      if self._continuous_eval_max_idle_secs is not None:
+        idle_secs = time.monotonic() - last_checkpoint_time
+        if idle_secs >= self._continuous_eval_max_idle_secs:
+          logging.warning(
+              "Stopping continuous_eval after %.1fs with no new checkpoints in"
+              " %s (continuous_eval_max_idle_secs=%s).",
+              idle_secs,
+              self._checkpoint_dir,
+              self._continuous_eval_max_idle_secs,
+          )
+          return True
+      return False
 
     if self._steps_per_eval is not None:
       steps_msg = f"running {self._steps_per_eval} steps of evaluation..."
@@ -623,6 +653,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
         )
       except FileNotFoundError:
         logging.info("Checkpoint epoch: %s did not finish writing...", epoch)
+      finally:
+        last_checkpoint_time = time.monotonic()
 
     return history
 
