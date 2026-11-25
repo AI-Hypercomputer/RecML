@@ -15,7 +15,7 @@
 
 The Keras JAX training loop passes every variable of the model, the optimizer,
 and the metrics to the jitted train step as its own array, and receives one
-array back for each. The host pays per-array
+array back for each, plus one array per scalar log. The host pays per-array
 overhead on every step: Python argument parsing, per-chip buffer handles and
 output buffer allocation, and Python array wrapper construction/destruction.
 Models with hundreds of metrics pass thousands of small arrays this way.
@@ -24,7 +24,10 @@ Models with hundreds of metrics pass thousands of small arrays this way.
 each of the 4 state lists into one 1-D vector per dtype and replicated
 sharding. Inside the jitted train step, the vectors are split and reshaped back
 before calling the model's `train_step`, and the updated state is folded back
-on return. Large or sharded arrays pass through unchanged.
+on return. Large or sharded arrays pass through unchanged. With
+`fold_logs=True`, the step logs are also stacked into one 1-D vector per dtype,
+wrapped in a lazy dict, if every log has one element; one-element logs then come
+back as scalars.
 
 Terms:
   leaf: one array of a state list.
@@ -44,6 +47,7 @@ from typing import Any
 from absl import logging
 import jax
 from jax import flatten_util
+import jax.numpy as jnp
 import keras
 import numpy as np
 
@@ -53,6 +57,7 @@ _STATE_KEYS = (
     "optimizer_variables",
     "metrics_variables",
 )
+_FOLDED_LOGS_KEY = "__state_folding_packed_logs__"
 
 
 @contextlib.contextmanager
@@ -319,12 +324,128 @@ class _StateLayout:
     )
 
 
+class _FoldedLogs(dict[str, Any]):
+  """Step logs backed by per-dtype device vectors, unpacked on first read.
+
+  Populates its keys upfront so key-membership checks (`keys()`, `in`, `len`)
+  work without transferring values from the device. Every method that reads or
+  changes a value reads the vectors first.
+  """
+
+  def __init__(
+      self, names_by_dtype: dict[str, list[str]], vectors: dict[str, jax.Array]
+  ):
+    """Initializes the logs.
+
+    Args:
+      names_by_dtype: For each dtype name, the log names in the order of their
+        entries in the vector of that dtype.
+      vectors: For each dtype name, the 1-D vector of the log values.
+    """
+    super().__init__()
+    for names in names_by_dtype.values():
+      for name in names:
+        dict.__setitem__(self, name, None)
+    self._names_by_dtype = names_by_dtype
+    self._vectors: dict[str, jax.Array] | None = vectors
+
+  def _read(self) -> None:
+    # Keras can read the same logs on its callback thread and on the main
+    # thread at once. Copy `_vectors` to a local first: the other thread can
+    # set it to None while this one is still reading.
+    vectors = self._vectors
+    if vectors is None:
+      return
+    for dtype, names in self._names_by_dtype.items():
+      values = np.asarray(vectors[dtype])
+      for name, value in zip(names, values, strict=True):
+        dict.__setitem__(self, name, value)
+    self._vectors = None
+
+  def __getitem__(self, key: str) -> Any:
+    self._read()
+    return super().__getitem__(key)
+
+  def __setitem__(self, key: str, value: Any) -> None:
+    self._read()
+    super().__setitem__(key, value)
+
+  def __delitem__(self, key: str) -> None:
+    self._read()
+    super().__delitem__(key)
+
+  def __eq__(self, other: object) -> bool:
+    self._read()
+    return super().__eq__(other)
+
+  def __ne__(self, other: object) -> bool:
+    self._read()
+    return super().__ne__(other)
+
+  __hash__ = None  # Like `dict`.
+
+  # pylint: disable-next=useless-parent-delegation
+  def __iter__(self) -> Iterator[str]:
+    # CPython's `dict(logs)` and `{**logs}` copy a dict subclass directly,
+    # without `__getitem__`, unless the subclass overrides `__iter__`. This
+    # override makes them call `__getitem__` (which reads the values), while
+    # `set(logs)` still reads only the keys.
+    return super().__iter__()
+
+  def get(self, key: str, default: Any = None) -> Any:
+    self._read()
+    return super().get(key, default)
+
+  def pop(self, key: str, *default: Any) -> Any:
+    self._read()
+    return super().pop(key, *default)
+
+  def popitem(self) -> tuple[str, Any]:
+    self._read()
+    return super().popitem()
+
+  def setdefault(self, key: str, default: Any = None) -> Any:
+    self._read()
+    return super().setdefault(key, default)
+
+  def update(self, *args: Any, **kwargs: Any) -> None:
+    self._read()
+    super().update(*args, **kwargs)
+
+  def __ior__(self, other: Any) -> "_FoldedLogs":
+    self._read()
+    return super().__ior__(other)
+
+  def clear(self) -> None:
+    self._vectors = None
+    super().clear()
+
+  def items(self):
+    self._read()
+    return super().items()
+
+  def values(self):
+    self._read()
+    return super().values()
+
+  def copy(self) -> dict[str, Any]:
+    return dict(self.items())
+
+  def __reduce__(self) -> tuple[Any, ...]:
+    return dict, (self.copy(),)
+
+  def __repr__(self) -> str:
+    self._read()
+    return super().__repr__()
+
+
 class _Folding:
   """The folded train step of a model and the state conversions around it."""
 
-  def __init__(self, model: keras.Model, max_leaf_size: int):
+  def __init__(self, model: keras.Model, max_leaf_size: int, fold_logs: bool):
     self._model = model
     self._max_leaf_size = max_leaf_size
+    self._fold_logs_enabled = fold_logs
     self._layout: _StateLayout | None = None
     self.original_train_step = model.train_step
     self.original_make_train_function = model.make_train_function
@@ -352,10 +473,53 @@ class _Folding:
   ) -> tuple[Any, tuple[list[jax.Array], ...]]:
     layout = self._get_layout()
     logs, state = self.original_train_step(layout.unfold(state), data)
+    if self._fold_logs_enabled:
+      logs = self._fold_logs(logs)
     return logs, layout.fold(state)
 
+  @staticmethod
+  def _fold_logs(logs: dict[str, Any]) -> dict[str, Any]:
+    """Stacks one-element logs into one vector per dtype.
+
+    Returns `logs` unchanged (with a warning for nested dicts or multi-element
+    logs) when logs are empty or cannot be stacked. Log names are carried as
+    static PyTree metadata in the returned dict keys so XLA cache hits across
+    multiple batch shapes stay stateless.
+
+    Args:
+      logs: The step logs returned by the model's `train_step`.
+
+    Returns:
+      A single-entry dict carrying the stacked vectors and log names, or `logs`.
+    """
+    if not logs:
+      return logs
+    named_values_by_dtype: dict[str, list[tuple[str, jax.Array]]] = {}
+    for name, value in logs.items():
+      if isinstance(value, dict):
+        logging.warning("Not folding the step logs: %r is a dict.", name)
+        return logs
+      value = jnp.asarray(value)
+      if value.size != 1:
+        logging.warning(
+            "Not folding the step logs: %r has %d elements.", name, value.size
+        )
+        return logs
+      named_values = named_values_by_dtype.setdefault(value.dtype.name, [])
+      named_values.append((name, value))
+    return {
+        _FOLDED_LOGS_KEY: {
+            (dtype, tuple(name for name, _ in named_values)): jnp.stack(
+                [jnp.reshape(value, ()) for _, value in named_values]
+            )
+            for dtype, named_values in named_values_by_dtype.items()
+        }
+    }
+
   def folded_make_train_function(self, force: bool = False) -> None:
-    """Builds `model.train_function` with folded state shardings."""
+    """Builds `model.train_function` with folded state shardings and logs."""
+    if self._model.train_function is not None and not force:
+      return
     # Only the train function sees folded shardings; `evaluate` and
     # `validation_data` keep the unfolded ones.
     with _override_attribute(
@@ -364,6 +528,20 @@ class _Folding:
         self.folded_get_state_sharding_spec,
     ):
       self.original_make_train_function(force=force)
+    if not self._fold_logs_enabled:
+      return
+    train_function: Any = self._model.train_function
+
+    def folded_train_function(state: Any, iterator: Any) -> tuple[Any, Any]:
+      logs, state = train_function(state, iterator)
+      if isinstance(logs, dict) and _FOLDED_LOGS_KEY in logs:
+        packed = logs[_FOLDED_LOGS_KEY]
+        names_by_dtype = {dtype: list(names) for dtype, names in packed}
+        vectors = {dtype: vec for (dtype, _), vec in packed.items()}
+        logs = _FoldedLogs(names_by_dtype, vectors)
+      return logs, state
+
+    self._model.train_function = folded_train_function
 
   def folded_get_jax_state(self, **kwargs: bool) -> Any:
     state = self.original_get_jax_state(**kwargs)
@@ -398,7 +576,7 @@ class _Folding:
 
 @contextlib.contextmanager
 def model_state_folding_scope(
-    model: keras.Model, max_leaf_size: int
+    model: keras.Model, max_leaf_size: int, fold_logs: bool = False
 ) -> Iterator[None]:
   """Makes `model.fit` pass small replicated arrays of the state folded.
 
@@ -406,6 +584,8 @@ def model_state_folding_scope(
     model: A Keras model on the JAX backend.
     max_leaf_size: Arrays with at most this many elements are folded. `0` leaves
       `model` untouched.
+    fold_logs: Also stack the step logs into one vector per dtype if every log
+      has one element. One-element logs then come back as scalars.
 
   Yields:
     None.
@@ -413,7 +593,7 @@ def model_state_folding_scope(
   if max_leaf_size == 0:
     yield
     return
-  folding = _Folding(model, max_leaf_size)
+  folding = _Folding(model, max_leaf_size, fold_logs)
   model.train_function = None
   try:
     with (

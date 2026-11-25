@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import pickle
+import threading
 
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import keras
+from keras.src.utils import python_utils
 import numpy as np
 from recml.core.training import state_folding
 
@@ -46,9 +49,30 @@ class _ExtraLogModel(keras.Model):
     return logs, state
 
 
-def _model(build: bool = True) -> keras.Model:
+class _NonScalarLogModel(_ExtraLogModel):
+  """Adds a 3-element log, which turns log folding off."""
+
+  def train_step(self, state, data):
+    logs, state = super().train_step(state, data)
+    logs["per_class"] = jnp.arange(3, dtype=jnp.float32)
+    return logs, state
+
+
+class _BatchShapedLogModel(_ExtraLogModel):
+  """Adds a `(batch_size,)` log: folds only on size-1 remainder batches."""
+
+  def train_step(self, state, data):
+    logs, state = super().train_step(state, data)
+    _, y = data[:2]
+    logs["per_row"] = y[:, 0]
+    return logs, state
+
+
+def _model(
+    build: bool = True, model_cls: type[keras.Model] = _ExtraLogModel
+) -> keras.Model:
   keras.utils.set_random_seed(0)
-  model = _ExtraLogModel()
+  model = model_cls()
   model.compile(
       optimizer=keras.optimizers.Adam(0.01),
       loss="mse",
@@ -369,6 +393,339 @@ class StateFoldingTest(absltest.TestCase):
       layout.unfold_list([0], [[jnp.zeros([]), jnp.zeros([1])]])
     with self.assertRaises(ValueError):
       layout.split_vectors([])
+
+  def test_folded_logs_defers_read_until_values_accessed(self):
+    logs = state_folding._FoldedLogs(
+        {"float32": ["loss", "mae"]},
+        {"float32": jnp.array([1.25, 0.5], dtype=jnp.float32)},
+    )
+    self.assertEqual(set(logs), {"loss", "mae"})
+    self.assertIn("loss", logs)
+    self.assertIsNotNone(logs._vectors)
+
+    copied = dict(logs)
+    self.assertIsNone(logs._vectors)
+    self.assertEqual(copied, {"loss": np.float32(1.25), "mae": np.float32(0.5)})
+
+  def test_folded_logs_survive_concurrent_reads(self):
+    slow = jax.jit(
+        lambda m: (
+            jnp.stack([jnp.sum(m @ m), jnp.sum(m)]),
+            jnp.stack([jnp.sum(m @ m).astype(jnp.int32), jnp.int32(2)]),
+        )
+    )
+    m = jnp.ones((1024, 1024), jnp.float32) * 1e-3
+    errors = []
+    worker_results = []
+
+    def read(logs: state_folding._FoldedLogs) -> None:
+      try:
+        worker_results.append(python_utils.pythonify_logs(logs))
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        errors.append(e)
+
+    for _ in range(100):
+      del worker_results[:]
+      float_vector, int_vector = slow(m)
+      logs = state_folding._FoldedLogs(
+          {"float32": ["a", "b"], "int32": ["c", "d"]},
+          {"float32": float_vector, "int32": int_vector},
+      )
+      worker = threading.Thread(target=read, args=(logs,))
+      worker.start()
+      main_result = None
+      try:
+        main_result = dict(logs)  # What `JAXTrainer.fit` does at epoch end.
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        errors.append(e)
+      worker.join()
+      self.assertIsNotNone(main_result)
+      self.assertLen(worker_results, 1)
+      for key in ("a", "b", "c", "d"):
+        self.assertIsNotNone(main_result[key])
+        self.assertIsNotNone(worker_results[0][key])
+      self.assertEqual(main_result["d"], np.int32(2))
+      self.assertEqual(worker_results[0]["d"], 2)
+    self.assertEmpty(errors)
+
+  def test_fold_logs_empty_and_multiple_dtypes(self):
+    folding = state_folding._Folding(_model(), max_leaf_size=16, fold_logs=True)
+
+    self.assertEqual(folding._fold_logs({}), {})
+
+    folded = folding._fold_logs({
+        "loss": jnp.array(1.0, dtype=jnp.float32),
+        "extra": jnp.array(2.5, dtype=jnp.float32),
+        "mae": jnp.array(0.5, dtype=jnp.bfloat16),
+        "step": jnp.array(100, dtype=jnp.int32),
+    })
+    packed = folded[state_folding._FOLDED_LOGS_KEY]
+    self.assertCountEqual(
+        packed,
+        [
+            ("float32", ("loss", "extra")),
+            ("bfloat16", ("mae",)),
+            ("int32", ("step",)),
+        ],
+    )
+    np.testing.assert_array_equal(
+        packed[("float32", ("loss", "extra"))],
+        np.array([1.0, 2.5], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        packed[("bfloat16", ("mae",))].astype(jnp.float32),
+        np.array([0.5], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        packed[("int32", ("step",))], np.array([100], dtype=np.int32)
+    )
+
+  def test_folded_logs_read_methods_read_values_first(self):
+    def folded_logs():
+      return state_folding._FoldedLogs(
+          {"float32": ["loss", "mae"], "int32": ["step"]},
+          {
+              "float32": jnp.array([1.25, 0.5], dtype=jnp.float32),
+              "int32": jnp.array([10], dtype=jnp.int32),
+          },
+      )
+
+    self.assertEqual(folded_logs().get("loss"), np.float32(1.25))
+    self.assertEqual(folded_logs().get("missing", 0.0), 0.0)
+    self.assertIn(("step", np.int32(10)), list(folded_logs().items()))
+    self.assertIn(np.float32(0.5), list(folded_logs().values()))
+    self.assertEqual(
+        folded_logs().copy(),
+        {
+            "loss": np.float32(1.25),
+            "mae": np.float32(0.5),
+            "step": np.int32(10),
+        },
+    )
+    self.assertIn("1.25", repr(folded_logs()))
+
+  def test_non_scalar_log_disables_log_folding_with_a_warning(self):
+    folding = state_folding._Folding(_model(), max_leaf_size=16, fold_logs=True)
+    logs = {"loss": jnp.float32(1.0), "per_class": jnp.zeros([3])}
+
+    with self.assertLogs(level="WARNING") as captured:
+      folded = folding._fold_logs(logs)
+
+    self.assertIs(folded, logs)
+    self.assertIn("per_class", captured.output[0])
+
+  def test_nested_dict_log_disables_log_folding_with_a_warning(self):
+    folding = state_folding._Folding(_model(), max_leaf_size=16, fold_logs=True)
+    logs = {"loss": jnp.float32(1.0), "nested": {"a": jnp.float32(2.0)}}
+
+    with self.assertLogs(level="WARNING") as captured:
+      folded = folding._fold_logs(logs)
+
+    self.assertIs(folded, logs)
+    self.assertIn("nested", captured.output[0])
+
+  def test_folded_logs_mutation_and_comparison_read_values_first(self):
+    def folded_logs():
+      return state_folding._FoldedLogs(
+          {"float32": ["loss", "mae"]},
+          {"float32": jnp.array([1.25, 0.5], dtype=jnp.float32)},
+      )
+
+    self.assertEqual(folded_logs(), {"loss": 1.25, "mae": 0.5})
+    self.assertNotEqual(folded_logs(), {"loss": None, "mae": None})
+    self.assertEqual(folded_logs().pop("loss"), np.float32(1.25))
+    self.assertEqual(folded_logs().setdefault("mae"), np.float32(0.5))
+    logs = folded_logs()
+    logs["loss"] = 5.0
+    self.assertEqual(logs["loss"], 5.0)
+    logs = folded_logs()
+    logs.update(mae=7.0)
+    self.assertEqual(dict(logs), {"loss": 1.25, "mae": 7.0})
+    self.assertEqual(folded_logs().popitem(), ("mae", np.float32(0.5)))
+    logs = folded_logs()
+    del logs["mae"]
+    self.assertEqual(logs["loss"], np.float32(1.25))
+    self.assertNotIn("mae", logs)
+    logs = folded_logs()
+    logs |= {"loss": 99.0}
+    self.assertEqual(dict(logs), {"loss": 99.0, "mae": np.float32(0.5)})
+    logs = folded_logs()
+    logs.clear()
+    self.assertEqual(logs, {})
+    self.assertEqual(dict(logs), {})
+    expected = {"loss": np.float32(1.25), "mae": np.float32(0.5)}
+    unpickled = pickle.loads(  # pylint: disable=g-unsafe-pickle-load
+        pickle.dumps(folded_logs())
+    )
+    self.assertEqual(unpickled, expected)
+    logs = folded_logs()
+    _ = dict(logs)
+    unpickled = pickle.loads(  # pylint: disable=g-unsafe-pickle-load
+        pickle.dumps(logs)
+    )
+    self.assertEqual(unpickled, expected)
+
+  def test_fit_folds_the_step_logs(self):
+    x, y = _data()
+    want_batch_logs, got_batch_logs = [], []
+    expected = _model()
+    want_history = expected.fit(
+        x,
+        y,
+        batch_size=8,
+        epochs=2,
+        shuffle=False,
+        verbose=0,
+        callbacks=[
+            keras.callbacks.LambdaCallback(
+                on_train_batch_end=lambda _, logs: want_batch_logs.append(
+                    dict(logs)
+                )
+            )
+        ],
+    ).history
+    model = _model()
+    log_types = []
+    with state_folding.model_state_folding_scope(
+        model, max_leaf_size=16, fold_logs=True
+    ):
+      model.make_train_function()
+      train_function = model.train_function
+
+      def recording_train_function(state, iterator):
+        logs, state = train_function(state, iterator)
+        log_types.append(type(logs))
+        return logs, state
+
+      model.train_function = recording_train_function
+      got_history = model.fit(
+          x,
+          y,
+          batch_size=8,
+          epochs=2,
+          shuffle=False,
+          verbose=0,
+          callbacks=[
+              keras.callbacks.LambdaCallback(
+                  on_train_batch_end=lambda _, logs: got_batch_logs.append(
+                      dict(logs)
+                  )
+              )
+          ],
+      ).history
+
+    self.assertEqual(set(log_types), {state_folding._FoldedLogs})
+    self._assert_same_training(model, got_history, expected, want_history)
+    for got, want in zip(got_batch_logs, want_batch_logs, strict=True):
+      self.assertCountEqual(got, want)
+      for key, value in want.items():
+        np.testing.assert_allclose(got[key], value, rtol=1e-6, err_msg=key)
+
+  def test_fit_folds_step_logs_with_steps_per_execution(self):
+    x, y = _data()
+    expected = _model()
+    expected.steps_per_execution = 2
+    want_history = expected.fit(
+        x, y, batch_size=8, epochs=2, shuffle=False, verbose=0
+    ).history
+    model = _model()
+    model.steps_per_execution = 2
+    log_types = []
+    with state_folding.model_state_folding_scope(
+        model, max_leaf_size=16, fold_logs=True
+    ):
+      model.make_train_function()
+      train_function = model.train_function
+
+      def recording_train_function(state, iterator):
+        logs, state = train_function(state, iterator)
+        log_types.append(type(logs))
+        return logs, state
+
+      model.train_function = recording_train_function
+      got_history = model.fit(
+          x, y, batch_size=8, epochs=2, shuffle=False, verbose=0
+      ).history
+
+    self.assertEqual(set(log_types), {state_folding._FoldedLogs})
+    self._assert_same_training(model, got_history, expected, want_history)
+
+  def test_mixed_batch_shapes_fold_and_pass_through_across_epochs(self):
+    x, y = _data()
+    x, y = x[:9], y[:9]  # Batch 0 has size 8 (raw), batch 1 has size 1 (fold).
+    expected = _model(model_cls=_BatchShapedLogModel)
+    want_history = expected.fit(
+        x, y, batch_size=8, epochs=2, shuffle=False, verbose=0
+    ).history
+
+    model = _model(model_cls=_BatchShapedLogModel)
+    log_types = []
+    with state_folding.model_state_folding_scope(
+        model, max_leaf_size=16, fold_logs=True
+    ):
+      model.make_train_function()
+      train_function = model.train_function
+
+      def recording_train_function(state, iterator):
+        logs, state = train_function(state, iterator)
+        log_types.append(type(logs))
+        return logs, state
+
+      model.train_function = recording_train_function
+      got_history = model.fit(
+          x, y, batch_size=8, epochs=2, shuffle=False, verbose=0
+      ).history
+
+    # Epoch 2 step 0 hits the B=8 XLA cache and stays raw (not _FoldedLogs).
+    self.assertEqual(
+        log_types,
+        [dict, state_folding._FoldedLogs, dict, state_folding._FoldedLogs],
+    )
+    # On the B=1 remainder batch, the (1,) log folds and returns as a scalar.
+    np.testing.assert_allclose(
+        got_history.pop("per_row"),
+        np.squeeze(want_history.pop("per_row"), axis=-1),
+        rtol=1e-6,
+    )
+    self._assert_same_training(model, got_history, expected, want_history)
+
+  def test_fit_without_fold_logs_returns_plain_logs(self):
+    x, y = _data()
+    model = _model()
+    log_types = []
+    with state_folding.model_state_folding_scope(model, max_leaf_size=16):
+      model.make_train_function()
+      train_function = model.train_function
+
+      def recording_train_function(state, iterator):
+        logs, state = train_function(state, iterator)
+        log_types.append(type(logs))
+        return logs, state
+
+      model.train_function = recording_train_function
+      model.fit(x, y, batch_size=8, epochs=1, shuffle=False, verbose=0)
+
+    self.assertNotIn(state_folding._FoldedLogs, set(log_types))
+
+  def test_non_scalar_log_passes_all_logs_through_fit(self):
+    histories = []
+    for max_leaf_size in (0, 16):
+      x, y = _data()
+      model = _model(model_cls=_NonScalarLogModel)
+      with state_folding.model_state_folding_scope(
+          model, max_leaf_size, fold_logs=True
+      ):
+        histories.append(
+            model.fit(
+                x, y, batch_size=8, epochs=2, shuffle=False, verbose=0
+            ).history
+        )
+
+    want = histories[0]
+    got = histories[1]
+    self.assertCountEqual(got, want)
+    for key, values in want.items():
+      np.testing.assert_allclose(got[key], values, rtol=1e-6, err_msg=key)
 
 
 if __name__ == "__main__":

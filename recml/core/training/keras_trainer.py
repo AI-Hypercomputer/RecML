@@ -135,6 +135,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
       fold_batch_leaves: bool = False,
       zero_copy_batches: bool = False,
       fold_state_max_leaf_size: int = 0,
+      fold_step_logs: bool = False,
   ):
     """Initializes the instance.
 
@@ -199,6 +200,11 @@ class KerasTrainer(core.Trainer[KerasTask]):
         pass in and out of each step, which reduces the host time per step for
         models with many small variables, such as metrics. `0` disables state
         folding. Not applied in `train_and_evaluate`. Defaults to 0.
+      fold_step_logs: With `fold_state_max_leaf_size > 0`, also stack the step
+        logs into one 1-D array per dtype inside the jitted train step if every
+        log has one element, so fewer arrays come back from each step. One-
+        element logs then come back as scalars. Not applied in
+        `train_and_evaluate`. Defaults to False.
       resume_training_launcher: Launcher to resume training.
       enable_xmanager_measurements: Whether to enable XManager measurements.
       enable_autoxprof: Whether to enable AutoXprof.
@@ -207,7 +213,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
 
     Raises:
       ValueError: If `device_prefetch_depth` or `fold_state_max_leaf_size` is
-        negative, or if `fold_batch_leaves` is set on a backend other than JAX.
+        negative, if `fold_batch_leaves` is set on a backend other than JAX, or
+        if `fold_step_logs` is set without `fold_state_max_leaf_size`.
     """
     if device_prefetch_depth < 0:
       raise ValueError(
@@ -223,6 +230,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
           "fold_state_max_leaf_size must be >= 0, got"
           f" {fold_state_max_leaf_size}."
       )
+    if fold_step_logs and not fold_state_max_leaf_size:
+      raise ValueError("fold_step_logs needs fold_state_max_leaf_size > 0.")
 
     keras.utils.set_random_seed(rng_seed)
 
@@ -250,6 +259,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
     self._fold_batch_leaves = fold_batch_leaves
     self._zero_copy_batches = zero_copy_batches
     self._fold_state_max_leaf_size = fold_state_max_leaf_size
+    self._fold_step_logs = fold_step_logs
     self._marker_path = os.path.join(
         model_dir, core.TRAINING_COMPLETE_MARKER_FILE
     )
@@ -440,6 +450,7 @@ class KerasTrainer(core.Trainer[KerasTask]):
                 if keras.backend.backend() == "jax"
                 else 0
             ),
+            fold_logs=self._fold_step_logs,
         ),
         device_prefetch.model_prefetch_scope(
             model, depth=self._device_prefetch_depth
@@ -505,8 +516,8 @@ class KerasTrainer(core.Trainer[KerasTask]):
     ):
       logging.warning(
           "device_prefetch_depth, skip_batch_logs, fold_batch_leaves,"
-          " zero_copy_batches and fold_state_max_leaf_size only apply to"
-          " `train`; ignoring them in `train_and_evaluate`."
+          " zero_copy_batches, fold_state_max_leaf_size and fold_step_logs only"
+          " apply to `train`; ignoring them in `train_and_evaluate`."
       )
     train_dataset = task.create_dataset(
         training=True, **self._maybe_get_dataset_kws(task)

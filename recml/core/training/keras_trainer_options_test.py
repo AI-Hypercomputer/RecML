@@ -191,6 +191,7 @@ class KerasTrainerOptionsTest(parameterized.TestCase):
       dict(fold_batch_leaves=True),
       dict(zero_copy_batches=True),
       dict(fold_state_max_leaf_size=64),
+      dict(fold_state_max_leaf_size=64, fold_step_logs=True),
   )
   def test_train_and_evaluate_warns_that_option_is_not_applied(self, **options):
     trainer = _trainer(self._tmpdir, **options)
@@ -336,6 +337,10 @@ class KerasTrainerOptionsTest(parameterized.TestCase):
             value, features[key][2 * step : 2 * step + 2]
         )
 
+  def test_rejects_fold_step_logs_without_state_folding(self):
+    with self.assertRaisesRegex(ValueError, "fold_step_logs needs"):
+      _trainer(self._tmpdir, fold_step_logs=True)
+
   def test_fold_state_max_leaf_size_folds_the_state_during_train(self):
     rng = np.random.default_rng(0)
     x = rng.random((8, 4)).astype(np.float32)
@@ -467,6 +472,7 @@ class KerasTrainerOptionsTest(parameterized.TestCase):
         fold_batch_leaves=True,
         zero_copy_batches=True,
         fold_state_max_leaf_size=64,
+        fold_step_logs=True,
         distribution=keras.distribution.DataParallel(),
     ).train(
         types.SimpleNamespace(
@@ -485,6 +491,60 @@ class KerasTrainerOptionsTest(parameterized.TestCase):
       np.testing.assert_allclose(
           opt_history.history[key], values, rtol=1e-6, err_msg=key
       )
+
+    # Exercise `_FoldedLogs._read()` through `KerasTrainer.train` with
+    # `skip_batch_logs=False` and a per-batch callback.
+    want_batch_logs = []
+    ref_cb_dir = os.path.join(self._tmpdir, "ref_batch_logs")
+    os.makedirs(ref_cb_dir)
+    _trainer(
+        ref_cb_dir,
+        train_steps=4,
+        steps_per_loop=2,
+        train_callbacks=[
+            keras.callbacks.LambdaCallback(
+                on_train_batch_end=lambda _, logs: want_batch_logs.append(
+                    dict(logs)
+                )
+            )
+        ],
+        distribution=keras.distribution.DataParallel(),
+    ).train(
+        types.SimpleNamespace(
+            create_dataset=lambda training: make_dataset(),
+            create_model=build_model,
+            export_model=lambda m, model_dir: None,
+        )
+    )
+    got_batch_logs = []
+    opt_cb_dir = os.path.join(self._tmpdir, "opt_batch_logs")
+    os.makedirs(opt_cb_dir)
+    _trainer(
+        opt_cb_dir,
+        train_steps=4,
+        steps_per_loop=2,
+        fold_state_max_leaf_size=64,
+        fold_step_logs=True,
+        train_callbacks=[
+            keras.callbacks.LambdaCallback(
+                on_train_batch_end=lambda _, logs: got_batch_logs.append(
+                    dict(logs)
+                )
+            )
+        ],
+        distribution=keras.distribution.DataParallel(),
+    ).train(
+        types.SimpleNamespace(
+            create_dataset=lambda training: make_dataset(),
+            create_model=build_model,
+            export_model=lambda m, model_dir: None,
+        )
+    )
+    self.assertLen(got_batch_logs, 4)
+    for got, want in zip(got_batch_logs, want_batch_logs, strict=True):
+      self.assertCountEqual(got, want)
+      for key, value in want.items():
+        np.testing.assert_allclose(got[key], value, rtol=1e-6, err_msg=key)
 
   def test_train_and_evaluate_skips_train_throughput_callback_with_warning(
       self,
