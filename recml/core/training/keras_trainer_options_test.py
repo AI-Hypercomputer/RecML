@@ -18,6 +18,7 @@ import types
 from unittest import mock
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 import keras
 from keras.src.utils import python_utils
@@ -116,7 +117,7 @@ def _task(model, exported):
   )
 
 
-class KerasTrainerOptionsTest(absltest.TestCase):
+class KerasTrainerOptionsTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -127,6 +128,12 @@ class KerasTrainerOptionsTest(absltest.TestCase):
         ValueError, "device_prefetch_depth must be >= 0"
     ):
       _trainer(self._tmpdir, device_prefetch_depth=-1)
+
+  def test_rejects_negative_fold_state_max_leaf_size(self):
+    with self.assertRaisesRegex(
+        ValueError, "fold_state_max_leaf_size must be >= 0"
+    ):
+      _trainer(self._tmpdir, fold_state_max_leaf_size=-1)
 
   def test_default_leaves_the_model_unchanged(self):
     trainer = _trainer(self._tmpdir)
@@ -178,14 +185,22 @@ class KerasTrainerOptionsTest(absltest.TestCase):
     self.assertLen(model.seen_in_fit, 1)
     self.assertEmpty(exported)
 
-  def test_train_and_evaluate_warns_that_prefetch_is_not_applied(self):
-    trainer = _trainer(self._tmpdir, device_prefetch_depth=2)
+  @parameterized.parameters(
+      dict(device_prefetch_depth=2),
+      dict(skip_batch_logs=True),
+      dict(fold_batch_leaves=True),
+      dict(zero_copy_batches=True),
+      dict(fold_state_max_leaf_size=64),
+  )
+  def test_train_and_evaluate_warns_that_option_is_not_applied(self, **options):
+    trainer = _trainer(self._tmpdir, **options)
     task = mock.Mock()
     task.create_dataset.side_effect = RuntimeError("stop")
     with self.assertLogs(level="WARNING") as logs:
       with self.assertRaisesRegex(RuntimeError, "stop"):
         trainer.train_and_evaluate(task)
-    self.assertIn("device_prefetch_depth", logs.output[0])
+    for name in options:
+      self.assertIn(name, logs.output[0])
 
   def test_fold_batch_leaves_folds_the_dataset_and_unfolds_in_the_step(self):
     features = {
@@ -269,15 +284,6 @@ class KerasTrainerOptionsTest(absltest.TestCase):
     for key, values in want_history.items():
       np.testing.assert_allclose(history[key], values, rtol=1e-6, err_msg=key)
 
-  def test_train_and_evaluate_warns_that_folding_is_not_applied(self):
-    trainer = _trainer(self._tmpdir, fold_batch_leaves=True)
-    task = mock.Mock()
-    task.create_dataset.side_effect = RuntimeError("stop")
-    with self.assertLogs(level="WARNING") as logs:
-      with self.assertRaisesRegex(RuntimeError, "stop"):
-        trainer.train_and_evaluate(task)
-    self.assertIn("fold_batch_leaves", logs.output[0])
-
   def test_zero_copy_batches_wraps_the_dataset_in_a_zero_copy_adapter(self):
     features = np.arange(20, dtype=np.float32).reshape([10, 2])
     dataset = tf.data.Dataset.from_tensor_slices(features).batch(
@@ -330,23 +336,155 @@ class KerasTrainerOptionsTest(absltest.TestCase):
             value, features[key][2 * step : 2 * step + 2]
         )
 
-  def test_train_and_evaluate_warns_that_zero_copy_batches_is_not_applied(self):
-    trainer = _trainer(self._tmpdir, zero_copy_batches=True)
-    task = mock.Mock()
-    task.create_dataset.side_effect = RuntimeError("stop")
-    with self.assertLogs(level="WARNING") as logs:
-      with self.assertRaisesRegex(RuntimeError, "stop"):
-        trainer.train_and_evaluate(task)
-    self.assertIn("zero_copy_batches", logs.output[0])
+  def test_fold_state_max_leaf_size_folds_the_state_during_train(self):
+    rng = np.random.default_rng(0)
+    x = rng.random((8, 4)).astype(np.float32)
+    y = rng.random((8, 1)).astype(np.float32)
+    inputs = keras.Input(shape=(4,), dtype="float32")
+    model = keras.Model(inputs, keras.layers.Dense(1)(inputs))
+    model.compile(optimizer="sgd", loss="mse")
+    task = types.SimpleNamespace(
+        create_dataset=lambda training: tf.data.Dataset.from_tensor_slices(
+            (x, y)
+        )
+        .batch(2, drop_remainder=True)
+        .repeat(),
+        create_model=lambda: model,
+        export_model=lambda m, model_dir: None,
+    )
 
-  def test_train_and_evaluate_warns_that_skip_batch_logs_is_not_applied(self):
-    trainer = _trainer(self._tmpdir, skip_batch_logs=True)
-    task = mock.Mock()
-    task.create_dataset.side_effect = RuntimeError("stop")
-    with self.assertLogs(level="WARNING") as logs:
-      with self.assertRaisesRegex(RuntimeError, "stop"):
-        trainer.train_and_evaluate(task)
-    self.assertIn("skip_batch_logs", logs.output[0])
+    with self.assertLogs(level="INFO") as logs:
+      _trainer(
+          self._tmpdir,
+          train_steps=2,
+          steps_per_loop=1,
+          fold_state_max_leaf_size=64,
+      ).train(task)
+
+    self.assertTrue(
+        any("Folding the training state" in line for line in logs.output)
+    )
+
+  def test_fold_state_max_leaf_size_checkpoints_resume(self):
+    rng = np.random.default_rng(0)
+    x = rng.random((40, 4)).astype(np.float32)
+    y = rng.random((40, 1)).astype(np.float32)
+
+    def train(model_dir, train_steps, fold_state_max_leaf_size):
+      keras.utils.set_random_seed(0)
+      inputs = keras.Input(shape=(4,), dtype="float32")
+      model = keras.Model(inputs, keras.layers.Dense(1)(inputs))
+      model.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+      os.makedirs(model_dir, exist_ok=True)
+      dataset = (
+          tf.data.Dataset.from_tensor_slices((x, y))
+          .batch(2, drop_remainder=True)
+          .repeat()
+      )
+      history = _trainer(
+          model_dir,
+          train_steps=train_steps,
+          steps_per_loop=5,
+          fold_state_max_leaf_size=fold_state_max_leaf_size,
+          distribution=keras.distribution.DataParallel(),
+      ).train(
+          types.SimpleNamespace(
+              create_dataset=lambda training: dataset,
+              create_model=lambda: model,
+              export_model=lambda m, model_dir: None,
+          )
+      )
+      variables = model.weights + model.optimizer.variables
+      return [v.numpy() for v in variables], history.history
+
+    plain_dir = os.path.join(self._tmpdir, "plain")
+    train(plain_dir, train_steps=10, fold_state_max_leaf_size=0)
+    want, _ = train(plain_dir, train_steps=20, fold_state_max_leaf_size=0)
+    for resume_max_leaf_size in (0, 64):
+      with self.subTest(resume_max_leaf_size=resume_max_leaf_size):
+        model_dir = os.path.join(self._tmpdir, f"folded_{resume_max_leaf_size}")
+        # Writes the epoch 0-2 checkpoints with folding, then resumes from the
+        # epoch 2 checkpoint.
+        train(model_dir, train_steps=10, fold_state_max_leaf_size=64)
+        got, history = train(
+            model_dir,
+            train_steps=20,
+            fold_state_max_leaf_size=resume_max_leaf_size,
+        )
+        self.assertLen(history["loss"], 2)  # Only epochs 3 and 4 ran.
+        for actual, expected in zip(got, want, strict=True):
+          np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+  def test_all_host_speed_options_end_to_end_real_keras_model(self):
+    rng = np.random.default_rng(0)
+    x = rng.random((40, 4)).astype(np.float32)
+    y = rng.random((40, 1)).astype(np.float32)
+
+    def build_model():
+      keras.utils.set_random_seed(0)
+      inp = keras.Input(shape=(4,), dtype="float32")
+      out = keras.layers.Dense(1)(keras.layers.Dense(4, activation="relu")(inp))
+      model = keras.Model(inputs=inp, outputs=out)
+      model.compile(
+          optimizer=keras.optimizers.Adam(0.01),
+          loss=keras.losses.MeanSquaredError(),
+          metrics=["mae", "mse"],
+      )
+      return model
+
+    def make_dataset():
+      return (
+          tf.data.Dataset.from_tensor_slices((x, y))
+          .batch(2, drop_remainder=True)
+          .repeat()
+      )
+
+    ref_model = build_model()
+    ref_dir = os.path.join(self._tmpdir, "ref")
+    os.makedirs(ref_dir)
+    ref_history = _trainer(
+        ref_dir,
+        train_steps=10,
+        steps_per_loop=5,
+        distribution=keras.distribution.DataParallel(),
+    ).train(
+        types.SimpleNamespace(
+            create_dataset=lambda training: make_dataset(),
+            create_model=lambda: ref_model,
+            export_model=lambda m, model_dir: None,
+        )
+    )
+
+    opt_model = build_model()
+    opt_dir = os.path.join(self._tmpdir, "opt")
+    os.makedirs(opt_dir)
+    opt_history = _trainer(
+        opt_dir,
+        train_steps=10,
+        steps_per_loop=5,
+        device_prefetch_depth=1,
+        skip_batch_logs=True,
+        fold_batch_leaves=True,
+        zero_copy_batches=True,
+        fold_state_max_leaf_size=64,
+        distribution=keras.distribution.DataParallel(),
+    ).train(
+        types.SimpleNamespace(
+            create_dataset=lambda training: make_dataset(),
+            create_model=lambda: opt_model,
+            export_model=lambda m, model_dir: None,
+        )
+    )
+
+    for actual, want in zip(
+        opt_model.get_weights(), ref_model.get_weights(), strict=True
+    ):
+      np.testing.assert_allclose(actual, want, rtol=1e-6, atol=1e-7)
+    self.assertCountEqual(opt_history.history, ref_history.history)
+    for key, values in ref_history.history.items():
+      np.testing.assert_allclose(
+          opt_history.history[key], values, rtol=1e-6, err_msg=key
+      )
 
   def test_train_and_evaluate_skips_train_throughput_callback_with_warning(
       self,
