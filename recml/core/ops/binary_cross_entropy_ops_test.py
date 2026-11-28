@@ -1210,6 +1210,94 @@ class BinaryCrossEntropyOpsTest(parameterized.TestCase):
         g_emb_forced, g_emb_clamped, atol=1e-5, rtol=1e-5
     )
 
+  def test_balanced_block_v_and_vmem_pos_fusion(self):
+    self.assertEqual(
+        binary_cross_entropy_ops._balanced_block_v(121088, 6144, 128), 5504
+    )
+    self.assertEqual(
+        binary_cross_entropy_ops._balanced_block_v(99072, 6144, 128), 5504
+    )
+
+    batch, seq_len, hidden_dim, vocab_size, num_labels = 24, 100, 96, 1003, 16
+    key_act, key_emb, key_tgt, key_mask = jax.random.split(
+        jax.random.PRNGKey(2026), 4
+    )
+    activations = jax.random.normal(key_act, (batch, seq_len, hidden_dim))
+    embeddings = jax.random.normal(key_emb, (vocab_size, hidden_dim))
+    raw_targets = jax.random.randint(
+        key_tgt, (batch, seq_len, num_labels), 0, vocab_size
+    )
+    keep = jax.random.bernoulli(key_mask, 0.7, raw_targets.shape)
+    targets = jnp.where(keep, raw_targets, -1)
+    # Include an all-negative position and explicit duplicate positive IDs.
+    targets = targets.at[0, 0, :].set(-1)
+    targets = targets.at[1, 2, :4].set(vocab_size - 1)
+
+    def eval_all(use_pallas: bool, opt_l: bool):
+      return binary_cross_entropy_ops.cut_binary_cross_entropy(
+          activations,
+          embeddings,
+          targets,
+          block_v=256,
+          block_n=128,
+          return_metrics=True,
+          use_pallas=use_pallas,
+          optimize_large_l=opt_l,
+      )
+
+    ref_loss, ref_tp, ref_fp, ref_fn, ref_tn = jax.jit(
+        lambda: eval_all(False, False)
+    )()
+    jax_opt_loss, jax_opt_tp, jax_opt_fp, jax_opt_fn, jax_opt_tn = jax.jit(
+        lambda: eval_all(False, True)
+    )()
+    pallas_noopt = jax.jit(lambda: eval_all(True, False))()
+    v2_loss, v2_tp, v2_fp, v2_fn, v2_tn = jax.jit(
+        lambda: eval_all(True, True)
+    )()
+    for val_p, val_r in zip(
+        pallas_noopt, (ref_loss, ref_tp, ref_fp, ref_fn, ref_tn)
+    ):
+      np.testing.assert_allclose(val_p, val_r, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(v2_loss, ref_loss, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(v2_loss, jax_opt_loss, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(v2_tp, jax_opt_tp, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(v2_fp, jax_opt_fp, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(v2_fn, jax_opt_fn, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(v2_tn, jax_opt_tn, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(v2_tp, ref_tp, atol=2.0, rtol=1e-3)
+
+    ref_g_act, ref_g_emb = jax.jit(
+        jax.grad(
+            lambda a, e: binary_cross_entropy_ops.cut_binary_cross_entropy(
+                a,
+                e,
+                targets,
+                block_v=256,
+                block_n=128,
+                use_pallas=False,
+                optimize_large_l=False,
+            ),
+            argnums=(0, 1),
+        )
+    )(activations, embeddings)
+    v2_g_act, v2_g_emb = jax.jit(
+        jax.grad(
+            lambda a, e: binary_cross_entropy_ops.cut_binary_cross_entropy(
+                a,
+                e,
+                targets,
+                block_v=256,
+                block_n=128,
+                use_pallas=True,
+                optimize_large_l=True,
+            ),
+            argnums=(0, 1),
+        )
+    )(activations, embeddings)
+    np.testing.assert_allclose(v2_g_act, ref_g_act, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(v2_g_emb, ref_g_emb, atol=1e-5, rtol=1e-5)
+
 
 if __name__ == '__main__':
   absltest.main()
